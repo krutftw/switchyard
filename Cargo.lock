@@ -2178,6 +2178,7 @@ dependencies = [
 name = "switchyard-codecs"
 version = "0.1.0"
 dependencies = [
+ "base64 0.22.1",
  "pretty_assertions",
  "serde_json",
  "switchyard-codec-anthropic",
@@ -2197,9 +2198,9 @@ dependencies = [
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "switchyard-core",
  "tempfile",
- "thiserror",
  "tokio",
  "toml",
  "toml_edit",
@@ -2227,16 +2228,17 @@ name = "switchyard-gateway"
 version = "0.1.0"
 dependencies = [
  "arc-swap",
- "async-stream",
  "axum",
  "bytes",
  "futures",
  "http",
- "notify",
  "parking_lot",
+ "percent-encoding",
  "pretty_assertions",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "subtle",
  "switchyard-codecs",
  "switchyard-config-store",
  "switchyard-core",
@@ -2247,12 +2249,8 @@ dependencies = [
  "tempfile",
  "thiserror",
  "tokio",
- "tokio-stream",
  "tokio-util",
- "toml",
- "toml_edit",
  "tracing",
- "uuid",
 ]
 
 [[package]]

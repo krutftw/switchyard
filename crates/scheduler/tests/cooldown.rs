@@ -671,6 +671,63 @@ fn tried_and_cooling_credentials_mix_into_the_right_error() {
 }
 
 #[test]
+fn soonest_recovery_of_counts_tried_credentials_and_honours_narrowed_routes() {
+    let f = fixture(
+        r#"
+[[providers]]
+name = "openai"
+kind = "openai"
+api_keys = ["sk-key-a-0000000000000", "sk-key-b-0000000000000"]
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers]]
+name = "other"
+kind = "openai-compat"
+base_url = "http://127.0.0.1:9/v1"
+api_keys = ["sk-other-000000000000"]
+[[providers.models]]
+id = "gpt-5.5"
+"#,
+    );
+    let mut resolved = f.scheduler.resolve("gpt-5.5").unwrap();
+    resolved.retain_routes(|route| route.provider == "openai");
+    assert_eq!(f.scheduler.soonest_recovery_of(&resolved), None);
+
+    let pick = |tried: &[String]| {
+        f.scheduler.pick(&switchyard_scheduler::PickRequest {
+            resolved: &resolved,
+            tried,
+            session: None,
+            client_protocol: switchyard_core::Protocol::OpenaiChat,
+            now: f.scheduler.now(),
+        })
+    };
+    let a = pick(&[]).unwrap();
+    f.fail(&a, &error(FailureClass::RateLimit, Some(5_000)));
+    let mut tried = vec![a.credential.id.clone()];
+    let b = pick(&tried).unwrap();
+    f.fail(&b, &error(FailureClass::RateLimit, Some(30_000)));
+    tried.push(b.credential.id.clone());
+
+    // The request has tried everything on these routes …
+    assert_eq!(
+        pick(&tried).unwrap_err(),
+        PickError::Exhausted {
+            model: "gpt-5.5".into()
+        }
+    );
+    // … and the first of them is back in five seconds. The third provider
+    // is ready, but not behind the narrowed routes.
+    assert_eq!(f.scheduler.soonest_recovery_of(&resolved), Some(secs(5)));
+    assert_eq!(f.scheduler.soonest_recovery("gpt-5.5"), None);
+
+    f.advance(5);
+    assert_eq!(f.scheduler.soonest_recovery_of(&resolved), None);
+    assert_eq!(pick(&[]).unwrap().credential.id, a.credential.id);
+}
+
+#[test]
 fn retry_after_ignores_credentials_already_tried() {
     let f = fixture(TWO_KEYS);
     let a = f.pick("gpt-5.5").unwrap();

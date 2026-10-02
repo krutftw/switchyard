@@ -1,12 +1,14 @@
 //! Upstream side: canonical [`Request`] → Messages request body.
 
-use crate::blocks::{encode_document, encode_image, encode_text, tool_call_input};
+use crate::blocks::{encode_document, encode_image, encode_text, native_parts, tool_call_input};
 use crate::reasoning::{
     drop_manual_thinking_without_turn_start, drop_thinking_for_forced_tool_choice, fix_sampling,
     write_reasoning, write_summary,
 };
+use crate::schema::fit_output_schema;
 use crate::util::{
-    THIS, TOOL_EXTRAS_KEY, ToolIds, Unmatched, is_block, sanitize_tool_name, str_field,
+    THIS, TOOL_EXTRAS_KEY, ToolIds, Unmatched, is_block, rejects_forced_tool_choice,
+    rejects_prefill, sanitize_tool_name, str_field,
 };
 use serde_json::{Map, Value, json};
 use std::collections::HashSet;
@@ -45,6 +47,12 @@ pub(crate) const PLACEHOLDER_USER_TURN: &str = "(continued)";
 pub(crate) const JSON_OBJECT_INSTRUCTION: &str = "Respond with a single valid JSON object and \
      nothing else: no explanations and no markdown code fences.";
 
+/// Lead-in of the `system` block that describes a JSON schema the API's
+/// structured outputs cannot take (see [`StructuredOutput`]).
+pub(crate) const JSON_SCHEMA_INSTRUCTION: &str = "Respond with a single valid JSON value that \
+     conforms to the JSON Schema below and nothing else: no explanations and no markdown code \
+     fences.";
+
 /// Top-level request fields without an IR slot that are copied back when the
 /// request was decoded from an Anthropic client.
 const FORWARDED_EXTRAS: &[&str] = &[
@@ -72,7 +80,7 @@ fn encode_tool_result(result: &ToolResult, native: bool) -> Value {
     // nested part moves up to the tool_result when it has none of its own.
     let mut cache = result.cache_control.clone();
     let mut blocks: Vec<Value> = Vec::new();
-    for part in &result.content {
+    for part in native_parts(&result.content) {
         if cache.is_none() {
             cache = part.cache_control().cloned();
         }
@@ -350,14 +358,17 @@ fn encode_messages(request: &Request) -> Vec<Value> {
     //    merge once more on the wire blocks.
     let mut turns: Vec<(Role, Vec<Value>)> = Vec::new();
     for message in &normalized {
-        let blocks: Vec<Value> = message
-            .parts
-            .iter()
-            .filter_map(|part| match message.role {
-                Role::Assistant => encode_assistant_part(part),
-                _ => encode_user_part(part, native),
-            })
-            .collect();
+        let blocks: Vec<Value> = match message.role {
+            Role::Assistant => message
+                .parts
+                .iter()
+                .filter_map(encode_assistant_part)
+                .collect(),
+            _ => native_parts(&message.parts)
+                .into_iter()
+                .filter_map(|part| encode_user_part(part, native))
+                .collect(),
+        };
         if blocks.is_empty() {
             continue;
         }
@@ -406,6 +417,17 @@ fn encode_messages(request: &Request) -> Vec<Value> {
             turns.pop();
         }
     }
+    //    Claude 4.6 and later take no prefill at all ("The conversation must
+    //    end with a user message"). Clients of other protocols prefill
+    //    freely, so for those models the trailing assistant turn is left
+    //    out (notes 08 §6.3). A turn that ends in tool calls is not a
+    //    prefill: step 4 put its results behind it.
+    if !native
+        && rejects_prefill(&request.model)
+        && matches!(turns.last(), Some((Role::Assistant, _)))
+    {
+        turns.pop();
+    }
 
     // 6. The conversation must exist and open with a user turn.
     if !matches!(turns.first(), Some((Role::User, _))) {
@@ -435,7 +457,68 @@ fn encode_messages(request: &Request) -> Vec<Value> {
 // System, tools
 // ---------------------------------------------------------------------------
 
-fn encode_system(request: &Request) -> Vec<Value> {
+/// How the request's output format reaches the API.
+enum StructuredOutput {
+    /// Free text.
+    None,
+    /// `output_config.format` with this schema.
+    Native(Value),
+    /// A closing `system` block with this text.
+    Instruction(String),
+}
+
+/// Decides how `request.response_format` is expressed.
+///
+/// * "Any JSON object" has no native form (the API only has
+///   schema-constrained output) and becomes a system instruction.
+/// * A JSON schema an Anthropic client wrote goes to `output_config.format`
+///   as it is: it was written for this API.
+/// * A JSON schema written for another protocol is fitted to the narrow
+///   dialect `output_config.format` accepts ([`fit_output_schema`]): the API
+///   answers anything outside it with a 400, and a Gemini `responseSchema`
+///   or an OpenAI non-strict schema is routinely outside it. A schema that
+///   cannot be fitted is described in a system instruction instead, which is
+///   how the vendor's API was used for JSON output before it had the native
+///   field.
+fn structured_output(request: &Request) -> StructuredOutput {
+    match &request.response_format {
+        None | Some(ResponseFormat::Text) => StructuredOutput::None,
+        Some(ResponseFormat::JsonObject) => {
+            StructuredOutput::Instruction(JSON_OBJECT_INSTRUCTION.to_string())
+        }
+        Some(ResponseFormat::JsonSchema {
+            name,
+            description,
+            schema,
+            ..
+        }) => {
+            if same_family(request.source) {
+                return StructuredOutput::Native(schema.clone());
+            }
+            if let Some(fitted) = fit_output_schema(schema) {
+                return StructuredOutput::Native(fitted);
+            }
+            if schema.is_null() {
+                // A schema format without a schema can only mean "some JSON".
+                return StructuredOutput::Instruction(JSON_OBJECT_INSTRUCTION.to_string());
+            }
+            let mut text = JSON_SCHEMA_INSTRUCTION.to_string();
+            if let Some(name) = name.as_deref().filter(|name| !name.trim().is_empty()) {
+                text.push_str(&format!("\nSchema name: {name}"));
+            }
+            if let Some(description) = description
+                .as_deref()
+                .filter(|description| !description.trim().is_empty())
+            {
+                text.push_str(&format!("\nSchema description: {description}"));
+            }
+            text.push_str(&format!("\nJSON Schema:\n{schema}"));
+            StructuredOutput::Instruction(text)
+        }
+    }
+}
+
+fn encode_system(request: &Request, output: &StructuredOutput) -> Vec<Value> {
     let leading = &request.messages[..leading_system_messages(request)];
     let mut blocks: Vec<Value> = request
         .system
@@ -446,8 +529,8 @@ fn encode_system(request: &Request) -> Vec<Value> {
             _ => None,
         })
         .collect();
-    if matches!(request.response_format, Some(ResponseFormat::JsonObject)) {
-        blocks.push(json!({"type": "text", "text": JSON_OBJECT_INSTRUCTION}));
+    if let StructuredOutput::Instruction(text) = output {
+        blocks.push(json!({"type": "text", "text": text}));
     }
     blocks
 }
@@ -549,7 +632,8 @@ fn encode_tools(request: &Request) -> Vec<Value> {
                     "input_schema".to_string(),
                     input_schema(&function.parameters),
                 );
-                if let Some(strict) = function.strict {
+                // See "Strict tools" on `encode_request`.
+                if let Some(strict) = function.strict.filter(|_| same_family(request.source)) {
                     out.insert("strict".to_string(), Value::Bool(strict));
                 }
                 if let Some(cache) = &function.cache_control {
@@ -623,14 +707,28 @@ fn encode_tools(request: &Request) -> Vec<Value> {
         .collect()
 }
 
-fn encode_tool_choice(request: &Request) -> Option<Value> {
+/// Encodes `tool_choice` for a body that offers `tools`.
+///
+/// A forced tool the body does not offer (a provider tool of another
+/// protocol that has no counterpart here, a declaration that lost its name
+/// to an earlier one) is refused by the API. The request then says `none`:
+/// a restriction that cannot be honoured must not turn into permission to
+/// call any tool. A Messages client's own choice is replayed as written.
+fn encode_tool_choice(request: &Request, tools: &[Value]) -> Option<Value> {
     let serial = request.parallel_tool_calls == Some(false);
     let mut choice = match &request.tool_choice {
         Some(ToolChoice::Auto) => json!({"type": "auto"}),
         Some(ToolChoice::None) => return Some(json!({"type": "none"})),
         Some(ToolChoice::Required) => json!({"type": "any"}),
         Some(ToolChoice::Tool { name }) => {
-            json!({"type": "tool", "name": sanitize_tool_name(name)})
+            let name = sanitize_tool_name(name);
+            let offered = tools
+                .iter()
+                .any(|tool| str_field(tool, "name") == Some(name.as_str()));
+            if !offered && !same_family(request.source) {
+                return Some(json!({"type": "none"}));
+            }
+            json!({"type": "tool", "name": name})
         }
         None if serial => json!({"type": "auto"}),
         None => return None,
@@ -639,6 +737,26 @@ fn encode_tool_choice(request: &Request) -> Option<Value> {
         object.insert("disable_parallel_tool_use".to_string(), json!(true));
     }
     Some(choice)
+}
+
+/// Rewrites a forced tool choice for a model that takes none (see
+/// [`rejects_forced_tool_choice`]): `any` becomes `auto`, and a forced tool
+/// becomes `auto` over a tool list narrowed to that one tool, so the model
+/// can still call nothing but the tool the client insisted on.
+fn relax_forced_choice(choice: &mut Option<Value>, tools: &mut Vec<Value>) {
+    let Some(Value::Object(choice)) = choice else {
+        return;
+    };
+    let forces_one = match choice.get("type").and_then(Value::as_str) {
+        Some("any") => false,
+        Some("tool") => true,
+        _ => return,
+    };
+    if forces_one {
+        let forced = choice.shift_remove("name");
+        tools.retain(|tool| tool.get("name") == forced.as_ref());
+    }
+    choice.insert("type".to_string(), json!("auto"));
 }
 
 /// Anthropic's `service_tier` is `auto | standard_only`; other vendors'
@@ -686,12 +804,25 @@ fn encode_service_tier(tier: &str) -> Option<&'static str> {
 ///   open with a thinking block (a tool loop whose signed thinking is not
 ///   available, because another vendor served it or the client has no slot
 ///   for it).
+/// * **Model generations** (translated requests only; a Messages client's
+///   own request is replayed and judged by the API): Claude 4.6 and later
+///   take no assistant prefill, so a trailing assistant turn is left out;
+///   Opus 5.5, Sonnet 5.5, Fable 5.1, Mythos 5.1 and their successors take
+///   no forced tool use, so `any` becomes `auto` and a forced tool becomes
+///   `auto` over a tool list narrowed to that tool (notes 15 §5.2).
 /// * **Tool pairing**: a tool result without a call in the preceding
 ///   assistant turn becomes plain user content and an unanswered call gets
 ///   an error result ([`INTERRUPTED_TOOL_RESULT`]); the API rejects both
 ///   situations outright.
-/// * **Structured output**: a JSON schema goes to `output_config.format`;
-///   "any JSON object" becomes a system instruction.
+/// * **Structured output**: a JSON schema goes to `output_config.format`,
+///   fitted to the dialect the API accepts when it was written for another
+///   protocol (and described in a system instruction when it cannot be
+///   fitted); "any JSON object" becomes a system instruction.
+/// * **Strict tools**: `strict` is only sent for tools an Anthropic client
+///   declared. With it the API holds `input_schema` to the structured-output
+///   dialect and to per-request limits (number of strict tools, optional and
+///   union-typed parameters) that schemas written for OpenAI's strict mode
+///   do not meet, and answers 400; without it the same tools simply work.
 /// * **Sampling**: `temperature` is clamped to `[0, 1]`; with thinking active
 ///   all sampling parameters are dropped, otherwise `top_p` is dropped when
 ///   `temperature` is present.
@@ -715,7 +846,8 @@ pub(crate) fn encode_request(
     body.insert("model".to_string(), Value::String(request.model.clone()));
     body.insert("max_tokens".to_string(), json!(max_tokens));
 
-    let system = encode_system(request);
+    let output = structured_output(request);
+    let system = encode_system(request, &output);
     if !system.is_empty() {
         body.insert("system".to_string(), Value::Array(system));
     }
@@ -724,16 +856,20 @@ pub(crate) fn encode_request(
         Value::Array(encode_messages(request)),
     );
 
-    let tools = encode_tools(request);
+    let mut tools = encode_tools(request);
     if !tools.is_empty() {
-        body.insert("tools".to_string(), Value::Array(tools));
         // `tool_choice` is only valid alongside tools.
-        if let Some(choice) = encode_tool_choice(request) {
+        let mut choice = encode_tool_choice(request, &tools);
+        if !same_family(request.source) && rejects_forced_tool_choice(&request.model) {
+            relax_forced_choice(&mut choice, &mut tools);
+        }
+        body.insert("tools".to_string(), Value::Array(tools));
+        if let Some(choice) = choice {
             body.insert("tool_choice".to_string(), choice);
         }
     }
 
-    if let Some(ResponseFormat::JsonSchema { schema, .. }) = &request.response_format {
+    if let StructuredOutput::Native(schema) = output {
         body.insert(
             "output_config".to_string(),
             json!({"format": {"type": "json_schema", "schema": schema}}),
@@ -844,6 +980,13 @@ pub(crate) fn encode_count_request(request: &Request, ctx: &UpstreamCtx<'_>) -> 
     if request.tools.is_empty() {
         request.tool_choice = None;
         request.parallel_tool_calls = None;
+    }
+    // A forced provider-executed tool went with its declaration; the choice
+    // may not name a tool the body no longer offers.
+    if let Some(ToolChoice::Tool { name }) = &request.tool_choice
+        && !request.tools.iter().any(|tool| tool.name() == Some(name))
+    {
+        request.tool_choice = Some(ToolChoice::Auto);
     }
     for message in &mut request.messages {
         message.parts = countable_parts(&message.parts);

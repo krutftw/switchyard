@@ -41,7 +41,7 @@ use crate::common::{
     images_from_wire, reasoning_details, reasoning_text, str_of, thought_signature,
     upstream_finish, usage_from_wire,
 };
-use crate::error::api_error_from_stream;
+use crate::error::{api_error_from_stream, clean_message};
 use serde_json::Value;
 use std::collections::HashMap;
 use switchyard_core::Usage;
@@ -50,7 +50,7 @@ use switchyard_core::error::{ApiError, CodecError};
 use switchyard_core::ir::{FinishReason, Part, Reasoning, Signature, ToolCallKind};
 use switchyard_core::sse::SseEvent;
 use switchyard_core::stream::{BlockStart, StreamEvent};
-use switchyard_core::util::{new_call_id, new_id, truncate_chars};
+use switchyard_core::util::{new_call_id, new_id};
 
 /// Wire key of the deprecated single `function_call`, which has no index.
 const LEGACY_CALL_KEY: i64 = -1;
@@ -962,7 +962,7 @@ impl StreamDecoder for ChatStreamDecoder {
             Ok(chunk) => chunk,
             Err(_) => {
                 if named_error && !data.is_empty() {
-                    self.fail(ApiError::upstream(truncate_chars(data, 2000)), &mut out);
+                    self.fail(ApiError::upstream(clean_message(data)), &mut out);
                 }
                 // Anything else that is not JSON is noise.
                 return Ok(out);

@@ -3,18 +3,20 @@
 //! response for a Chat client.
 
 use crate::common::{
-    ID_PREFIX, PROTOCOL, Side, arguments_text, citation_to_wire, citations_from_wire,
-    client_response_id, finish_from_wire, finish_to_wire, i64_of, image_to_wire, images_from_wire,
-    reasoning_from_message, reasoning_text, reconcile_finish, str_of, tool_call_from_wire,
-    tool_call_to_wire, upstream_finish, usage_from_wire, usage_to_wire, write_reasoning_fields,
+    CallSpelling, ID_PREFIX, Side, arguments_text, blob_for_client, citation_to_wire,
+    citations_from_wire, client_finish, client_response_id, finish_from_wire, i64_of,
+    image_to_wire, images_from_wire, reasoning_from_message, reasoning_text, str_of,
+    tool_call_from_wire, tool_call_to_wire, upstream_finish, usage_from_wire, usage_to_wire,
+    write_reasoning_fields,
 };
+use crate::error::clean_message;
+use crate::names::ClientNames;
 use serde_json::{Map, Value, json};
 use switchyard_core::codec::ClientCtx;
 use switchyard_core::error::CodecError;
 use switchyard_core::ir::{
     FinishReason, MediaPart, Part, Reasoning, RefusalPart, Response, TextPart,
 };
-use switchyard_core::sig;
 use switchyard_core::util::{new_call_id, new_id, now_unix};
 
 // ---------------------------------------------------------------------------
@@ -41,7 +43,10 @@ pub(crate) fn decode_response(body: &Value) -> Result<Response, CodecError> {
                         .map(str::to_string)
                         .unwrap_or_else(|| other.to_string()),
                 };
-                return Err(CodecError::upstream(format!("error payload: {message}")));
+                return Err(CodecError::upstream(format!(
+                    "error payload: {}",
+                    clean_message(&message)
+                )));
             }
             return Err(CodecError::upstream("response has no `choices` array"));
         }
@@ -209,11 +214,15 @@ fn content_item(item: &Value) -> Option<Part> {
 /// * all text parts are concatenated into `content` (`null` when the turn is
 ///   only tool calls or a refusal);
 /// * reasoning text goes to `reasoning_content`, blobs to `reasoning_details`
-///   (wrapped with [`sig::encode_for_client`] when another vendor issued them);
+///   (tagged with their origin when a Chat upstream did not issue them, see
+///   [`blob_for_client`]);
+/// * tool calls are named the way the client declared the tool, whatever
+///   spelling the upstream had to be given;
 /// * generated images go to the `images` extension array;
 /// * audio, documents and provider-specific blocks have no Chat
 ///   representation and are dropped.
 pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Value, CodecError> {
+    let names = ClientNames::from_request(Some(&ctx.request));
     let mut text = String::new();
     let mut has_text = false;
     let mut refusal = String::new();
@@ -235,11 +244,15 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
             }
             Part::Refusal(r) => refusal.push_str(&r.text),
             Part::ToolCall(call) => {
-                let signature = call
-                    .signature
-                    .as_ref()
-                    .map(|s| sig::encode_for_client(s, PROTOCOL));
-                calls.push(tool_call_to_wire(call, signature));
+                let signature = call.signature.as_ref().map(blob_for_client);
+                calls.push(tool_call_to_wire(
+                    call,
+                    signature,
+                    &CallSpelling {
+                        name: Some(names.restore(&call.name)),
+                        ..CallSpelling::default()
+                    },
+                ));
             }
             Part::Reasoning(r) => reasoning.push(r),
             Part::Image(media) => images.extend(image_to_wire(media, images.len())),
@@ -256,7 +269,7 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
     };
     message.insert("content".into(), content);
     write_reasoning_fields(&mut message, reasoning.into_iter(), "\n\n", |s| {
-        Some(sig::encode_for_client(s, PROTOCOL))
+        Some(blob_for_client(s))
     });
     message.insert(
         "refusal".into(),
@@ -277,7 +290,6 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
         message.insert("images".into(), Value::Array(images));
     }
 
-    let finish = reconcile_finish(response.finish.clone(), has_calls);
     let mut body = Map::new();
     body.insert("id".into(), json!(client_response_id(&response.id)));
     body.insert("object".into(), json!("chat.completion"));
@@ -303,7 +315,7 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
             "index": 0,
             "message": Value::Object(message),
             "logprobs": null,
-            "finish_reason": finish_to_wire(&finish),
+            "finish_reason": client_finish(&response.finish, has_calls, !refusal.is_empty()),
         }]),
     );
     body.insert("usage".into(), usage_to_wire(&response.usage));

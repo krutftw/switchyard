@@ -180,30 +180,46 @@ fn redact_assignments(text: &str) -> String {
     out
 }
 
-/// Bare API keys in the vendor's `sk-...` shape, wherever they appear. Keys
-/// the vendor already masked (`sk-proj-****abcd`) are too short to match.
-fn redact_key_shapes(text: &str) -> String {
+/// Bare keys recognisable by their shape: prefix, characters the key
+/// continues with besides ASCII letters and digits, and the shortest run
+/// after the prefix that is taken for a key (keys the vendor already masked,
+/// `sk-proj-****abcd`, stay below it).
+///
+/// * `sk-…`: OpenAI and most compatible servers;
+/// * `AIza…`: Google API keys (a relay speaking this protocol may front any
+///   vendor);
+/// * `ya29.…`: Google OAuth access tokens.
+const KEY_SHAPES: &[(&str, &[u8], usize)] = &[
+    ("sk-", b"_-", 20),
+    ("AIza", b"_-", 30),
+    ("ya29.", b"_-.", 20),
+];
+
+/// Bare keys of one of the [`KEY_SHAPES`], wherever they appear.
+fn redact_key_shape(text: &str, prefix: &str, extra: &[u8], min_run: usize) -> String {
     let bytes = text.as_bytes();
     let mut out = String::with_capacity(text.len());
     let mut copied = 0;
     let mut from = 0;
-    while let Some(found) = text[from..].find("sk-") {
+    while let Some(found) = text[from..].find(prefix) {
         let start = from + found;
-        let body = start + "sk-".len();
+        let body = start + prefix.len();
         from = body;
         if start > 0 && is_word_byte(bytes[start - 1]) {
             continue;
         }
         let run = bytes[body..]
             .iter()
-            .take_while(|b| b.is_ascii_alphanumeric() || **b == b'_' || **b == b'-')
+            .take_while(|b| b.is_ascii_alphanumeric() || extra.contains(b))
             .count();
-        if run < 20 {
+        if run < min_run {
             continue;
         }
+        // A full stop that ends the sentence is not part of the key.
+        let end = body + text[body..body + run].trim_end_matches('.').len();
         out.push_str(&text[copied..start]);
         out.push_str(REDACTED);
-        copied = body + run;
+        copied = end;
         from = copied;
     }
     out.push_str(&text[copied..]);
@@ -211,9 +227,15 @@ fn redact_key_shapes(text: &str) -> String {
 }
 
 /// Removes credentials from error text: `Bearer` tokens, values assigned to
-/// secret-looking names, and bare `sk-...` keys. Idempotent.
+/// secret-looking names, and bare vendor keys. Idempotent.
 pub(crate) fn redact_secrets(text: &str) -> String {
-    redact_key_shapes(&redact_assignments(&redact_bearer(text)))
+    let mut out = redact_assignments(&redact_bearer(text));
+    for (prefix, extra, min_run) in KEY_SHAPES {
+        if out.contains(prefix) {
+            out = redact_key_shape(&out, prefix, extra, *min_run);
+        }
+    }
+    out
 }
 
 /// Redacts and truncates a piece of upstream error text.

@@ -13,10 +13,12 @@ use switchyard_core::protocol::Family;
 use switchyard_core::util::{new_call_id, new_id, str_field, u64_field};
 use switchyard_core::{Protocol, Usage, sig};
 
+use crate::names::{loose, may_be_truncated};
+
 /// The protocol this crate implements.
 pub(crate) const P: Protocol = Protocol::OpenaiResponses;
 
-/// Marker put in front of a foreign `redacted_thinking` payload before it is
+/// Marker put in front of a foreign redacted-reasoning payload before it is
 /// wrapped for a client. Responses has a single opaque slot per reasoning
 /// item (`encrypted_content`), so "this blob *is* the reasoning" has to ride
 /// inside the blob. Base64 never contains `:`, so the marker cannot collide.
@@ -323,8 +325,30 @@ impl ToolIndex {
     /// Finds the declaration a tool name refers to: the exact flat name, or a
     /// local name that only one declared tool carries (models sometimes
     /// answer with the bare child name of a namespaced tool).
+    ///
+    /// A name that is neither is the spelling an upstream of another
+    /// protocol was given for a declared tool (Gemini function names cannot
+    /// start with a digit and stop at 64 characters, Anthropic's take no
+    /// dots): it is matched ignoring case, punctuation and leading
+    /// underscores, and allowing for a name that was cut short. Only an
+    /// unambiguous match counts; the client then sees the call under the
+    /// name it declared instead of one it never offered.
     pub(crate) fn resolve(&self, name: &str) -> Option<&ToolIdentity> {
-        self.by_qualified.get(self.flat_name(name)?)
+        if let Some(flat) = self.flat_name(name) {
+            return self.by_qualified.get(flat);
+        }
+        let key = loose(name);
+        let mut found: Option<&ToolIdentity> = None;
+        for (qualified, identity) in &self.by_qualified {
+            if loose(qualified) != key && !may_be_truncated(name, qualified) {
+                continue;
+            }
+            if found.is_some() {
+                return None;
+            }
+            found = Some(identity);
+        }
+        found
     }
 
     /// The flat IR name of the declaration a tool name refers to, by the
@@ -391,30 +415,89 @@ pub(crate) fn unwrap_custom_input(arguments: &str) -> String {
 // Signatures
 // ---------------------------------------------------------------------------
 
-/// Reads `encrypted_content` sent by a client. Returns the signature and
-/// whether it stands for a redacted (text-less) reasoning block.
-pub(crate) fn signature_from_client(raw: &str) -> (Signature, bool) {
+/// Marker in front of a blob that is the signature of a *tool call* rather
+/// than of reasoning.
+///
+/// Gemini signs the `functionCall` part itself (`thoughtSignature`), and so
+/// does Google's Chat-compatible endpoint (`extra_content`); the model's
+/// reasoning state is lost when the call is replayed without it. A
+/// `function_call` item has no field for an opaque blob, a `reasoning` item
+/// does (`encrypted_content`), so such a signature is handed to the client
+/// on a summary-less reasoning item directly ahead of the call it belongs to
+/// and the request decoder puts it back on the call. The marker is what
+/// tells that item from encrypted reasoning.
+const CALL_MARKER: &str = "call:";
+
+/// What a blob read from a client's `encrypted_content` is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum BlobKind {
+    /// The encrypted form of the item's reasoning.
+    Reasoning,
+    /// A redacted (text-less) reasoning block of another vendor.
+    Redacted,
+    /// The signature of the tool call that follows the item.
+    Call,
+}
+
+/// Reads `encrypted_content` sent by a client: the signature, and what it
+/// stands for.
+pub(crate) fn signature_from_client(raw: &str) -> (Signature, BlobKind) {
     let mut signature = sig::decode_from_client(raw, P);
-    if signature.origin.family() != Family::Openai
-        && let Some(rest) = signature.data.strip_prefix(REDACTED_MARKER)
-    {
-        signature.data = rest.to_string();
-        return (signature, true);
+    if signature.origin != P {
+        for (marker, kind) in [
+            (REDACTED_MARKER, BlobKind::Redacted),
+            (CALL_MARKER, BlobKind::Call),
+        ] {
+            if let Some(rest) = signature.data.strip_prefix(marker) {
+                signature.data = rest.to_string();
+                return (signature, kind);
+            }
+        }
     }
-    (signature, false)
+    (signature, BlobKind::Reasoning)
 }
 
 /// Renders a reasoning signature for a Responses client's
-/// `encrypted_content` slot.
+/// `encrypted_content` slot: a blob a Responses upstream issued travels as
+/// it is, every other one tagged with its origin (`sy1.<tag>.<blob>`).
+///
+/// That includes blobs of a **Chat Completions** upstream, although the two
+/// protocols are one vendor family and [`sig::encode_for_client`] would hand
+/// such a blob out bare. A bare blob comes back from the client as "issued
+/// by a Responses upstream": it would then be sent to OpenAI as encrypted
+/// reasoning (a 400, the blob is some compatible server's signature) and
+/// never again to the Chat upstream that can read it. The exact origin has
+/// to survive the trip through the client.
 pub(crate) fn signature_for_client(signature: &Signature, redacted: bool) -> String {
-    if redacted && signature.origin.family() != Family::Openai {
-        let marked = Signature::new(
-            signature.origin,
-            format!("{REDACTED_MARKER}{}", signature.data),
-        );
-        return sig::encode_for_client(&marked, P);
+    if signature.origin == P {
+        return signature.data.clone();
     }
-    sig::encode_for_client(signature, P)
+    let data = if redacted {
+        format!("{REDACTED_MARKER}{}", signature.data)
+    } else {
+        signature.data.clone()
+    };
+    tagged(signature.origin, &data)
+}
+
+/// `sy1.<tag>.<data>` for a blob another protocol's upstream issued.
+fn tagged(origin: Protocol, data: &str) -> String {
+    if origin.family() == Family::Openai {
+        return format!("{}{}.{data}", sig::PREFIX, origin.tag());
+    }
+    sig::encode_for_client(&Signature::new(origin, data), P)
+}
+
+/// The `encrypted_content` of the reasoning item that carries the signature
+/// of a tool call to a Responses client (see [`CALL_MARKER`]). `None` when
+/// the call has no signature to carry (this API does not sign tool calls, so
+/// a blob of its own would be taken for encrypted reasoning).
+pub(crate) fn call_signature_for_client(signature: Option<&Signature>) -> Option<String> {
+    let signature = signature.filter(|s| !s.data.is_empty() && s.origin != P)?;
+    Some(tagged(
+        signature.origin,
+        &format!("{CALL_MARKER}{}", signature.data),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -924,10 +1007,32 @@ mod tests {
         let foreign = Signature::new(Protocol::Anthropic, "EqRedacted==");
         let wire = signature_for_client(&foreign, true);
         assert_eq!(wire, "sy1.a.redacted:EqRedacted==");
-        assert_eq!(signature_from_client(&wire), (foreign, true));
+        assert_eq!(signature_from_client(&wire), (foreign, BlobKind::Redacted));
 
         let native = Signature::new(P, "gAAAAnative");
         assert_eq!(signature_for_client(&native, false), "gAAAAnative");
-        assert_eq!(signature_from_client("gAAAAnative"), (native, false));
+        assert_eq!(
+            signature_from_client("gAAAAnative"),
+            (native.clone(), BlobKind::Reasoning)
+        );
+        // A marker in a blob this API issued is part of the blob.
+        assert_eq!(
+            signature_from_client("call:gAAAA"),
+            (Signature::new(P, "call:gAAAA"), BlobKind::Reasoning)
+        );
+        assert_eq!(call_signature_for_client(Some(&native)), None);
+    }
+
+    #[test]
+    fn call_signatures_are_marked_and_tagged() {
+        let gemini = Signature::new(Protocol::Gemini, "CiQBcsig==");
+        let wire = call_signature_for_client(Some(&gemini)).unwrap();
+        assert_eq!(wire, "sy1.g.call:CiQBcsig==");
+        assert_eq!(signature_from_client(&wire), (gemini, BlobKind::Call));
+        let chat = Signature::new(Protocol::OpenaiChat, "EjQKsig==");
+        let wire = call_signature_for_client(Some(&chat)).unwrap();
+        assert_eq!(wire, "sy1.c.call:EjQKsig==");
+        assert_eq!(signature_from_client(&wire), (chat, BlobKind::Call));
+        assert_eq!(call_signature_for_client(None), None);
     }
 }

@@ -178,9 +178,15 @@ fn read_reasoning_from_raw_bodies() {
         read(json!({"reasoning_effort": "medium"})),
         ReasoningConfig::with_depth(Depth::Level(Effort::Medium))
     );
+    // "No reasoning" also says "no summaries" (notes 12 §8.1): a model that
+    // cannot stop reasoning is given its lowest depth, and must not be asked
+    // for the thoughts of that as well.
     assert_eq!(
         read(json!({"reasoning_effort": "none"})),
-        ReasoningConfig::with_depth(Depth::Off)
+        ReasoningConfig {
+            depth: Some(Depth::Off),
+            summary: Some(Summary::Off)
+        }
     );
     assert_eq!(
         read(json!({"reasoning": {"max_tokens": 8000, "exclude": false}})),

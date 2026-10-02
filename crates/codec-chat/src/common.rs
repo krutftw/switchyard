@@ -33,6 +33,33 @@ pub(crate) fn blob(raw: &str, side: Side) -> Signature {
     }
 }
 
+/// Renders a blob for a Chat client: a blob a Chat upstream issued travels
+/// as it is, every other one tagged with its origin (`sy1.<tag>.<blob>`).
+///
+/// That includes blobs of an OpenAI **Responses** upstream, although the two
+/// protocols are one vendor family and [`sig::encode_for_client`] would hand
+/// such a blob out bare. A bare blob comes back from the client as "issued
+/// by a Chat upstream", and the Chat and Responses blobs are not
+/// interchangeable: Chat blobs are the signatures of the compatible servers
+/// behind this protocol (OpenRouter relaying Anthropic, Google's compatible
+/// endpoint), a Responses blob is OpenAI's encrypted reasoning. Replaying
+/// one to the other is a 400 that no failover can repair, so the exact
+/// origin has to survive the trip through the client.
+pub(crate) fn blob_for_client(signature: &Signature) -> String {
+    if signature.origin == PROTOCOL {
+        signature.data.clone()
+    } else if signature.valid_for(PROTOCOL) {
+        format!(
+            "{}{}.{}",
+            sig::PREFIX,
+            signature.origin.tag(),
+            signature.data
+        )
+    } else {
+        sig::encode_for_client(signature, PROTOCOL)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Tolerant field access
 // ---------------------------------------------------------------------------
@@ -115,7 +142,7 @@ pub(crate) fn client_response_id(id: &str) -> String {
 /// | `Length` | `length` |
 /// | `ToolCalls` | `tool_calls` |
 /// | `ContentFilter` | `content_filter` |
-/// | `Refusal` | `content_filter` (the answer was withheld) |
+/// | `Refusal` | `content_filter` (the answer was withheld; see [`client_finish`] for a refusal that was written out) |
 /// | `PauseTurn` | `stop` (the turn ended without an error; Chat has no "continue" signal) |
 /// | `ContextWindow` | `length` (the model ran out of room) |
 /// | `Error` | `length` (the output is incomplete; `stop` would claim a finished answer) |
@@ -164,6 +191,37 @@ pub(crate) fn reconcile_finish(reason: FinishReason, has_tool_calls: bool) -> Fi
     match reason {
         FinishReason::Stop if has_tool_calls => FinishReason::ToolCalls,
         FinishReason::ToolCalls if !has_tool_calls => FinishReason::Stop,
+        other => other,
+    }
+}
+
+/// The `finish_reason` a Chat client is shown. On top of
+/// [`finish_to_wire`]:
+///
+/// * a turn that carries tool calls and would be reported as a plain `stop`
+///   is reported as `tool_calls` (clients key their tool loop on it, and
+///   some upstreams end a tool turn with a reason of their own), and
+///   `tool_calls` without any call is a `stop`. `length` and
+///   `content_filter` are kept: such a turn is incomplete, calls or not;
+/// * a refusal the model wrote out (`has_refusal`: the client is sent
+///   `message.refusal`) is a completed answer and ends with `stop`, which
+///   is how Chat Completions itself reports one. A Responses upstream
+///   reports the same answer as `completed` with a refusal part, and the
+///   client must not be told `content_filter` for it: SDK helpers raise on
+///   that reason instead of returning the refusal. A refusal without text
+///   (Anthropic's `stop_reason: "refusal"`, where a classifier withheld the
+///   answer) stays `content_filter`.
+pub(crate) fn client_finish(
+    reason: &FinishReason,
+    has_tool_calls: bool,
+    has_refusal: bool,
+) -> &'static str {
+    let reason = match reason {
+        FinishReason::Refusal if has_refusal => FinishReason::Stop,
+        other => other.clone(),
+    };
+    match finish_to_wire(&reconcile_finish(reason, has_tool_calls)) {
+        "stop" if has_tool_calls => "tool_calls",
         other => other,
     }
 }
@@ -576,14 +634,30 @@ pub(crate) fn tool_call_from_wire(tc: &Value, side: Side) -> Option<ToolCall> {
     })
 }
 
+/// How a tool call is spelled on the wire, where that differs from the
+/// canonical call.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct CallSpelling<'a> {
+    /// The id to write instead of the call's own (an upstream's limits).
+    pub id: Option<&'a str>,
+    /// The name to write instead of the call's own: the client's spelling
+    /// on the way to a client, the upstream's on the way to an upstream.
+    pub name: Option<&'a str>,
+}
+
 /// Renders a tool call for a `tool_calls` array. `signature` is the already
 /// rendered thought signature, if one may be sent.
-pub(crate) fn tool_call_to_wire(call: &ToolCall, signature: Option<String>) -> Value {
-    let id = if call.id.is_empty() {
-        new_call_id()
-    } else {
-        call.id.clone()
+pub(crate) fn tool_call_to_wire(
+    call: &ToolCall,
+    signature: Option<String>,
+    spelling: &CallSpelling<'_>,
+) -> Value {
+    let id = match spelling.id {
+        Some(id) => id.to_string(),
+        None if call.id.is_empty() => new_call_id(),
+        None => call.id.clone(),
     };
+    let name = spelling.name.unwrap_or(call.name.as_str());
     let mut out = Map::new();
     out.insert("id".into(), json!(id));
     match call.kind {
@@ -598,14 +672,14 @@ pub(crate) fn tool_call_to_wire(call: &ToolCall, signature: Option<String>) -> V
             out.insert("type".into(), json!("function"));
             out.insert(
                 "function".into(),
-                json!({"name": call.name, "arguments": arguments}),
+                json!({"name": name, "arguments": arguments}),
             );
         }
         ToolCallKind::Custom => {
             out.insert("type".into(), json!("custom"));
             out.insert(
                 "custom".into(),
-                json!({"name": call.name, "input": call.arguments}),
+                json!({"name": name, "input": call.arguments}),
             );
         }
     }

@@ -304,9 +304,10 @@ fn reasoning_deltas_and_signatures() {
         vec![
             chunk(json!({"text": "Step 1. ", "thought": true})),
             chunk(json!({"text": "Step 2.", "thought": true})),
-            // base64("sy1.a.ErACkgE=") and base64("sy1.r.gAAAAAB")
+            // base64("sy1.a.ErACkgE=") and, for the withheld reasoning, the
+            // payload marked as such: base64("sy1.r.redacted:gAAAAAB")
             chunk(json!({"text": "", "thought": true, "thoughtSignature": "c3kxLmEuRXJBQ2tnRT0="})),
-            chunk(json!({"text": "", "thoughtSignature": "c3kxLnIuZ0FBQUFBQg=="})),
+            chunk(json!({"text": "", "thoughtSignature": "c3kxLnIucmVkYWN0ZWQ6Z0FBQUFBQg=="})),
             last_chunk("STOP", ZERO_USAGE()),
         ]
     );

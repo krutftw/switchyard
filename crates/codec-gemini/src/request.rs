@@ -4,7 +4,7 @@
 use crate::parts::{
     SKIP_SIGNATURE, call_args_text, call_name, candidate_metadata, decode_file_data,
     decode_function_response, decode_inline_data, encode_function_response, encode_media,
-    explicit_id, is_metadata_only, opaque, request_signature, upstream_signature,
+    explicit_id, is_metadata_only, opaque, request_signature, split_redacted, upstream_signature,
 };
 use crate::raw::{empty_user_turn, request_meta, request_root};
 use crate::reasoning::{read_reasoning, set_include_thoughts, write_reasoning};
@@ -19,7 +19,7 @@ use switchyard_core::ir::{
     BuiltinKind, BuiltinTool, FunctionTool, Message, Part, Reasoning, Request, ResponseFormat,
     Role, TextPart, Tool, ToolCall, ToolCallKind, ToolChoice, ToolResult, normalize_turns,
 };
-use switchyard_core::reasoning::{Fitted, ModelThinking};
+use switchyard_core::reasoning::{Depth, Fitted, ModelThinking};
 use switchyard_core::{CodecError, Family, Protocol, RequestPath, UpstreamCtx};
 
 /// Gemini accepts at most this many stop sequences.
@@ -160,12 +160,27 @@ pub(crate) fn decode_request(body: &Value, path: &RequestPath<'_>) -> Result<Req
         decode_tool(tool, &mut request.tools);
     }
     if let Some(config) = pick_in(root, &["toolConfig", "tool_config"]) {
-        let (choice, lossy) = decode_tool_config(config);
-        request.tool_choice = choice;
-        if lossy {
+        let decoded = decode_tool_config(config);
+        request.tool_choice = decoded.choice;
+        if decoded.lossy {
             request
                 .extra
                 .insert("toolConfig".to_string(), config.clone());
+        }
+        // A restriction to some of the declared functions. The IR has no
+        // such notion and neither have the other protocols, so the list of
+        // functions itself is narrowed: passing on the mode with every
+        // function declared would let the model call exactly the ones the
+        // client excluded. Provider-executed tools are not function calls
+        // and are not affected.
+        if let Some(allowed) = decoded.restricted_to {
+            request.tools.retain(|tool| match tool.name() {
+                Some(name) => allowed.iter().any(|allowed| allowed == name),
+                None => true,
+            });
+            if !request.tools.iter().any(|tool| tool.name().is_some()) {
+                request.tool_choice = Some(ToolChoice::None);
+            }
         }
     }
     if let Some(Value::Object(config)) = pick_in(root, &["generationConfig", "generation_config"]) {
@@ -285,7 +300,20 @@ fn decode_content(content: &Value, index: usize, tracker: &mut CallTracker, requ
         _ => Role::User,
     };
 
-    let mut main = Vec::new();
+    // Consecutive model contents are one assistant turn. A client that
+    // streamed the turn may have recorded one content per chunk
+    // (`google-genai` chats do), which splits a thought from the part that
+    // carries its signature and the reasoning from the call it led to; every
+    // other protocol needs them in one message, and the encoders merge
+    // same-role neighbours anyway.
+    let mut main = match request.messages.last() {
+        Some(last) if role == Role::Assistant && last.role == Role::Assistant => request
+            .messages
+            .pop()
+            .map(|message| message.parts)
+            .unwrap_or_default(),
+        _ => Vec::new(),
+    };
     // Function responses found in a model turn belong to the user.
     let mut displaced = Vec::new();
     for (position, part) in parts.iter().enumerate() {
@@ -413,13 +441,8 @@ fn decode_part(
 
     if let Some(text) = map.get("text").and_then(Value::as_str) {
         if thought {
-            if role == Role::Assistant && (!text.is_empty() || signature.is_some()) {
-                out.push(Part::Reasoning(Reasoning {
-                    id: None,
-                    text: text.to_string(),
-                    signature,
-                    redacted: false,
-                }));
+            if role == Role::Assistant {
+                push_thought(text, signature, out);
             }
         } else if text.is_empty() {
             // `{"text": "", "thoughtSignature": …}` carries reasoning state only.
@@ -453,24 +476,54 @@ fn decode_part(
     out.push(opaque(part));
 }
 
-/// A part that is nothing but a thought signature: it completes the
-/// reasoning right before it, or stands alone as signed, text-less reasoning.
-fn push_signature_carrier(role: Role, signature: switchyard_core::Signature, out: &mut Vec<Part>) {
-    if role != Role::Assistant {
+/// A thought part. Consecutive thought parts are one reasoning block, up to
+/// and including the part that carries the signature: that is how a streamed
+/// thought comes back from a client (text chunk by chunk, then the signature
+/// in a part of its own), and the vendor that issued the signature only
+/// accepts it together with the whole text it signed.
+fn push_thought(text: &str, signature: Option<switchyard_core::Signature>, out: &mut Vec<Part>) {
+    let (signature, redacted) = match signature.map(split_redacted) {
+        Some((signature, redacted)) => (Some(signature), redacted),
+        None => (None, false),
+    };
+    if redacted {
+        // Withheld reasoning is nothing but its payload and never part of
+        // the block before it.
+        out.push(Part::Reasoning(Reasoning {
+            id: None,
+            text: String::new(),
+            signature,
+            redacted: true,
+        }));
         return;
     }
-    if let Some(Part::Reasoning(previous)) = out.last_mut()
-        && previous.signature.is_none()
+    if let Some(Part::Reasoning(open)) = out.last_mut()
+        && open.signature.is_none()
+        && !open.redacted
     {
-        previous.signature = Some(signature);
+        open.text.push_str(text);
+        open.signature = signature;
+        return;
+    }
+    if text.is_empty() && signature.is_none() {
         return;
     }
     out.push(Part::Reasoning(Reasoning {
         id: None,
-        text: String::new(),
-        signature: Some(signature),
+        text: text.to_string(),
+        signature,
         redacted: false,
     }));
+}
+
+/// A part that is nothing but a thought signature: it completes the
+/// reasoning right before it, or stands alone as signed, text-less reasoning
+/// (or as withheld reasoning, when the signature says so).
+fn push_signature_carrier(role: Role, signature: switchyard_core::Signature, out: &mut Vec<Part>) {
+    if role != Role::Assistant {
+        return;
+    }
+    push_thought("", Some(signature), out);
 }
 
 fn builtin(kind: BuiltinKind, key: &str, value: &Value) -> Tool {
@@ -533,10 +586,25 @@ fn decode_tool(tool: &Value, out: &mut Vec<Tool>) {
     }
 }
 
-/// `toolConfig` -> tool choice. The second value says whether the canonical
-/// choice lost information (`VALIDATED`, several allowed names, retrieval
-/// settings), in which case the raw object is kept for Gemini upstreams.
-fn decode_tool_config(config: &Value) -> (Option<ToolChoice>, bool) {
+/// What a `toolConfig` says about calling tools.
+struct ToolConfig {
+    choice: Option<ToolChoice>,
+    /// The canonical choice lost information (`VALIDATED`, several allowed
+    /// names, retrieval settings): the raw object is kept for Gemini
+    /// upstreams.
+    lossy: bool,
+    /// `allowedFunctionNames` that the choice does not express by itself:
+    /// the only functions the model may call.
+    restricted_to: Option<Vec<String>>,
+}
+
+/// `toolConfig` -> tool choice.
+///
+/// `allowedFunctionNames` limits the functions the model may call in the
+/// modes that have it (`ANY`, `VALIDATED`). A single name under `ANY` is a
+/// forced tool; any other list is returned as a restriction for the caller
+/// to apply to the tool list.
+fn decode_tool_config(config: &Value) -> ToolConfig {
     let calling = pick(
         config,
         &["functionCallingConfig", "function_calling_config"],
@@ -554,20 +622,31 @@ fn decode_tool_config(config: &Value) -> (Option<ToolChoice>, bool) {
         map.keys()
             .any(|k| k != "functionCallingConfig" && k != "function_calling_config")
     });
-    let (choice, lossy) = match mode.as_str() {
-        "AUTO" => (Some(ToolChoice::Auto), false),
-        "NONE" => (Some(ToolChoice::None), false),
+    let restriction =
+        || (!allowed.is_empty()).then(|| allowed.iter().map(|name| name.to_string()).collect());
+    let (choice, lossy, restricted_to) = match mode.as_str() {
+        "AUTO" => (Some(ToolChoice::Auto), false, None),
+        "NONE" => (Some(ToolChoice::None), false, None),
         "ANY" if allowed.len() == 1 => (
             Some(ToolChoice::Tool {
                 name: allowed[0].to_string(),
             }),
             false,
+            None,
         ),
-        "ANY" => (Some(ToolChoice::Required), !allowed.is_empty()),
-        "VALIDATED" => (Some(ToolChoice::Auto), true),
-        _ => (None, false),
+        "ANY" => (
+            Some(ToolChoice::Required),
+            !allowed.is_empty(),
+            restriction(),
+        ),
+        "VALIDATED" => (Some(ToolChoice::Auto), true, restriction()),
+        _ => (None, false, None),
     };
-    (choice, lossy || other_settings)
+    ToolConfig {
+        choice,
+        lossy: lossy || other_settings,
+        restricted_to,
+    }
 }
 
 fn decode_generation_config(config: &Map<String, Value>, request: &mut Request) {
@@ -623,11 +702,20 @@ fn decode_generation_config(config: &Map<String, Value>, request: &mut Request) 
         && !wants_json
         && !mime.trim().eq_ignore_ascii_case("text/plain")
     {
-        // `text/x.enum` and friends have no canonical equivalent.
+        // `text/x.enum` and friends have no canonical equivalent. The MIME
+        // type and the schema that goes with it are kept as the client wrote
+        // them, so a Gemini upstream gets the same output mode back (see
+        // `encode_generation_config`); the canonical format above is what
+        // the other protocols can make of it.
         leftovers.insert(
             "responseMimeType".to_string(),
             Value::String(mime.to_string()),
         );
+        if let Some(schema) = json_schema {
+            leftovers.insert("responseJsonSchema".to_string(), schema.clone());
+        } else if let Some(schema) = dialect_schema {
+            leftovers.insert("responseSchema".to_string(), schema.clone());
+        }
     }
     if !leftovers.is_empty() {
         request
@@ -734,10 +822,27 @@ pub(crate) fn encode_request(
         // "No summaries" is Gemini's default. It is only spelled out next to a
         // depth: a lone `includeThoughts: false` would create a thinking
         // config on models that may not accept one.
-        if let Some(summary) = reasoning.summary
-            && (summary.is_on() || reasoning.depth.is_some())
-        {
-            set_include_thoughts(&mut body, summary.is_on());
+        match reasoning.summary {
+            Some(summary) => {
+                if summary.is_on() || reasoning.depth.is_some() {
+                    set_include_thoughts(&mut body, summary.is_on());
+                }
+            }
+            // A Chat Completions client has no field that asks for the
+            // reasoning text: servers of that protocol send
+            // `reasoning_content` whenever the model reasons. Turning
+            // reasoning on with `reasoning_effort` is therefore taken as
+            // wanting to see it, or such a client would never get any from
+            // Gemini, whose default is to keep its thoughts to itself.
+            // (Effort `none` decodes to an explicit "no summaries", handled
+            // above.)
+            None => {
+                if request.source == Protocol::OpenaiChat
+                    && reasoning.depth.is_some_and(|depth| depth != Depth::Off)
+                {
+                    set_include_thoughts(&mut body, true);
+                }
+            }
         }
     }
     Ok(body)
@@ -1167,8 +1272,13 @@ fn encode_contents(request: &Request, native: bool, for_count: bool) -> Vec<Valu
         }
     }
 
+    // `contents` must hold at least one turn and open with the user. A
+    // request that is nothing but instructions (valid on both OpenAI
+    // protocols: a lone system message, or `instructions` with an empty
+    // `input`) would otherwise go out as `contents: []`, which Gemini
+    // refuses.
     let mut contents: Vec<Value> = Vec::with_capacity(turns.len() + 1);
-    if turns.first().is_some_and(|turn| turn.role == "model") {
+    if turns.first().is_none_or(|turn| turn.role == "model") {
         contents.push(empty_user_turn());
     }
     for mut turn in turns {
@@ -1358,7 +1468,18 @@ fn encode_generation_config(
             config.insert(key.to_string(), f64_value(penalty));
         }
     }
+    // A Gemini client's own output mode that is not JSON (`text/x.enum`):
+    // the decoder kept the MIME type and its schema verbatim, and they are
+    // replayed below instead of the canonical format, which would turn the
+    // request into JSON mode and the answer into a quoted string.
+    let own_mode = native
+        && request
+            .extra
+            .get("generationConfig")
+            .and_then(|leftovers| leftovers.get("responseMimeType"))
+            .is_some_and(Value::is_string);
     match &request.response_format {
+        _ if own_mode => {}
         Some(ResponseFormat::JsonObject) => {
             config.insert(
                 "responseMimeType".to_string(),

@@ -15,7 +15,7 @@ use std::sync::Arc;
 use switchyard_core::config::{Config, ProviderConfig, ProviderKind, is_secret_reference};
 use switchyard_core::reasoning::parse_model_suffix;
 use switchyard_core::util::mask_secret;
-use switchyard_core::{Depth, MaxTokensField, ModelInfo, Protocol, Quirks};
+use switchyard_core::{Depth, ModelInfo, Protocol, Quirks};
 
 /// Resolves a secret as written in the config (`sk-…`, `env:NAME`,
 /// `${NAME}`) to its value. `Err` carries the name of the unset variable.
@@ -420,14 +420,7 @@ impl Registry {
         let mut provider_index = HashMap::new();
         for (index, provider) in config.providers.iter().enumerate() {
             let models = provider_models(provider, discovered.get(&provider.name));
-            let quirks = Quirks {
-                max_tokens_field: if provider.uses_legacy_max_tokens() {
-                    MaxTokensField::MaxTokens
-                } else {
-                    MaxTokensField::MaxCompletionTokens
-                },
-                ..Quirks::default()
-            };
+            let quirks = provider.quirks();
             provider_index.entry(provider.name.clone()).or_insert(index);
             providers.push(ProviderEntry {
                 config: Arc::new(provider.clone()),

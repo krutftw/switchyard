@@ -386,10 +386,22 @@ fn decode_tool_choice_object_variants() {
         named("mcp__github__get_me")
     );
 
-    // Not expressible in the IR: kept verbatim for same-family upstreams.
+    // Not expressible in the IR: the mode is the choice, the tool list is
+    // narrowed to the allowed tools (other protocols have no way to say
+    // "only these"), and the value is kept verbatim for a Responses upstream.
     let allowed = json!({"type": "allowed_tools", "mode": "required", "tools": [{"type": "function", "name": "f"}]});
-    let request = full(allowed.clone());
+    let request = decode(json!({
+        "model": "m", "input": "x", "tool_choice": allowed,
+        "tools": [{"type": "function", "name": "f"}, {"type": "function", "name": "g"},
+                  {"type": "web_search"}]
+    }));
     assert_eq!(request.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(request.extra.get("tool_choice"), Some(&allowed));
+    let names: Vec<Option<&str>> = request.tools.iter().map(Tool::name).collect();
+    assert_eq!(names, vec![Some("f")]);
+    // Nothing that is allowed is declared: nothing may be called.
+    let request = full(allowed.clone());
+    assert_eq!(request.tool_choice, Some(ToolChoice::None));
     assert_eq!(request.extra.get("tool_choice"), Some(&allowed));
 
     let hosted = json!({"type": "web_search_preview"});

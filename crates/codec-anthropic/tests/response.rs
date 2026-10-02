@@ -478,11 +478,19 @@ fn encode_response_parallel_tool_calls() {
     // A missing id is minted; unparsable arguments are wrapped, not lost.
     assert!(content[3]["id"].as_str().unwrap().starts_with("toolu_"));
     assert_eq!(content[3]["input"], json!({"input": "{\"a\":"}));
+    // A `tool_use` block has no field for the signature another vendor put
+    // on the call, so it travels on a text-less `thinking` block right ahead
+    // of the call, marked as a call signature and tagged with its origin.
     assert_eq!(
         content[4],
+        json!({"type": "thinking", "thinking": "", "signature": "sy1.g.call:thought"})
+    );
+    assert_eq!(
+        content[5],
         json!({"type": "tool_use", "id": "call_custom", "name": "apply_patch",
                "input": {"input": "*** Begin Patch"}})
     );
+    assert_eq!(content.len(), 6);
     assert_eq!(body["stop_reason"], json!("tool_use"));
 }
 

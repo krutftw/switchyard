@@ -2,7 +2,9 @@
 //! [`Response`] and canonical [`Response`] → client body. The stop-reason,
 //! usage and block helpers are shared with the stream code.
 
-use crate::blocks::{SigSource, decode_assistant_block, encode_citation, tool_call_input};
+use crate::blocks::{
+    SigSource, call_signature_block, decode_assistant_block, encode_citation, tool_call_input,
+};
 use crate::error::parse_error_value;
 use crate::util::{THIS, non_empty, str_field, u64_field};
 use serde_json::{Map, Value, json};
@@ -68,7 +70,9 @@ pub(crate) struct StopHints {
 ///   upstreams report a plain stop next to tool calls), `stop_sequence` when
 ///   one matched, `end_turn` otherwise;
 /// * `ContentFilter` has no Messages spelling and is reported as `refusal`;
-/// * reasons without an equivalent become `end_turn`;
+/// * reasons without an equivalent become `end_turn`, or `tool_use` when a
+///   tool call is pending (an upstream that ends a tool turn with a reason
+///   of its own must not make the client skip the call);
 /// * `Error` yields `None`: the caller decides how to report a failed
 ///   generation (`null` in a complete response, an `error` event in a stream).
 pub(crate) fn stop_reason(finish: &FinishReason, hints: StopHints) -> Option<&'static str> {
@@ -83,6 +87,7 @@ pub(crate) fn stop_reason(finish: &FinishReason, hints: StopHints) -> Option<&'s
         FinishReason::PauseTurn => "pause_turn",
         FinishReason::ContextWindow => "model_context_window_exceeded",
         FinishReason::Error => return None,
+        FinishReason::Other(_) if hints.tool_use => "tool_use",
         FinishReason::Other(_) => "end_turn",
     })
 }
@@ -216,8 +221,17 @@ pub(crate) fn tool_use_id(id: &str) -> String {
 /// it: its encoder changes the spelling (a `_` prepended to a name that
 /// starts with a digit, for instance) and some models change the case. A
 /// client only recognises its own spelling, so a returned name that is not
-/// one of the declared ones is matched loosely — ignoring case and leading
-/// underscores — and replaced when exactly one declared tool fits.
+/// one of the declared ones is matched loosely — ignoring case, punctuation
+/// and leading underscores — and replaced when exactly one declared tool
+/// fits.
+///
+/// Punctuation and length matter because Anthropic's names are the most
+/// permissive of the four protocols in one respect: 128 characters, where
+/// OpenAI and Gemini stop at 64. An OpenAI upstream is given
+/// `mcp__server__a_very_long_…` cut to 64 characters, and a name with a
+/// character it refuses with a `_` in its place; the call comes back under
+/// that spelling. A returned name of 63 characters or more that is the
+/// beginning of exactly one declared name is therefore that tool.
 #[derive(Debug, Default)]
 pub(crate) struct ToolNames {
     exact: HashSet<String>,
@@ -225,8 +239,23 @@ pub(crate) struct ToolNames {
     loose: HashMap<String, Option<String>>,
 }
 
+/// Shortest returned name that may be a declared one cut short (Gemini cuts
+/// at 64 and may spend one character on a leading `_`).
+const MIN_TRUNCATED_NAME: usize = 63;
+
 fn loose_name(name: &str) -> String {
-    name.trim().trim_start_matches('_').to_ascii_lowercase()
+    let key: String = name
+        .trim()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    key.trim_start_matches('_').to_string()
 }
 
 impl ToolNames {
@@ -256,8 +285,22 @@ impl ToolNames {
         if self.exact.contains(name) {
             return name;
         }
-        match self.loose.get(&loose_name(name)) {
-            Some(Some(declared)) => declared,
+        let key = loose_name(name);
+        match self.loose.get(&key) {
+            Some(Some(declared)) => return declared,
+            Some(None) => return name,
+            None => {}
+        }
+        if name.len() < MIN_TRUNCATED_NAME || key.is_empty() {
+            return name;
+        }
+        let mut cut_short = self
+            .loose
+            .iter()
+            .filter(|(loose, _)| loose.starts_with(&key))
+            .map(|(_, declared)| declared);
+        match (cut_short.next(), cut_short.next()) {
+            (Some(Some(declared)), None) => declared,
             _ => name,
         }
     }
@@ -350,13 +393,19 @@ pub(crate) fn encode_part(part: &Part, names: &ToolNames) -> Option<Value> {
 ///   "stop_sequence"`, as the API does.
 /// * `usage.service_tier` is written only for the vendor's own tier names.
 /// * Tool names are handed back in the client's own spelling ([`ToolNames`]).
+/// * A tool call that carries a signature of its own (Gemini's
+///   `thoughtSignature` on a `functionCall`) is preceded by a text-less
+///   `thinking` block holding it, so a client that echoes the turn returns
+///   it (see [`call_signature_block`]).
 pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Value, CodecError> {
     let names = ToolNames::from_request(&ctx.request);
-    let content: Vec<Value> = response
-        .parts
-        .iter()
-        .filter_map(|part| encode_part(part, &names))
-        .collect();
+    let mut content: Vec<Value> = Vec::with_capacity(response.parts.len());
+    for part in &response.parts {
+        if let Part::ToolCall(call) = part {
+            content.extend(call_signature_block(call));
+        }
+        content.extend(encode_part(part, &names));
+    }
     let hints = StopHints {
         stop_sequence: response.stop_sequence.is_some(),
         tool_use: response

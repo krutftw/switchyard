@@ -3,10 +3,11 @@
 //! for same-protocol passthrough.
 
 use crate::common::{
-    P, ToolIndex, annotation_from_citation, call_id_of, decode_content_part, encode_media_part,
-    fit_call_id, is_content_part_type, non_empty, qualify, reasoning_item_text,
-    signature_from_client, stringish, type_of,
+    BlobKind, P, ToolIndex, annotation_from_citation, call_id_of, decode_content_part,
+    encode_media_part, fit_call_id, fnv64_hex, is_content_part_type, non_empty, qualify,
+    reasoning_item_text, signature_from_client, stringish, type_of,
 };
+use crate::names::UpstreamNames;
 use crate::reasoning::{read_reasoning, write_reasoning, write_summary};
 use crate::schema::portable_parameters;
 use serde_json::{Map, Value, json};
@@ -16,7 +17,7 @@ use switchyard_core::ir::{
     Request, ResponseFormat, Role, Tool, ToolCall, ToolCallKind, ToolChoice, ToolResult,
 };
 use switchyard_core::protocol::Family;
-use switchyard_core::reasoning::{Depth, Fitted, ModelThinking};
+use switchyard_core::reasoning::{Depth, Fitted, ModelThinking, Summary};
 use switchyard_core::util::{new_call_id, str_field, u64_field};
 use switchyard_core::{CodecError, Protocol, RequestMeta, RequestPath, UpstreamCtx};
 
@@ -26,6 +27,10 @@ const MIN_MAX_OUTPUT_TOKENS: u64 = 16;
 
 /// Longest item id the vendor accepts.
 const MAX_ITEM_ID_CHARS: usize = 64;
+
+/// Longest end-user identifier (`user`, `safety_identifier`) the vendor
+/// accepts.
+const MAX_USER_CHARS: usize = 64;
 
 /// Top-level keys that only make sense on the WebSocket transport or are
 /// consumed by the decoder itself; they never go into [`Request::extra`].
@@ -66,6 +71,18 @@ const COUNT_KEYS: &[&str] = &[
     "previous_response_id",
     "conversation",
 ];
+
+/// Text of the system message that accompanies `text.format: json_object`
+/// when the conversation of another protocol's client never says "JSON" (see
+/// [`output_format`]).
+pub(crate) const JSON_OBJECT_INSTRUCTION: &str = "Respond with a single valid JSON object and \
+     nothing else: no explanations and no markdown code fences.";
+
+/// Lead-in of the instruction that describes a JSON schema the `json_schema`
+/// format cannot take (see [`output_format`]).
+pub(crate) const JSON_SCHEMA_INSTRUCTION: &str = "Respond with a single valid JSON value that \
+     conforms to the JSON Schema below and nothing else: no explanations and no markdown code \
+     fences.";
 
 /// `service_tier` values the vendor documents. Tiers of other vendors
 /// (`standard_only`, …) must not be forwarded.
@@ -157,6 +174,10 @@ struct Conversation {
     /// Call ids named explicitly by some output item of the input. Such calls
     /// are never handed to an output that lacks a call id.
     explicit_outputs: HashSet<String>,
+    /// The signature of the tool call that comes next: the blob of the
+    /// carrier reasoning item directly ahead of it (see
+    /// [`BlobKind::Call`]).
+    call_signature: Option<switchyard_core::Signature>,
 }
 
 impl Conversation {
@@ -305,6 +326,26 @@ pub(crate) fn decode_request(body: &Value, path: &RequestPath<'_>) -> Result<Req
     // end up with the name the declaration got, or the upstream is told to
     // call (or shown a call to) a tool it was never offered.
     let declared = ToolIndex::from_request(body);
+
+    // `allowed_tools` restricts the model to some of the declared tools
+    // without rewriting `tools` (which keeps the prompt cache warm). The IR
+    // has no such notion and neither have the other protocols, so the tool
+    // list itself is narrowed: offering every tool with the mode alone would
+    // let the model call exactly the tools the client excluded.
+    if let Some(allowed) = root.get("tool_choice").and_then(allowed_tools) {
+        let named: HashSet<&str> = allowed
+            .iter()
+            .filter_map(|entry| entry.name.as_deref())
+            .map(|name| declared.flat_name(name).unwrap_or(name))
+            .collect();
+        request.tools.retain(|tool| match tool {
+            Tool::Builtin(builtin) => allowed.iter().any(|entry| entry.permits(&builtin.raw)),
+            named_tool => named_tool.name().is_some_and(|name| named.contains(name)),
+        });
+        if request.tools.is_empty() {
+            request.tool_choice = Some(ToolChoice::None);
+        }
+    }
     let flat_name = |name: &mut String| {
         if let Some(flat) = declared.flat_name(name)
             && flat != name.as_str()
@@ -400,6 +441,8 @@ fn decode_item<'a>(
         "" if item.get("text").is_some() => "input_text",
         other => other,
     };
+    // Only the item directly behind a carrier can be the call it signs.
+    let call_signature = conversation.call_signature.take();
     match kind {
         "message" => decode_message(item, conversation),
         "function_call" | "custom_tool_call" => {
@@ -426,7 +469,7 @@ fn decode_item<'a>(
                 } else {
                     ToolCallKind::Function
                 },
-                signature: None,
+                signature: call_signature,
                 cache_control: None,
             }));
         }
@@ -443,9 +486,19 @@ fn decode_item<'a>(
                 return;
             }
             let (signature, redacted) = match blob {
-                Some((signature, redacted)) => (Some(signature), redacted),
+                // The signature of the tool call that follows: it goes back
+                // onto the call. Text a client put on the carrier stays as
+                // unsigned reasoning.
+                Some((signature, BlobKind::Call)) => {
+                    conversation.call_signature = Some(signature);
+                    (None, false)
+                }
+                Some((signature, kind)) => (Some(signature), kind == BlobKind::Redacted),
                 None => (None, false),
             };
+            if text.is_empty() && signature.is_none() {
+                return;
+            }
             conversation.push_assistant(Part::Reasoning(Reasoning {
                 id: non_empty(item, "id").map(str::to_string),
                 text,
@@ -763,8 +816,10 @@ fn decode_tool_choice(choice: &Value) -> (Option<ToolChoice>, bool) {
                         None => (None, false),
                     }
                 }
+                // The mode; the caller narrows the tool list to the allowed
+                // ones (see `allowed_tools`).
                 "allowed_tools" => {
-                    let mode = str_field(choice, "mode").and_then(by_mode);
+                    let mode = str_field(allowed_tools_spec(choice), "mode").and_then(by_mode);
                     (Some(mode.unwrap_or(ToolChoice::Auto)), true)
                 }
                 "auto" | "none" | "required" | "any" => (by_mode(kind), false),
@@ -776,6 +831,84 @@ fn decode_tool_choice(choice: &Value) -> (Option<ToolChoice>, bool) {
         }
         _ => (None, false),
     }
+}
+
+/// Where an `allowed_tools` choice keeps its `mode` and `tools`: on the
+/// choice itself, or (Chat Completions' spelling, sent by clients ported
+/// from it) under a nested `allowed_tools` object.
+fn allowed_tools_spec(choice: &Value) -> &Value {
+    choice
+        .get("allowed_tools")
+        .filter(|nested| nested.is_object())
+        .unwrap_or(choice)
+}
+
+/// One entry of the `tools` list of an `allowed_tools` choice.
+struct AllowedTool {
+    /// The entry's `type`: `function`, `custom`, or a hosted tool's type.
+    kind: String,
+    /// Flat name of a function or custom tool (namespace-qualified when the
+    /// entry names a namespace).
+    name: Option<String>,
+    /// `server_label` of an `mcp` entry.
+    server_label: Option<String>,
+}
+
+impl AllowedTool {
+    /// Whether this entry allows the hosted tool declared as `declaration`.
+    fn permits(&self, declaration: &Value) -> bool {
+        let declared = type_of(declaration);
+        let same_kind = self.kind == declared
+            // `web_search`, `web_search_preview` and their dated variants
+            // name one tool.
+            || (self.kind.starts_with("web_search") && declared.starts_with("web_search"));
+        same_kind
+            && self
+                .server_label
+                .as_deref()
+                .is_none_or(|label| non_empty(declaration, "server_label") == Some(label))
+    }
+}
+
+/// The tools an `allowed_tools` choice restricts the model to; `None` for
+/// every other kind of choice.
+fn allowed_tools(choice: &Value) -> Option<Vec<AllowedTool>> {
+    if type_of(choice) != "allowed_tools" {
+        return None;
+    }
+    let entries = allowed_tools_spec(choice)
+        .get("tools")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    Some(
+        entries
+            .iter()
+            .filter(|entry| entry.is_object())
+            .map(|entry| {
+                let kind = match type_of(entry) {
+                    "" => "function",
+                    other => other,
+                };
+                let inner = entry.get(kind).filter(|v| v.is_object());
+                let field = |key: &str| {
+                    non_empty(entry, key).or_else(|| inner.and_then(|inner| non_empty(inner, key)))
+                };
+                let name = matches!(kind, "function" | "custom")
+                    .then(|| field("name"))
+                    .flatten()
+                    .map(|name| match field("namespace") {
+                        Some(namespace) => qualify(namespace, name),
+                        None => name.to_string(),
+                    });
+                AllowedTool {
+                    kind: kind.to_string(),
+                    name,
+                    server_label: non_empty(entry, "server_label").map(str::to_string),
+                }
+            })
+            .collect(),
+    )
 }
 
 fn decode_format(format: &Value) -> Option<ResponseFormat> {
@@ -826,6 +959,8 @@ struct InputBuilder<'a> {
     /// not to reason rejects them outright, however valid the blob.
     replay_reasoning: bool,
     signed_reasoning: bool,
+    /// How the upstream is told the tool names of this request.
+    names: &'a UpstreamNames,
 }
 
 impl InputBuilder<'_> {
@@ -965,17 +1100,18 @@ impl InputBuilder<'_> {
                 }
                 Part::ToolCall(call) => {
                     let call_id = fit_call_id(&call.id);
+                    let name = self.names.wire(&call.name);
                     let item = match call.kind {
                         ToolCallKind::Custom => json!({
                             "type": "custom_tool_call",
                             "call_id": call_id,
-                            "name": call.name,
+                            "name": name,
                             "input": call.arguments,
                         }),
                         ToolCallKind::Function => json!({
                             "type": "function_call",
                             "call_id": call_id,
-                            "name": call.name,
+                            "name": name,
                             // Strict upstreams reject an empty argument string.
                             "arguments": if call.arguments.trim().is_empty() {
                                 "{}"
@@ -988,8 +1124,11 @@ impl InputBuilder<'_> {
                 }
                 Part::Reasoning(reasoning) => {
                     // Without a blob this vendor issued the item is rejected,
-                    // and a foreign blob cannot be decrypted: drop both.
-                    let Some(signature) = reasoning.signature.as_ref().filter(|s| s.valid_for(P))
+                    // and a foreign blob cannot be decrypted: drop both. A
+                    // blob a Chat Completions upstream issued is as foreign
+                    // here as any other (it is some compatible server's
+                    // signature, not OpenAI's encrypted reasoning).
+                    let Some(signature) = reasoning.signature.as_ref().filter(|s| s.origin == P)
                     else {
                         continue;
                     };
@@ -1027,14 +1166,14 @@ impl InputBuilder<'_> {
     }
 }
 
-fn encode_tools(request: &Request) -> Vec<Value> {
+fn encode_tools(request: &Request, names: &UpstreamNames) -> Vec<Value> {
     let mut tools = Vec::new();
     for tool in &request.tools {
         match tool {
             Tool::Function(function) => {
                 let mut out = Map::new();
                 out.insert("type".into(), json!("function"));
-                out.insert("name".into(), json!(function.name));
+                out.insert("name".into(), json!(names.wire(&function.name)));
                 if let Some(description) = &function.description {
                     out.insert("description".into(), json!(description));
                 }
@@ -1049,22 +1188,26 @@ fn encode_tools(request: &Request) -> Vec<Value> {
                 // Responses defaults `strict` to true, every other protocol
                 // to false: an absent flag must be spelled out unless the
                 // request came from a Responses client (whose omission meant
-                // the Responses default).
+                // the Responses default). `strict` of another vendor's
+                // client is not taken over: strict mode here wants every
+                // property listed in `required`, which a schema written
+                // for Anthropic's strict tools does not promise, and
+                // answers anything else with a 400.
                 match function.strict {
-                    Some(strict) => {
+                    Some(strict) if request.source.family() == Family::Openai => {
                         out.insert("strict".into(), json!(strict));
                     }
-                    None if request.source != P => {
+                    _ if request.source != P => {
                         out.insert("strict".into(), json!(false));
                     }
-                    None => {}
+                    _ => {}
                 }
                 tools.push(Value::Object(out));
             }
             Tool::Custom(custom) => {
                 let mut out = Map::new();
                 out.insert("type".into(), json!("custom"));
-                out.insert("name".into(), json!(custom.name));
+                out.insert("name".into(), json!(names.wire(&custom.name)));
                 if let Some(description) = &custom.description {
                     out.insert("description".into(), json!(description));
                 }
@@ -1080,13 +1223,8 @@ fn encode_tools(request: &Request) -> Vec<Value> {
                 }
                 // Another family's declaration: this API's own default for
                 // the same kind of tool, once.
-                let default = match builtin.kind {
-                    BuiltinKind::WebSearch => json!({"type": "web_search"}),
-                    BuiltinKind::CodeExecution => {
-                        json!({"type": "code_interpreter", "container": {"type": "auto"}})
-                    }
-                    // No hosted equivalent.
-                    BuiltinKind::WebFetch | BuiltinKind::Other(_) => continue,
+                let Some(default) = hosted_tool(&builtin.kind) else {
+                    continue;
                 };
                 if !tools.contains(&default) {
                     tools.push(default);
@@ -1097,31 +1235,206 @@ fn encode_tools(request: &Request) -> Vec<Value> {
     tools
 }
 
-fn encode_tool_choice(request: &Request, choice: &ToolChoice) -> Value {
+/// This API's default declaration of the hosted tool that does what a
+/// provider-executed tool of another vendor does. `None` when there is no
+/// hosted equivalent.
+fn hosted_tool(kind: &BuiltinKind) -> Option<Value> {
+    match kind {
+        BuiltinKind::WebSearch => Some(json!({"type": "web_search"})),
+        BuiltinKind::CodeExecution => {
+            Some(json!({"type": "code_interpreter", "container": {"type": "auto"}}))
+        }
+        BuiltinKind::WebFetch | BuiltinKind::Other(_) => None,
+    }
+}
+
+/// The choice that forces the hosted tool another vendor's provider tool
+/// named `name` was mapped to (see [`hosted_tool`]): a Messages client's
+/// `{"type":"tool","name":"web_search"}` forces its web-search server tool,
+/// which reaches this API as the hosted `web_search`.
+fn hosted_choice(request: &Request, name: &str) -> Option<Value> {
+    request.tools.iter().find_map(|tool| match tool {
+        Tool::Builtin(builtin)
+            if builtin.origin != P && non_empty(&builtin.raw, "name") == Some(name) =>
+        {
+            let kind = hosted_tool(&builtin.kind)?.get("type")?.clone();
+            Some(json!({"type": kind}))
+        }
+        _ => None,
+    })
+}
+
+/// A forced tool the body does not offer (a provider tool of another
+/// protocol this API has no equivalent for, say) is refused by the vendor.
+/// The request then says `none`: a restriction that cannot be honoured must
+/// not turn into permission to call any tool. A forced provider tool that
+/// *was* mapped to a hosted one forces that one ([`hosted_choice`]). A
+/// Responses client's own choice is replayed.
+fn encode_tool_choice(request: &Request, choice: &ToolChoice, names: &UpstreamNames) -> Value {
     match choice {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::None => json!("none"),
         ToolChoice::Required => json!("required"),
         ToolChoice::Tool { name } => {
-            let custom = request
+            // Built-in tools have no name: only functions and custom tools
+            // can be found here.
+            let declared = request
                 .tools
                 .iter()
-                .any(|tool| matches!(tool, Tool::Custom(c) if &c.name == name));
-            json!({"type": if custom { "custom" } else { "function" }, "name": name})
+                .find(|tool| tool.name() == Some(name.as_str()));
+            let wire = names.wire(name);
+            match declared {
+                Some(Tool::Custom(_)) => json!({"type": "custom", "name": wire}),
+                None if request.source != P => {
+                    hosted_choice(request, name).unwrap_or_else(|| json!("none"))
+                }
+                _ => json!({"type": "function", "name": wire}),
+            }
         }
     }
 }
 
-fn encode_format(format: &ResponseFormat) -> Value {
+/// The `user` value for an end-user identifier.
+///
+/// The vendor limits the identifier (`user`, `safety_identifier`) to
+/// [`MAX_USER_CHARS`] characters and answers a longer one with a 400. An
+/// identifier written for another vendor is not bound by that (Anthropic's
+/// `metadata.user_id` may be 256 characters long, and Claude Code's is about
+/// 150), so a longer one is replaced by a prefix of it plus a hash of all of
+/// it: still stable per end user, which is all the field is for. An OpenAI
+/// client's own value is replayed as written.
+fn end_user_id(user: &str, openai_source: bool) -> String {
+    if openai_source || user.chars().count() <= MAX_USER_CHARS {
+        return user.to_string();
+    }
+    let prefix: String = user.chars().take(MAX_USER_CHARS - 17).collect();
+    format!("{prefix}_{}", fnv64_hex(user))
+}
+
+/// How the output format of a request reaches a Responses upstream.
+#[derive(Debug, Default)]
+struct OutputFormat {
+    /// The `text.format` value, when there is one to send.
+    field: Option<Value>,
+    /// Text appended to `instructions`.
+    instruction: Option<String>,
+    /// Text of a system message put at the head of `input`.
+    input_note: Option<String>,
+}
+
+/// Whether any message of the conversation says "JSON", in any case. The
+/// leading instructions are deliberately not looked at: the vendor's rule
+/// speaks of the *input messages*.
+fn mentions_json(request: &Request) -> bool {
+    fn says_json(parts: &[Part]) -> bool {
+        parts.iter().any(|part| match part {
+            Part::Text(text) => text.text.to_ascii_lowercase().contains("json"),
+            Part::ToolResult(result) => says_json(&result.content),
+            _ => false,
+        })
+    }
+    request.messages.iter().any(|m| says_json(&m.parts))
+}
+
+/// A schema as the root of a `json_schema` format: this API takes an object
+/// schema there and nothing else ("schema must be a JSON Schema of 'type:
+/// \"object\"'"). A root that describes an object without saying so (Gemini's
+/// dialect allows that) is given its type; `None` for every other root (an
+/// array, a bare enum, a union).
+fn object_rooted(schema: &Value) -> Option<Value> {
+    let root = schema.as_object()?;
+    let retyped = || {
+        let mut typed = Map::new();
+        typed.insert("type".into(), json!("object"));
+        typed.extend(
+            root.iter()
+                .filter(|(key, _)| key.as_str() != "type")
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Some(Value::Object(typed))
+    };
+    match root.get("type") {
+        Some(Value::String(kind)) if kind == "object" => Some(schema.clone()),
+        // "An object or null" (a nullable root): the object is what can be
+        // asked for.
+        Some(Value::Array(kinds)) if kinds.iter().any(|k| k.as_str() == Some("object")) => {
+            retyped()
+        }
+        None | Some(Value::Null) if root.contains_key("properties") => retyped(),
+        _ => None,
+    }
+}
+
+/// Decides how `request.response_format` is expressed.
+///
+/// An OpenAI client's format (Responses or Chat Completions, whose rules are
+/// the same) is written as it is. For a client of another vendor:
+///
+/// * a schema format without a schema can only mean "some JSON" and becomes
+///   `json_object`;
+/// * a schema whose root is not an object schema (Gemini's `responseSchema`
+///   takes any root; the example in its guide is an array) cannot be a
+///   `json_schema` format: the vendor answers 400, a request fault no
+///   failover repairs. `json_object` would force an object, so the request
+///   then carries no format at all and the schema is described in the
+///   instructions instead, the way JSON output is obtained from an API
+///   without a native field for it;
+/// * `json_object` needs the word "JSON" somewhere in the input ("Response
+///   input messages must contain the word 'json' in some form to use
+///   'text.format' of type 'json_object'"), a rule other vendors' JSON
+///   modes do not have. When no message of a request that was written for
+///   another protocol says it (a Chat Completions client may have said it
+///   in a system message, which travels as `instructions`), a system
+///   message at the head of `input` does.
+fn output_format(request: &Request) -> OutputFormat {
+    let Some(format) = &request.response_format else {
+        return OutputFormat::default();
+    };
+    let other_vendor = request.source.family() != Family::Openai;
+    let json_object = || OutputFormat {
+        field: Some(json!({"type": "json_object"})),
+        instruction: None,
+        input_note: (request.source != P && !mentions_json(request))
+            .then(|| JSON_OBJECT_INSTRUCTION.to_string()),
+    };
     match format {
-        ResponseFormat::Text => json!({"type": "text"}),
-        ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        ResponseFormat::Text => OutputFormat {
+            field: Some(json!({"type": "text"})),
+            ..OutputFormat::default()
+        },
+        ResponseFormat::JsonObject => json_object(),
+        ResponseFormat::JsonSchema { schema, .. } if other_vendor && schema.is_null() => {
+            json_object()
+        }
         ResponseFormat::JsonSchema {
             name,
             description,
             schema,
             strict,
         } => {
+            let schema = if !other_vendor {
+                schema.clone()
+            } else {
+                match object_rooted(schema) {
+                    Some(rooted) => rooted,
+                    None => {
+                        let mut text = JSON_SCHEMA_INSTRUCTION.to_string();
+                        if let Some(name) = name.as_deref().filter(|n| !n.trim().is_empty()) {
+                            text.push_str(&format!("\nSchema name: {name}"));
+                        }
+                        if let Some(description) =
+                            description.as_deref().filter(|d| !d.trim().is_empty())
+                        {
+                            text.push_str(&format!("\nSchema description: {description}"));
+                        }
+                        text.push_str(&format!("\nJSON Schema:\n{schema}"));
+                        return OutputFormat {
+                            instruction: Some(text),
+                            ..OutputFormat::default()
+                        };
+                    }
+                }
+            };
             let mut out = Map::new();
             out.insert("type".into(), json!("json_schema"));
             // `name` is mandatory on this API.
@@ -1129,11 +1442,14 @@ fn encode_format(format: &ResponseFormat) -> Value {
             if let Some(description) = description {
                 out.insert("description".into(), json!(description));
             }
-            out.insert("schema".into(), schema.clone());
+            out.insert("schema".into(), schema);
             if let Some(strict) = strict {
                 out.insert("strict".into(), json!(strict));
             }
-            Value::Object(out)
+            OutputFormat {
+                field: Some(Value::Object(out)),
+                ..OutputFormat::default()
+            }
         }
     }
 }
@@ -1146,11 +1462,24 @@ fn encode_format(format: &ResponseFormat) -> Value {
 ///   are items of their own: tool calls (`function_call` /
 ///   `custom_tool_call`), tool results (`function_call_output` /
 ///   `custom_tool_call_output`), reasoning and provider-specific blocks.
-/// * Reasoning is replayed only when it carries a blob of this vendor family
-///   and is followed by output of the same turn; everything else is dropped.
-///   A model known not to reason ([`ModelThinking::Unsupported`]) gets no
+/// * Reasoning is replayed only when it carries a blob a Responses upstream
+///   issued and is followed by output of the same turn; everything else is
+///   dropped.
+/// * Tool names that came through another protocol are made valid for this
+///   API (see [`crate::names`]); a forced tool the body does not offer
+///   becomes `tool_choice: "none"`, and a forced provider tool of another
+///   vendor that was mapped to a hosted tool forces that tool.
+/// * A model known not to reason ([`ModelThinking::Unsupported`]) gets no
 ///   reasoning items at all, like it gets no reasoning settings: the vendor
 ///   rejects both.
+/// * `reasoning.summary` is written when the request asks for reasoning
+///   text. A Chat Completions client asks by turning reasoning on (it has no
+///   other way to), so its effort brings `summary: "auto"` along unless it
+///   said otherwise. OpenAI only generates summaries for verified
+///   organisations on some models; an operator whose organisation is not
+///   can remove the field with a payload filter rule.
+/// * Output format: see [`output_format`] for what becomes of a JSON schema
+///   and of JSON mode written for another vendor.
 /// * When the model may reason and the request does not rely on stored state
 ///   (`store: true` or `previous_response_id`), the body asks for
 ///   `reasoning.encrypted_content` and sets `store: false`, so the reasoning
@@ -1174,12 +1503,21 @@ pub(crate) fn encode_request(
     let mut body = Map::new();
     body.insert("model".into(), json!(request.model));
 
-    let instructions = request.system_text();
+    let output = output_format(request);
+    let mut instructions = request.system_text();
+    if let Some(instruction) = &output.instruction {
+        if !instructions.is_empty() {
+            instructions.push_str("\n\n");
+        }
+        instructions.push_str(instruction);
+    }
     if !instructions.is_empty() {
         body.insert("instructions".into(), json!(instructions));
     }
 
+    let names = UpstreamNames::for_request(request);
     let mut builder = InputBuilder {
+        names: &names,
         items: Vec::new(),
         pending: None,
         held_reasoning: Vec::new(),
@@ -1202,17 +1540,28 @@ pub(crate) fn encode_request(
         }
     }
     let signed_reasoning = builder.signed_reasoning;
-    body.insert("input".into(), Value::Array(builder.items));
+    let mut input = builder.items;
+    if let Some(note) = &output.input_note {
+        input.insert(
+            0,
+            json!({"type": "message", "role": "system",
+                   "content": [{"type": "input_text", "text": note}]}),
+        );
+    }
+    body.insert("input".into(), Value::Array(input));
 
     // Tool settings without tools are rejected by strict upstreams.
-    let tools = encode_tools(request);
+    let tools = encode_tools(request, &names);
     if !tools.is_empty() {
         body.insert("tools".into(), Value::Array(tools));
         let raw_choice = request.extra.get("tool_choice").filter(|_| same_protocol);
         if let Some(choice) = raw_choice {
             body.insert("tool_choice".into(), choice.clone());
         } else if let Some(choice) = &request.tool_choice {
-            body.insert("tool_choice".into(), encode_tool_choice(request, choice));
+            body.insert(
+                "tool_choice".into(),
+                encode_tool_choice(request, choice, &names),
+            );
         }
         if let Some(parallel) = request.parallel_tool_calls {
             body.insert("parallel_tool_calls".into(), json!(parallel));
@@ -1225,7 +1574,19 @@ pub(crate) fn encode_request(
         if let Some(depth) = config.depth {
             write_reasoning(&mut scratch, Fitted::Use(depth), ctx);
         }
-        if let (Some(summary), Some(root)) = (config.summary, scratch.as_object_mut()) {
+        // A Chat Completions client has no field that asks for reasoning
+        // text: servers of that protocol send `reasoning_content` whenever
+        // the model reasons. Turning reasoning on with `reasoning_effort` is
+        // therefore read as wanting to see it (notes 12 §8.1, §8.3), or such
+        // a client would never get any from this API, which returns
+        // summaries only on request. (Effort `none` decodes to an explicit
+        // "no summaries".)
+        let summary = config.summary.or_else(|| {
+            (request.source == Protocol::OpenaiChat
+                && config.depth.is_some_and(|depth| depth != Depth::Off))
+            .then_some(Summary::Auto)
+        });
+        if let (Some(summary), Some(root)) = (summary, scratch.as_object_mut()) {
             write_summary(root, summary);
         }
         if let Some(reasoning) = scratch.get("reasoning") {
@@ -1243,8 +1604,8 @@ pub(crate) fn encode_request(
             text.insert("verbosity".into(), verbosity.clone());
         }
     }
-    if let Some(format) = &request.response_format {
-        text.insert("format".into(), encode_format(format));
+    if let Some(format) = output.field {
+        text.insert("format".into(), format);
     }
     if !text.is_empty() {
         body.insert("text".into(), Value::Object(text));
@@ -1340,7 +1701,10 @@ pub(crate) fn encode_request(
     if let Some(user) = &request.user
         && safety.and_then(Value::as_str) != Some(user.as_str())
     {
-        body.insert("user".into(), json!(user));
+        body.insert(
+            "user".into(),
+            json!(end_user_id(user, request.source.family() == Family::Openai)),
+        );
     }
     if let Some(safety) = safety {
         body.insert("safety_identifier".into(), safety.clone());

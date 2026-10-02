@@ -313,11 +313,17 @@ impl BodyStore {
     ///   `now`) are removed entirely;
     /// * when `max_total_bytes` is not zero and the remaining files exceed
     ///   it, the oldest files are removed until they fit.
+    ///
+    /// Day directories left empty are removed, except those of today and
+    /// yesterday: [`capture_at`](BodyStore::capture_at) creates the day
+    /// directory and then writes into it, and removing the still-empty
+    /// directory in between would lose that capture.
     pub fn prune(&self, now: i64, retention_days: u32, max_total_bytes: u64) -> usize {
         let Some(dir) = self.dir() else {
             return 0;
         };
-        let first_kept = day_index(now) - i64::from(retention_days.max(1));
+        let today = day_index(now);
+        let first_kept = today - i64::from(retention_days.max(1));
         let mut removed = 0;
         let mut kept_days = Vec::new();
         for (day, day_dir) in day_dirs(dir) {
@@ -327,14 +333,17 @@ impl BodyStore {
                     removed += files;
                 }
             } else {
-                kept_days.push(day_dir);
+                kept_days.push((day, day_dir));
             }
         }
         if max_total_bytes == 0 {
             return removed;
         }
         // Oldest first: by day, then by modification time, then by name.
-        let mut files: Vec<BodyFile> = kept_days.iter().flat_map(|d| body_files(d)).collect();
+        let mut files: Vec<BodyFile> = kept_days
+            .iter()
+            .flat_map(|(_, day_dir)| body_files(day_dir))
+            .collect();
         let mut total: u64 = files.iter().map(|f| f.size).sum();
         files.sort_by(|a, b| {
             (a.path.parent(), a.modified, &a.path).cmp(&(b.path.parent(), b.modified, &b.path))
@@ -348,9 +357,14 @@ impl BodyStore {
                 removed += 1;
             }
         }
-        for day_dir in &kept_days {
-            // Only succeeds when the directory is empty.
-            let _ = fs::remove_dir(day_dir);
+        for (day, day_dir) in &kept_days {
+            // A request is filed under the day it started on, so a capture
+            // in progress can only be creating the directory of today or
+            // (for a request that began before midnight) yesterday.
+            if *day < today - 1 {
+                // Only succeeds when the directory is empty.
+                let _ = fs::remove_dir(day_dir);
+            }
         }
         removed
     }
@@ -829,6 +843,29 @@ mod tests {
         assert_eq!(store.prune(now, 30, size * 5 / 2), 0);
         assert_eq!(store.prune(now, 30, 1), 2);
         assert!(all_files(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn prune_leaves_the_empty_directories_a_capture_may_be_creating() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path(), RequestLogMode::All);
+        let now = T0 + 3 * DAY_MS + 1_000;
+        // What `capture_at` leaves behind between creating the day directory
+        // and writing the file: an empty directory.
+        for day in ["2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05"] {
+            fs::create_dir_all(tmp.path().join("requests").join(day)).unwrap();
+        }
+        assert_eq!(store.prune(now, 30, 1), 0);
+        // Today and yesterday may have a capture in progress.
+        assert!(tmp.path().join("requests/2026-10-05").exists());
+        assert!(tmp.path().join("requests/2026-10-04").exists());
+        // Older empty directories are tidied up.
+        assert!(!tmp.path().join("requests/2026-10-03").exists());
+        assert!(!tmp.path().join("requests/2026-10-02").exists());
+
+        // The capture that was in progress completes.
+        store.capture_at("late", now, true, bodies()).unwrap();
+        assert!(store.read("late").is_some());
     }
 
     #[test]

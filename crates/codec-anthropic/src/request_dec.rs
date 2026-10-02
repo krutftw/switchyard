@@ -1,6 +1,8 @@
 //! Client side: Messages request body → canonical [`Request`].
 
-use crate::blocks::{SigSource, cache_control, decode_assistant_block, decode_user_block};
+use crate::blocks::{
+    SigSource, cache_control, decode_assistant_block, decode_user_block, restore_call_signatures,
+};
 use crate::reasoning::read_reasoning;
 use crate::util::{THIS, TOOL_EXTRAS_KEY, f64_field, non_empty, str_field, u64_field};
 use serde_json::{Map, Value};
@@ -88,17 +90,31 @@ fn decode_message(message: &Value) -> Option<Message> {
         return None;
     }
     let role = decode_role(str_field(message, "role"));
-    let decode_block = |block: &Value| match role {
-        Role::Assistant => decode_assistant_block(block, SigSource::Client),
-        Role::User => decode_user_block(block),
-        // A mid-conversation system message is instructions: text only.
-        Role::System => decode_user_block(block).filter(|part| matches!(part, Part::Text(_))),
+    let decode_block = |block: &Value| -> Vec<Part> {
+        match role {
+            Role::Assistant => decode_assistant_block(block, SigSource::Client)
+                .into_iter()
+                .collect(),
+            Role::User => decode_user_block(block),
+            // A mid-conversation system message is instructions: text only.
+            Role::System => decode_user_block(block)
+                .into_iter()
+                .filter(|part| matches!(part, Part::Text(_)))
+                .collect(),
+        }
     };
     let parts: Vec<Part> = match message.get("content") {
         Some(Value::String(text)) if !text.is_empty() => vec![Part::text(text.clone())],
-        Some(Value::Array(blocks)) => blocks.iter().filter_map(decode_block).collect(),
-        Some(single @ Value::Object(_)) => decode_block(single).into_iter().collect(),
+        Some(Value::Array(blocks)) => blocks.iter().flat_map(decode_block).collect(),
+        Some(single @ Value::Object(_)) => decode_block(single),
         _ => Vec::new(),
+    };
+    // A tool call's signature travels on a thinking block of its own (the
+    // `tool_use` block has no field for it); put it back on the call.
+    let parts = if role == Role::Assistant {
+        restore_call_signatures(parts)
+    } else {
+        parts
     };
     // A turn without content says nothing; the API itself rejects it.
     if parts.is_empty() {
@@ -226,8 +242,13 @@ fn decode_response_format(body: &Value) -> Option<ResponseFormat> {
 /// Errors only when the body is not an object or `messages` is missing or
 /// not an array. `role: "system"` / `"developer"` messages at the head of
 /// `messages` are appended to [`Request::system`]; later ones stay in place
-/// as [`Role::System`] messages. Lost in the IR (and therefore in translation, never in
-/// passthrough): `citations` settings and `context` of document blocks and
+/// as [`Role::System`] messages. User blocks only this protocol has but
+/// whose substance is text (`document` blocks with a `content` source,
+/// `search_result` blocks) are kept verbatim for Anthropic upstreams and
+/// followed by a portable rendering every other upstream can be sent (see
+/// [`crate::blocks::portable_parts`]). Lost in the IR (and therefore in
+/// translation, never in passthrough): `citations` settings and `context`
+/// of PDF and plain-text document blocks and
 /// `thinking` fields other than type / budget / display. Tool fields without
 /// an IR slot survive a round trip to an Anthropic upstream through
 /// [`Request::extra`] and are lost for every other target.

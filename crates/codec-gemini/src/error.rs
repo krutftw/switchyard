@@ -9,7 +9,13 @@
 //! Google states retry hints in the body, not in headers: a `RetryInfo`
 //! detail, an `ErrorInfo` `quotaResetDelay`, or a "Please retry in 12.3s."
 //! sentence at the end of the message.
+//!
+//! Error text that comes from an upstream is never trusted to be free of
+//! credentials (see [`crate::redact`]): everything that enters through
+//! [`decode_error`] / [`api_error_from_payload`] is redacted, and so is
+//! every message that leaves through [`encode_error`].
 
+use crate::redact::redact_secrets;
 use crate::util::pick_str;
 use serde_json::{Map, Value, json};
 use switchyard_core::util::truncate_chars;
@@ -44,10 +50,15 @@ pub(crate) fn status_name(kind: ErrorKind) -> &'static str {
 
 /// Renders an error in Google's envelope. The same object is used as the
 /// in-stream error payload.
+///
+/// The message is redacted once more on the way out: an error another
+/// protocol's decoder took from its upstream is rendered here too, and this
+/// is the last place to catch a credential before it reaches a client.
 pub(crate) fn encode_error(error: &ApiError) -> Value {
+    let message = redact_secrets(&error.message);
     let mut inner = Map::new();
     inner.insert("code".to_string(), Value::from(error.status));
-    inner.insert("message".to_string(), Value::String(error.message.clone()));
+    inner.insert("message".to_string(), Value::String(message.clone()));
     inner.insert("status".to_string(), Value::from(status_name(error.kind)));
     let mut details = Vec::new();
     if let Some(code) = &error.code {
@@ -56,7 +67,7 @@ pub(crate) fn encode_error(error: &ApiError) -> Value {
     if let Some(param) = &error.param {
         details.push(json!({
             "@type": BAD_REQUEST,
-            "fieldViolations": [{"field": param, "description": error.message}],
+            "fieldViolations": [{"field": param, "description": message}],
         }));
     }
     if let Some(secs) = error.retry_after_secs {
@@ -86,7 +97,7 @@ fn kind_from_status_name(status: &str) -> Option<ErrorKind> {
 /// SSE payload) into the error reported to the client.
 pub(crate) fn api_error_from_payload(payload: &Value) -> ApiError {
     let info = info_from_json(payload).unwrap_or_else(|| UpstreamErrorInfo {
-        message: truncate_chars(&payload.to_string(), MAX_MESSAGE_CHARS),
+        message: clean_message(&payload.to_string()),
         ..UpstreamErrorInfo::default()
     });
     let http = find_detail(payload)
@@ -136,11 +147,11 @@ pub(crate) fn decode_error(status: u16, body: &[u8]) -> UpstreamErrorInfo {
     }
     let message = if looks_like_html(trimmed) {
         match html_title(trimmed) {
-            Some(title) => format!("upstream returned HTTP {status}: {title}"),
+            Some(title) => clean_message(&format!("upstream returned HTTP {status}: {title}")),
             None => format!("upstream returned HTTP {status} with an HTML error page"),
         }
     } else {
-        truncate_chars(trimmed, MAX_MESSAGE_CHARS)
+        clean_message(trimmed)
     };
     UpstreamErrorInfo {
         message,
@@ -148,6 +159,12 @@ pub(crate) fn decode_error(status: u16, body: &[u8]) -> UpstreamErrorInfo {
         code: None,
         retry_after_ms: retry_hint_in_text(trimmed),
     }
+}
+
+/// Upstream error text as it may be shown: credentials removed, then cut to
+/// the longest message kept.
+pub(crate) fn clean_message(text: &str) -> String {
+    truncate_chars(&redact_secrets(text), MAX_MESSAGE_CHARS)
 }
 
 /// Locates the error object. Google wraps streamed errors in a one-element
@@ -174,7 +191,7 @@ fn find_detail(value: &Value) -> Option<&Value> {
 
 fn scalar_string(value: Option<&Value>) -> Option<String> {
     match value {
-        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(redact_secrets(text.trim())),
         Some(Value::Number(number)) => Some(number.to_string()),
         _ => None,
     }
@@ -219,9 +236,9 @@ fn info_from_json(value: &Value) -> Option<UpstreamErrorInfo> {
             .error_type
             .clone()
             .or_else(|| info.code.clone())
-            .unwrap_or_else(|| truncate_chars(&value.to_string(), MAX_MESSAGE_CHARS));
+            .unwrap_or_else(|| clean_message(&value.to_string()));
     } else {
-        info.message = truncate_chars(info.message.trim(), MAX_MESSAGE_CHARS);
+        info.message = clean_message(info.message.trim());
     }
     Some(info)
 }

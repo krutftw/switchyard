@@ -27,6 +27,88 @@ pub(crate) fn make_signature(raw: &str, source: SigSource) -> Signature {
     }
 }
 
+/// Marker in front of a blob that is the signature of a *tool call* rather
+/// than of reasoning.
+///
+/// Gemini signs the `functionCall` part itself (`thoughtSignature`), and so
+/// does Google's Chat-compatible endpoint (`extra_content`); the model's
+/// reasoning state is lost when the call is replayed without it. A
+/// `tool_use` block has no field for an opaque blob, a `thinking` block
+/// does, so such a signature is handed to the client on a text-less
+/// `thinking` block directly ahead of the `tool_use` it belongs to
+/// ([`call_signature_block`]), and the request decoder puts it back on the
+/// call ([`restore_call_signatures`]). The marker is what tells that block
+/// from signed reasoning. Blobs are base64, which never contains `:`, so it
+/// cannot collide with one.
+const CALL_MARKER: &str = "call:";
+
+/// The `thinking` block that carries the signature of a tool call to a
+/// Messages client (see [`CALL_MARKER`]). `None` when the call has no
+/// signature to carry.
+pub(crate) fn call_signature_block(call: &ToolCall) -> Option<Value> {
+    let signature = call_signature_for_client(call.signature.as_ref())?;
+    Some(json!({"type": "thinking", "thinking": "", "signature": signature}))
+}
+
+/// The wire form of a tool call's signature: marked, and tagged with the
+/// vendor that issued it. `None` for an empty blob and for one of this
+/// vendor's family, which would travel untagged and be taken for a thinking
+/// signature (the Messages API does not sign tool calls).
+pub(crate) fn call_signature_for_client(signature: Option<&Signature>) -> Option<String> {
+    let signature = signature.filter(|s| !s.data.is_empty() && !s.valid_for(THIS))?;
+    let marked = Signature::new(signature.origin, format!("{CALL_MARKER}{}", signature.data));
+    Some(sig::encode_for_client(&marked, THIS))
+}
+
+/// Undoes [`call_signature_block`] on the parts of an assistant turn a
+/// client sent back: the signature of a carrier block moves onto the tool
+/// call that directly follows it, and the carrier is removed (its text, if a
+/// client put any there, stays as unsigned reasoning). A carrier that is not
+/// followed by a call carries nothing.
+pub(crate) fn restore_call_signatures(parts: Vec<Part>) -> Vec<Part> {
+    let is_carrier = |part: &Part| {
+        matches!(part, Part::Reasoning(Reasoning { signature: Some(signature), redacted: false, .. })
+            if !signature.valid_for(THIS) && signature.data.starts_with(CALL_MARKER))
+    };
+    if !parts.iter().any(is_carrier) {
+        return parts;
+    }
+    let mut out = Vec::with_capacity(parts.len());
+    let mut pending: Option<Signature> = None;
+    for part in parts {
+        match part {
+            Part::Reasoning(mut reasoning)
+                if reasoning.signature.as_ref().is_some_and(|signature| {
+                    !reasoning.redacted
+                        && !signature.valid_for(THIS)
+                        && signature.data.starts_with(CALL_MARKER)
+                }) =>
+            {
+                pending = reasoning.signature.take().map(|mut signature| {
+                    signature.data = signature.data[CALL_MARKER.len()..].to_string();
+                    signature
+                });
+                if !reasoning.text.is_empty() {
+                    out.push(Part::Reasoning(reasoning));
+                }
+            }
+            Part::ToolCall(mut call) => {
+                if let Some(signature) = pending.take()
+                    && call.signature.is_none()
+                {
+                    call.signature = Some(signature);
+                }
+                out.push(Part::ToolCall(call));
+            }
+            other => {
+                pending = None;
+                out.push(other);
+            }
+        }
+    }
+    out
+}
+
 /// The `cache_control` marker of a block, kept verbatim.
 pub(crate) fn cache_control(block: &Value) -> Option<Value> {
     block
@@ -200,9 +282,145 @@ fn decode_document(block: &Value) -> Part {
             media.cache_control = cache_control(block);
             Part::Document(media)
         }
-        // Custom-content documents and unknown source kinds stay verbatim.
+        // Custom-content documents and unknown source kinds stay verbatim
+        // (the former with a portable rendering, see `portable_parts`).
         None => opaque(block),
     }
+}
+
+// ---------------------------------------------------------------------------
+// Portable renderings of Anthropic-only user blocks
+// ---------------------------------------------------------------------------
+
+fn escape_attribute(value: &str) -> String {
+    value.replace('&', "&amp;").replace('"', "&quot;")
+}
+
+/// What other protocols are shown in place of a user block only the Messages
+/// API has but whose substance is plain content the user wants the model to
+/// read: a `document` whose source is a list of content blocks
+/// (`source.type: "content"`, used with citations for retrieval) and a
+/// `search_result` block.
+///
+/// Such a block is kept as a [`Part::Opaque`] so an Anthropic upstream gets
+/// it back verbatim, citations settings and all. Every other encoder drops
+/// opaque blocks of another vendor, which would silently remove the material
+/// the user attached. The decoder therefore lets this rendering follow the
+/// opaque part: the texts of the block wrapped in a tag naming what they are,
+/// then its images. The Anthropic request encoder leaves the rendering out
+/// again ([`native_parts`]), so no upstream ever sees the content twice.
+///
+/// Empty for every other block, and for one that carries neither text nor
+/// an image.
+pub(crate) fn portable_parts(block: &Value) -> Vec<Part> {
+    let (tag, attributes, content) = match str_field(block, "type").unwrap_or("") {
+        "document" => {
+            let Some(source) = block
+                .get("source")
+                .filter(|source| str_field(source, "type") == Some("content"))
+            else {
+                return Vec::new();
+            };
+            (
+                "document",
+                [
+                    ("title", non_empty(block, "title")),
+                    ("context", non_empty(block, "context")),
+                ],
+                source.get("content"),
+            )
+        }
+        "search_result" => (
+            "search_result",
+            [
+                ("title", non_empty(block, "title")),
+                ("source", non_empty(block, "source")),
+            ],
+            block.get("content"),
+        ),
+        _ => return Vec::new(),
+    };
+    let mut texts: Vec<&str> = Vec::new();
+    let mut media: Vec<Part> = Vec::new();
+    match content {
+        Some(Value::String(text)) => texts.push(text),
+        Some(Value::Array(items)) => {
+            for item in items {
+                match item {
+                    Value::String(text) => texts.push(text),
+                    Value::Object(_) => match str_field(item, "type").unwrap_or("") {
+                        "text" | "" => texts.extend(str_field(item, "text")),
+                        "image" => {
+                            if let image @ Part::Image(_) = decode_image(item) {
+                                media.push(image);
+                            }
+                        }
+                        _ => {}
+                    },
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    texts.retain(|text| !text.trim().is_empty());
+    let mut out = Vec::with_capacity(media.len() + 1);
+    if !texts.is_empty() {
+        let mut rendered = format!("<{tag}");
+        for (name, value) in attributes {
+            if let Some(value) = value {
+                rendered.push_str(&format!(" {name}=\"{}\"", escape_attribute(value)));
+            }
+        }
+        rendered.push_str(">\n");
+        rendered.push_str(&texts.join("\n\n"));
+        rendered.push_str(&format!("\n</{tag}>"));
+        out.push(Part::text(rendered));
+    }
+    for mut part in media {
+        clear_cache_control(&mut part);
+        out.push(part);
+    }
+    out
+}
+
+/// A decoded user block followed by its portable rendering, when it is an
+/// opaque block that has one (see [`portable_parts`]).
+fn with_portable(part: Option<Part>, block: &Value) -> Vec<Part> {
+    let Some(part) = part else {
+        return Vec::new();
+    };
+    let rendering = match &part {
+        Part::Opaque(_) => portable_parts(block),
+        _ => Vec::new(),
+    };
+    let mut out = Vec::with_capacity(rendering.len() + 1);
+    out.push(part);
+    out.extend(rendering);
+    out
+}
+
+/// The parts of a user turn (or of a tool result) as an Anthropic upstream
+/// is sent them: an opaque block of this protocol stands for itself, so the
+/// portable rendering the decoder put behind it ([`portable_parts`]) is left
+/// out. Parts that merely look alike but do not directly follow their block
+/// are kept.
+pub(crate) fn native_parts(parts: &[Part]) -> Vec<&Part> {
+    let mut out = Vec::with_capacity(parts.len());
+    let mut at = 0;
+    while at < parts.len() {
+        out.push(&parts[at]);
+        if let Part::Opaque(opaque) = &parts[at]
+            && opaque.origin == THIS
+        {
+            let rendering = portable_parts(&opaque.raw);
+            if !rendering.is_empty() && parts[at + 1..].starts_with(&rendering) {
+                at += rendering.len();
+            }
+        }
+        at += 1;
+    }
+    out
 }
 
 /// Serialises a `tool_use.input` value as canonical argument text.
@@ -259,9 +477,10 @@ fn decode_tool_result(block: &Value) -> Part {
                 "text" | "" => decode_text(item),
                 "image" => Some(decode_image(item)),
                 "document" => Some(decode_document(item)),
+                // `search_result` (retrieval tools) and anything newer.
                 _ => Some(opaque(item)),
             };
-            if let Some(mut part) = part {
+            for mut part in with_portable(part, item) {
                 clear_cache_control(&mut part);
                 content.push(part);
             }
@@ -297,14 +516,16 @@ fn clear_cache_control(part: &mut Part) {
     }
 }
 
-/// Decodes one block of a user turn. `None` means "drop it".
-pub(crate) fn decode_user_block(block: &Value) -> Option<Part> {
+/// Decodes one block of a user turn into its part, followed by the portable
+/// rendering of a block only this protocol has ([`portable_parts`]). Empty
+/// means "drop it".
+pub(crate) fn decode_user_block(block: &Value) -> Vec<Part> {
     match block {
-        Value::String(text) if !text.is_empty() => return Some(Part::text(text.clone())),
+        Value::String(text) if !text.is_empty() => return vec![Part::text(text.clone())],
         Value::Object(_) => {}
-        _ => return None,
+        _ => return Vec::new(),
     }
-    match str_field(block, "type").unwrap_or("") {
+    let part = match str_field(block, "type").unwrap_or("") {
         "text" => decode_text(block),
         "image" => Some(decode_image(block)),
         "document" => Some(decode_document(block)),
@@ -315,7 +536,8 @@ pub(crate) fn decode_user_block(block: &Value) -> Option<Part> {
         "tool_use" | "thinking" | "redacted_thinking" => None,
         "" => decode_text(block),
         _ => Some(opaque(block)),
-    }
+    };
+    with_portable(part, block)
 }
 
 /// Decodes one block of an assistant turn (request history or a response).

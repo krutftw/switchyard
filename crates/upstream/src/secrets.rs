@@ -32,8 +32,11 @@ const ANYWHERE_MIN_BYTES: usize = 8;
 /// Anything shorter than this protects nothing and is left alone.
 const TOKEN_MIN_BYTES: usize = 4;
 
-/// Secrets shorter than this are hidden completely when displayed:
-/// `mask_secret` keeps up to seven characters, which is most of a short key.
+/// Secrets shorter than this are hidden completely when displayed, and
+/// without revealing their length. `mask_secret` on its own already hides
+/// secrets of up to 11 characters, but it still shows the first and last
+/// characters of a 12–19 character one; a header value that short is as
+/// likely a password as a key, so nothing of it is shown here.
 const MASK_MIN_CHARS: usize = 20;
 
 /// Header names whose values never carry a credential and may be shown.
@@ -280,10 +283,12 @@ mod tests {
             display_header_value("Authorization", "Bearer sk-proj-abcdefghijklmnopqrstuvwxyz"),
             "Bearer sk-pro…wxyz"
         );
-        assert_eq!(
-            display_header_value("Helicone-Auth", "Bearer sk-helicone-abcdefg-hijklmn"),
-            "Bearer sk-hel…klmn"
-        );
+        // A 27-character secret shows four leading and three trailing
+        // characters, and nothing in between.
+        let shown = display_header_value("Helicone-Auth", "Bearer sk-helicone-abcdefg-hijklmn");
+        assert_eq!(shown, "Bearer sk-h…lmn");
+        assert!(!shown.contains("helicone"), "{shown}");
+        assert!(!shown.contains("abcdefg"), "{shown}");
         assert_eq!(
             display_header_value(
                 "Ocp-Apim-Subscription-Key",

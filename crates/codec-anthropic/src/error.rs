@@ -1,6 +1,12 @@
 //! The Messages error envelope: rendering [`ApiError`] for clients and
 //! understanding upstream error bodies.
+//!
+//! Error text that comes from an upstream is never trusted to be free of
+//! credentials (see [`crate::redact`]): everything [`parse_error_value`] and
+//! [`decode_error`] return is redacted, and so is every message that leaves
+//! through [`encode_error`].
 
+use crate::redact::redact_secrets;
 use crate::util::str_field;
 use serde_json::{Value, json};
 use switchyard_core::util::truncate_chars;
@@ -42,10 +48,14 @@ pub(crate) fn error_type(error: &ApiError) -> &'static str {
 
 /// `{"type":"error","error":{"type":…,"message":…}}`. The same object is the
 /// payload of an in-stream `event: error`.
+///
+/// The message is redacted once more on the way out: an error another
+/// protocol's decoder took from its upstream is rendered here too, and this
+/// is the last place to catch a credential before it reaches a client.
 pub(crate) fn encode_error(error: &ApiError) -> Value {
     json!({
         "type": "error",
-        "error": {"type": error_type(error), "message": error.message},
+        "error": {"type": error_type(error), "message": redact_secrets(&error.message)},
     })
 }
 
@@ -201,8 +211,17 @@ pub(crate) fn retry_hint_in_text(text: &str) -> Option<u64> {
 ///   wrapped in an array;
 /// * flat bodies: `{"error":"…"}`, `{"message":"…"}`, `{"detail":"…"}`.
 ///
-/// `None` when the value has none of these shapes.
+/// `None` when the value has none of these shapes. The text fields of the
+/// result are free of credentials.
 pub(crate) fn parse_error_value(value: &Value) -> Option<UpstreamErrorInfo> {
+    let mut info = parse_error_fields(value)?;
+    info.message = redact_secrets(&info.message);
+    info.error_type = info.error_type.map(|kind| redact_secrets(&kind));
+    info.code = info.code.map(|code| redact_secrets(&code));
+    Some(info)
+}
+
+fn parse_error_fields(value: &Value) -> Option<UpstreamErrorInfo> {
     let value = match value {
         Value::Array(items) => items.first()?,
         Value::String(text) if !text.trim().is_empty() => {
@@ -342,12 +361,12 @@ pub(crate) fn decode_error(status: u16, body: &[u8]) -> UpstreamErrorInfo {
         match html_title(text) {
             Some(title) => format!(
                 "upstream returned an HTML page (HTTP {status}): {}",
-                truncate_chars(&title, 200)
+                truncate_chars(&redact_secrets(&title), 200)
             ),
             None => format!("upstream returned an HTML page (HTTP {status})"),
         }
     } else {
-        truncate_chars(text, MAX_RAW_MESSAGE_CHARS)
+        truncate_chars(&redact_secrets(text), MAX_RAW_MESSAGE_CHARS)
     };
     UpstreamErrorInfo {
         retry_after_ms: retry_hint_in_text(text),

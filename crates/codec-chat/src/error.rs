@@ -1,7 +1,13 @@
 //! Error envelopes: rendering [`ApiError`] for Chat clients, parsing the
 //! error bodies of OpenAI and of the many servers that imitate it, and
 //! turning in-stream error frames into [`ApiError`]s.
+//!
+//! Error text that comes from an upstream is never trusted to be free of
+//! credentials (see [`crate::redact`]): everything that enters through
+//! [`decode_error`] / [`api_error_from_stream`] is redacted, and so is every
+//! message that leaves through [`encode_error`].
 
+use crate::redact::redact_secrets;
 use serde_json::{Value, json};
 use switchyard_core::util::truncate_chars;
 use switchyard_core::{ApiError, ErrorKind, UpstreamErrorInfo};
@@ -20,9 +26,14 @@ const MAX_MESSAGE_CHARS: usize = 2000;
 /// | `TooLarge` | `invalid_request_error` | `request_too_large` |
 /// | `RateLimit` | `rate_limit_error` | `rate_limit_exceeded` |
 /// | `Upstream` | `server_error` | `upstream_error` |
-/// | `Unavailable` | `server_error` | `service_unavailable` |
+/// | `Unavailable` | `service_unavailable_error` | `service_unavailable` |
 /// | `Timeout` | `server_error` | `request_timeout` |
 /// | `Internal` | `server_error` | `internal_server_error` |
+///
+/// `Unavailable` has a type of its own because OpenAI's has one: its 503
+/// bodies say `service_unavailable_error`, and clients (and gateways stacked
+/// on this one) tell "overloaded, try again later" from a generic
+/// `server_error` by it. The Responses codec renders the same type.
 fn type_and_code(kind: ErrorKind) -> (&'static str, Option<&'static str>) {
     match kind {
         ErrorKind::InvalidRequest => ("invalid_request_error", None),
@@ -32,7 +43,7 @@ fn type_and_code(kind: ErrorKind) -> (&'static str, Option<&'static str>) {
         ErrorKind::TooLarge => ("invalid_request_error", Some("request_too_large")),
         ErrorKind::RateLimit => ("rate_limit_error", Some("rate_limit_exceeded")),
         ErrorKind::Upstream => ("server_error", Some("upstream_error")),
-        ErrorKind::Unavailable => ("server_error", Some("service_unavailable")),
+        ErrorKind::Unavailable => ("service_unavailable_error", Some("service_unavailable")),
         ErrorKind::Timeout => ("server_error", Some("request_timeout")),
         ErrorKind::Internal => ("server_error", Some("internal_server_error")),
     }
@@ -41,11 +52,15 @@ fn type_and_code(kind: ErrorKind) -> (&'static str, Option<&'static str>) {
 /// Renders an error as the OpenAI error body
 /// `{"error":{"message","type","param","code"}}`. The same object is the
 /// payload of an in-stream error frame.
+///
+/// The message is redacted once more on the way out: an error another
+/// protocol's decoder took from its upstream is rendered here too, and this
+/// is the last place to catch a credential before it reaches a client.
 pub(crate) fn encode_error(error: &ApiError) -> Value {
     let (kind, default_code) = type_and_code(error.kind);
     json!({
         "error": {
-            "message": error.message,
+            "message": redact_secrets(&error.message),
             "type": kind,
             "param": error.param,
             "code": error.code.as_deref().or(default_code),
@@ -75,11 +90,11 @@ pub(crate) fn decode_error(status: u16, body: &[u8]) -> UpstreamErrorInfo {
     }
     let message = if looks_like_html(trimmed) {
         match html_title(trimmed) {
-            Some(title) => format!("upstream returned HTTP {status}: {title}"),
+            Some(title) => clean_message(&format!("upstream returned HTTP {status}: {title}")),
             None => format!("upstream returned HTTP {status} with an HTML error page"),
         }
     } else {
-        truncate_chars(trimmed, MAX_MESSAGE_CHARS)
+        clean_message(trimmed)
     };
     UpstreamErrorInfo {
         message,
@@ -87,6 +102,12 @@ pub(crate) fn decode_error(status: u16, body: &[u8]) -> UpstreamErrorInfo {
         code: None,
         retry_after_ms: retry_hint_ms(trimmed),
     }
+}
+
+/// Upstream error text as it may be shown: credentials removed, then cut to
+/// the longest message kept.
+pub(crate) fn clean_message(text: &str) -> String {
+    truncate_chars(&redact_secrets(text), MAX_MESSAGE_CHARS)
 }
 
 /// Locates the error object inside the shapes "OpenAI-compatible" servers
@@ -110,7 +131,7 @@ fn find_detail(value: &Value) -> Option<&Value> {
 
 fn scalar_string(value: Option<&Value>) -> Option<String> {
     match value {
-        Some(Value::String(text)) if !text.trim().is_empty() => Some(text.trim().to_string()),
+        Some(Value::String(text)) if !text.trim().is_empty() => Some(redact_secrets(text.trim())),
         Some(Value::Number(n)) => Some(n.to_string()),
         _ => None,
     }
@@ -169,7 +190,7 @@ fn info_from_json(value: &Value) -> Option<UpstreamErrorInfo> {
     if info.retry_after_ms.is_none() {
         info.retry_after_ms = explicit_retry_ms(value).or_else(|| retry_hint_ms(&info.message));
     }
-    info.message = truncate_chars(&info.message, MAX_MESSAGE_CHARS);
+    info.message = clean_message(&info.message);
     Some(info)
 }
 
@@ -360,7 +381,7 @@ fn stream_status(payload: &Value, info: &UpstreamErrorInfo) -> u16 {
 /// exhausted upstream balance (402) is a 429, as for failed HTTP calls.
 pub(crate) fn api_error_from_stream(payload: &Value) -> ApiError {
     let info = info_from_json(payload).unwrap_or_else(|| UpstreamErrorInfo {
-        message: truncate_chars(&payload.to_string(), MAX_MESSAGE_CHARS),
+        message: clean_message(&payload.to_string()),
         ..UpstreamErrorInfo::default()
     });
     let status = stream_status(payload, &info);

@@ -3,10 +3,11 @@
 //! same-protocol passthrough.
 
 use crate::common::{
-    PROTOCOL, Side, apply_message_cache_control, bool_of, cache_control_of, f64_of, i64_of,
-    parts_from_content, reasoning_from_message, str_of, text_to_wire, tool_call_from_wire,
+    CallSpelling, PROTOCOL, Side, apply_message_cache_control, bool_of, cache_control_of, f64_of,
+    i64_of, parts_from_content, reasoning_from_message, str_of, text_to_wire, tool_call_from_wire,
     tool_call_to_wire, user_part_to_wire, write_reasoning_fields,
 };
+use crate::names::{UpstreamIds, UpstreamNames, fnv1a64};
 use crate::reasoning;
 use crate::schema::{normalize_parameters, normalize_schema};
 use serde_json::{Map, Value, json};
@@ -15,7 +16,7 @@ use switchyard_core::codec::{MaxTokensField, RequestMeta, RequestPath, UpstreamC
 use switchyard_core::error::CodecError;
 use switchyard_core::ir::{
     BuiltinKind, BuiltinTool, CustomTool, FunctionTool, Message, Part, Reasoning, RefusalPart,
-    Request, ResponseFormat, Role, Tool, ToolChoice, ToolResult,
+    Request, ResponseFormat, Role, Tool, ToolCall, ToolCallKind, ToolChoice, ToolResult,
 };
 use switchyard_core::protocol::{Family, Protocol};
 use switchyard_core::util::{new_call_id, u64_field};
@@ -68,19 +69,49 @@ const PASSTHROUGH_EXTRAS: &[&str] = &[
     "prediction",
     "verbosity",
     "safety_identifier",
+    "include_reasoning",
 ];
-
-/// `service_tier` values OpenAI accepts. Other vendors' tiers (Anthropic's
-/// `standard_only`) would be rejected, so they are not forwarded.
-const OPENAI_SERVICE_TIERS: &[&str] = &["auto", "default", "flex", "scale", "priority"];
 
 /// Tool-message text used when a tool returned only media. Chat tool
 /// messages are text-only, so the media travels in the next user message.
 const TOOL_MEDIA_PLACEHOLDER: &str =
     "[The tool returned non-text content; it is attached to the next user message.]";
 
+/// OpenAI accepts at most this many stop sequences.
+const MAX_STOP_SEQUENCES: usize = 4;
+
+/// Longest end-user identifier (`user`, `safety_identifier`) OpenAI accepts.
+const MAX_USER_CHARS: usize = 64;
+
 /// Lead-in of the user message that relays media returned by tools.
 const TOOL_MEDIA_NOTICE: &str = "Content returned by the preceding tool call(s):";
+
+/// System instruction that accompanies `response_format: json_object` when
+/// the conversation of another protocol's client never says "JSON" (see
+/// [`output_format`]).
+pub(crate) const JSON_OBJECT_INSTRUCTION: &str = "Respond with a single valid JSON object and \
+     nothing else: no explanations and no markdown code fences.";
+
+/// Lead-in of the system instruction that describes a JSON schema the
+/// `json_schema` response format cannot take (see [`output_format`]).
+pub(crate) const JSON_SCHEMA_INSTRUCTION: &str = "Respond with a single valid JSON value that \
+     conforms to the JSON Schema below and nothing else: no explanations and no markdown code \
+     fences.";
+
+/// The [`PASSTHROUGH_EXTRAS`] that are replayed for a Chat client only.
+///
+/// Like `store`, `metadata`, `prompt_cache_key` and `service_tier`,
+/// `safety_identifier` exists on OpenAI's own platform only. A Chat client
+/// wrote such fields for this protocol; a request of another protocol is
+/// translated to Chat when the provider speaks nothing else, which in
+/// practice is an OpenAI-compatible server, and those that validate their
+/// request schema refuse unknown fields. (Notes 08 §5.1 ends the Responses
+/// -> Chat table with "everything else: dropped".)
+///
+/// `include_reasoning` is a relay's visibility switch (OpenRouter). It is
+/// never invented for an upstream (notes 12 §8.3), only handed back to the
+/// Chat upstream of the client that wrote it.
+const CHAT_CLIENT_EXTRAS: &[&str] = &["safety_identifier", "include_reasoning"];
 
 // ---------------------------------------------------------------------------
 // Inspect / patch
@@ -249,6 +280,12 @@ pub(crate) fn decode_request(body: &Value, path: &RequestPath<'_>) -> Result<Req
         if !MODELLED_FIELDS.contains(&key.as_str()) {
             req.extra.insert(key.clone(), value.clone());
         }
+    }
+    // Read into the summary intent above, and kept as written as well: a
+    // Chat upstream is handed the switch back (see `CHAT_CLIENT_EXTRAS`).
+    if let Some(include) = bool_of(body, "include_reasoning") {
+        req.extra
+            .insert("include_reasoning".into(), Value::Bool(include));
     }
     Ok(req)
 }
@@ -598,18 +635,33 @@ pub(crate) fn encode_request(
     // Schemas a Chat client wrote are forwarded as they are; schemas written
     // for another protocol are normalised to what Chat upstreams accept.
     let foreign_schemas = request.source != PROTOCOL;
+    // Names and ids written for another protocol are fitted to OpenAI's
+    // limits; a Chat client's own are replayed.
+    let spelling = Spelling {
+        names: UpstreamNames::for_request(request),
+        ids: UpstreamIds::for_request(request),
+        foreign: request.source != PROTOCOL,
+    };
 
+    let output = output_format(request);
     let mut messages: Vec<Value> = Vec::new();
-    messages.extend(system_message(&request.system, None));
+    match &output.instruction {
+        Some(instruction) => {
+            let mut system = request.system.clone();
+            system.push(Part::text(instruction.clone()));
+            messages.extend(system_message(&system, None));
+        }
+        None => messages.extend(system_message(&request.system, None)),
+    }
     // Ids of the tool calls emitted so far that no tool message has answered
     // yet. Only these may be answered by a `tool` message.
     let mut awaiting: Vec<String> = Vec::new();
     for msg in &request.messages {
         match msg.role {
             Role::System => messages.extend(system_message(&msg.parts, msg.name.as_deref())),
-            Role::User => encode_user(msg, openai_source, &mut awaiting, &mut messages),
+            Role::User => encode_user(msg, openai_source, &spelling, &mut awaiting, &mut messages),
             Role::Assistant => {
-                if let Some(message) = encode_assistant(msg) {
+                if let Some(message) = encode_assistant(msg, &spelling) {
                     awaiting.extend(call_ids(&message).into_iter().map(str::to_string));
                     messages.push(message);
                 }
@@ -626,6 +678,15 @@ pub(crate) fn encode_request(
             MaxTokensField::MaxCompletionTokens => "max_completion_tokens",
             MaxTokensField::MaxTokens => "max_tokens",
         };
+        // A limit above what the target model can produce is answered with
+        // a 400 ("max_tokens is too large"), and clients of other protocols
+        // state limits written for *their* model (Claude Code asks for
+        // 32000 or 64000). When the model's own limit is known the request
+        // is lowered to it, as the other three encoders do.
+        let limit = match ctx.max_output_tokens {
+            Some(model_limit) if model_limit > 0 => limit.min(model_limit),
+            _ => limit,
+        };
         body.insert(field.into(), json!(limit));
     }
     if let Some(v) = request.temperature {
@@ -639,11 +700,29 @@ pub(crate) fn encode_request(
     if let Some(v) = request.top_k.filter(|_| request.source == PROTOCOL) {
         body.insert("top_k".into(), json!(v));
     }
-    if let Some(n) = request.candidate_count {
+    // The gateway shows a client of another protocol exactly one candidate
+    // (`ir::Request::candidate_count`), so a count written for one (Gemini's
+    // `candidateCount`) would only make the upstream generate, and bill,
+    // completions nobody reads. A Chat client's own `n` is replayed.
+    if let Some(n) = request.candidate_count.filter(|_| !spelling.foreign) {
         body.insert("n".into(), json!(n));
     }
-    if !request.stop.is_empty() {
-        body.insert("stop".into(), json!(request.stop));
+    // A Chat client's own list is replayed; a list written for a protocol
+    // with a higher limit (Gemini takes five, Anthropic thousands) is cut
+    // to what OpenAI accepts instead of failing the request.
+    let stop_limit = if spelling.foreign {
+        MAX_STOP_SEQUENCES
+    } else {
+        usize::MAX
+    };
+    let stop: Vec<&String> = request
+        .stop
+        .iter()
+        .filter(|s| !s.is_empty())
+        .take(stop_limit)
+        .collect();
+    if !stop.is_empty() {
+        body.insert("stop".into(), json!(stop));
     }
     if let Some(v) = request.seed {
         body.insert("seed".into(), json!(v));
@@ -654,19 +733,19 @@ pub(crate) fn encode_request(
     if let Some(v) = request.frequency_penalty {
         body.insert("frequency_penalty".into(), json!(v));
     }
-    if let Some(format) = &request.response_format {
-        body.insert(
-            "response_format".into(),
-            encode_response_format(format, foreign_schemas),
-        );
+    if let Some(format) = output.field {
+        body.insert("response_format".into(), format);
     }
 
-    let (tools, web_search_options) = encode_tools(request, foreign_schemas);
+    let (tools, web_search_options) = encode_tools(request, foreign_schemas, &spelling.names);
     if !tools.is_empty() {
         body.insert("tools".into(), Value::Array(tools));
         // Both fields are rejected by OpenAI when no tools are declared.
         if let Some(choice) = &request.tool_choice {
-            body.insert("tool_choice".into(), encode_tool_choice(choice, request));
+            body.insert(
+                "tool_choice".into(),
+                encode_tool_choice(choice, request, &spelling.names),
+            );
         }
         if let Some(parallel) = request.parallel_tool_calls {
             body.insert("parallel_tool_calls".into(), json!(parallel));
@@ -681,35 +760,31 @@ pub(crate) fn encode_request(
         body.insert("web_search_options".into(), options);
     }
     if let Some(user) = &request.user {
-        body.insert("user".into(), json!(user));
+        body.insert("user".into(), json!(end_user_id(user, openai_source)));
     }
-    // Other vendors' metadata means nothing to a Chat upstream. Chat only
-    // allows `metadata` on stored completions ("The 'metadata' parameter is
-    // only allowed when 'store' is enabled"), whereas Responses accepts it
-    // unconditionally, so a Responses client's metadata is only forwarded
-    // together with `store: true`. A Chat client's own body is replayed as
-    // it was written.
-    let metadata_allowed = match request.source {
-        Protocol::OpenaiChat => true,
-        Protocol::OpenaiResponses => request.store == Some(true),
-        _ => false,
-    };
-    if metadata_allowed && let Some(metadata) = &request.metadata {
-        body.insert("metadata".into(), Value::Object(metadata.clone()));
-    }
-    if let Some(tier) = &request.service_tier
-        && (openai_source || OPENAI_SERVICE_TIERS.contains(&tier.as_str()))
-    {
-        body.insert("service_tier".into(), json!(tier));
-    }
-    if let Some(key) = &request.prompt_cache_key {
-        body.insert("prompt_cache_key".into(), json!(key));
-    }
-    if let Some(store) = request.store {
-        body.insert("store".into(), json!(store));
+    // What only OpenAI's platform knows is replayed for a Chat client and
+    // left out for everyone else (see `CHAT_CLIENT_EXTRAS`): `metadata` (which
+    // Chat only allows on stored completions anyway), `service_tier`,
+    // `prompt_cache_key` and `store`.
+    if !spelling.foreign {
+        if let Some(metadata) = &request.metadata {
+            body.insert("metadata".into(), Value::Object(metadata.clone()));
+        }
+        if let Some(tier) = &request.service_tier {
+            body.insert("service_tier".into(), json!(tier));
+        }
+        if let Some(key) = &request.prompt_cache_key {
+            body.insert("prompt_cache_key".into(), json!(key));
+        }
+        if let Some(store) = request.store {
+            body.insert("store".into(), json!(store));
+        }
     }
     if openai_source {
         for key in PASSTHROUGH_EXTRAS {
+            if spelling.foreign && CHAT_CLIENT_EXTRAS.contains(key) {
+                continue;
+            }
             let Some(value) = request.extra.get(*key).filter(|v| !v.is_null()) else {
                 continue;
             };
@@ -727,6 +802,23 @@ pub(crate) fn encode_request(
         body.insert("stream_options".into(), json!({"include_usage": true}));
     }
     Ok(Value::Object(body))
+}
+
+/// The `user` value for an end-user identifier.
+///
+/// OpenAI limits the identifier to [`MAX_USER_CHARS`] characters and answers
+/// a longer one with a 400. An identifier written for another vendor is not
+/// bound by that (Anthropic's `metadata.user_id` may be 256 characters long,
+/// and Claude Code's is about 150), so a longer one is replaced by a prefix
+/// of it plus a hash of all of it: still stable per end user, which is all
+/// the field is for (abuse attribution, cache routing). An OpenAI client's
+/// own value is replayed as written.
+fn end_user_id(user: &str, openai_source: bool) -> String {
+    if openai_source || user.chars().count() <= MAX_USER_CHARS {
+        return user.to_string();
+    }
+    let prefix: String = user.chars().take(MAX_USER_CHARS - 17).collect();
+    format!("{prefix}_{:016x}", fnv1a64(user))
 }
 
 /// Builds a `system` message from the text parts of `parts`. Non-text parts
@@ -766,6 +858,7 @@ fn system_message(parts: &[Part], name: Option<&str>) -> Option<Value> {
 fn encode_user(
     msg: &Message,
     openai_source: bool,
+    spelling: &Spelling,
     awaiting: &mut Vec<String>,
     out: &mut Vec<Value>,
 ) {
@@ -795,15 +888,16 @@ fn encode_user(
         } else {
             texts.join("\n\n")
         };
-        let answers = (!result.call_id.is_empty())
-            .then(|| awaiting.iter().position(|id| *id == result.call_id))
+        let call_id = spelling.ids.wire(&result.call_id);
+        let answers = (!call_id.is_empty())
+            .then(|| awaiting.iter().position(|id| *id == call_id))
             .flatten();
         match answers {
             Some(position) => {
                 awaiting.remove(position);
                 out.push(json!({
                     "role": "tool",
-                    "tool_call_id": result.call_id,
+                    "tool_call_id": call_id,
                     "content": text
                 }));
             }
@@ -847,13 +941,16 @@ fn encode_user(
 
 /// An assistant turn is always exactly one Chat message.
 ///
+/// Tool calls are written under the upstream's spelling of their name and
+/// id (see [`Spelling`]).
+///
 /// Reasoning: blobs issued by another vendor family are dropped together
 /// with their text (it is that vendor's private state). Unsigned reasoning
 /// and reasoning from the OpenAI family is replayed as `reasoning_content`,
 /// which thinking-mode Chat servers (DeepSeek, Kimi) require next to tool
 /// calls; blobs that came out of a Chat upstream go back in
 /// `reasoning_details`, the slot they came from.
-fn encode_assistant(msg: &Message) -> Option<Value> {
+fn encode_assistant(msg: &Message, spelling: &Spelling) -> Option<Value> {
     let mut text = String::new();
     let mut refusal = String::new();
     let mut calls: Vec<Value> = Vec::new();
@@ -868,7 +965,30 @@ fn encode_assistant(msg: &Message) -> Option<Value> {
                     .as_ref()
                     .filter(|s| s.valid_for(PROTOCOL) && s.origin == PROTOCOL)
                     .map(|s| s.data.clone());
-                calls.push(tool_call_to_wire(call, signature));
+                let id = (!call.id.is_empty()).then(|| spelling.ids.wire(&call.id));
+                // A free-form call of another protocol's client is replayed
+                // as a call of the function that stands in for the custom
+                // tool (see `encode_tools`): its raw input is the function's
+                // one argument.
+                let stand_in;
+                let call = if spelling.foreign && call.kind == ToolCallKind::Custom {
+                    stand_in = ToolCall {
+                        arguments: json!({"input": call.arguments}).to_string(),
+                        kind: ToolCallKind::Function,
+                        ..call.clone()
+                    };
+                    &stand_in
+                } else {
+                    call
+                };
+                calls.push(tool_call_to_wire(
+                    call,
+                    signature,
+                    &CallSpelling {
+                        id: id.as_deref(),
+                        name: Some(spelling.names.wire(&call.name)),
+                    },
+                ));
             }
             Part::Reasoning(r) => {
                 if r.signature.as_ref().is_none_or(|s| s.valid_for(PROTOCOL)) {
@@ -907,36 +1027,151 @@ fn encode_assistant(msg: &Message) -> Option<Value> {
     (has_payload || msg.parts.is_empty()).then_some(Value::Object(m))
 }
 
-fn encode_response_format(format: &ResponseFormat, foreign_schema: bool) -> Value {
+/// How the output format of a request reaches a Chat upstream.
+#[derive(Debug, Default)]
+struct OutputFormat {
+    /// The `response_format` value, when there is one to send.
+    field: Option<Value>,
+    /// Text appended to the system instructions.
+    instruction: Option<String>,
+}
+
+/// Whether the system instructions or any message of the conversation says
+/// "JSON", in any case.
+fn mentions_json(request: &Request) -> bool {
+    fn says_json(parts: &[Part]) -> bool {
+        parts.iter().any(|part| match part {
+            Part::Text(text) => text.text.to_ascii_lowercase().contains("json"),
+            Part::ToolResult(result) => says_json(&result.content),
+            _ => false,
+        })
+    }
+    says_json(&request.system) || request.messages.iter().any(|m| says_json(&m.parts))
+}
+
+/// A schema as the root of a `json_schema` response format: OpenAI takes an
+/// object schema there and nothing else ("schema must be a JSON Schema of
+/// 'type: \"object\"'"). A root that describes an object without saying so
+/// (Gemini's dialect allows that) is given its type; `None` for every other
+/// root (an array, a bare enum, a union).
+fn object_rooted(schema: &Value) -> Option<Value> {
+    let root = schema.as_object()?;
+    let retyped = || {
+        let mut typed = Map::new();
+        typed.insert("type".into(), json!("object"));
+        typed.extend(
+            root.iter()
+                .filter(|(key, _)| key.as_str() != "type")
+                .map(|(key, value)| (key.clone(), value.clone())),
+        );
+        Some(Value::Object(typed))
+    };
+    match root.get("type") {
+        Some(Value::String(kind)) if kind == "object" => Some(schema.clone()),
+        // "An object or null" (a nullable root): the object is what can be
+        // asked for.
+        Some(Value::Array(kinds)) if kinds.iter().any(|k| k.as_str() == Some("object")) => {
+            retyped()
+        }
+        None | Some(Value::Null) if root.contains_key("properties") => retyped(),
+        _ => None,
+    }
+}
+
+/// Decides how `request.response_format` is expressed.
+///
+/// A Chat client's own format is replayed as written. For every other
+/// client:
+///
+/// * a schema format without a schema can only mean "some JSON" and becomes
+///   `json_object`;
+/// * schemas are normalised (see [`crate::schema`]);
+/// * a schema written for another vendor whose root is not an object schema
+///   (Gemini's `responseSchema` takes any root; the example in its guide is
+///   an array) cannot be a `json_schema` format: OpenAI answers 400, a
+///   request fault no failover repairs. `json_object` mode would force an
+///   object, so the request then carries no format at all and the schema is
+///   described in a system instruction instead, the way JSON output is
+///   obtained from an API without a native field for it;
+/// * `json_object` needs the word "JSON" somewhere in the conversation
+///   ("'messages' must contain the word 'json' in some form"), a rule other
+///   vendors' JSON modes do not have (and that a Responses client may have
+///   met in a place that does not travel): when the conversation never says
+///   it, a system instruction does.
+fn output_format(request: &Request) -> OutputFormat {
+    let Some(format) = &request.response_format else {
+        return OutputFormat::default();
+    };
+    let own = request.source == PROTOCOL;
+    let other_vendor = request.source.family() != Family::Openai;
+    let json_object = || OutputFormat {
+        field: Some(json!({"type": "json_object"})),
+        instruction: (!own && !mentions_json(request)).then(|| JSON_OBJECT_INSTRUCTION.to_string()),
+    };
     match format {
-        ResponseFormat::Text => json!({"type": "text"}),
-        ResponseFormat::JsonObject => json!({"type": "json_object"}),
+        ResponseFormat::Text => OutputFormat {
+            field: Some(json!({"type": "text"})),
+            instruction: None,
+        },
+        ResponseFormat::JsonObject => json_object(),
+        ResponseFormat::JsonSchema { schema, .. } if !own && schema.is_null() => json_object(),
         ResponseFormat::JsonSchema {
             name,
             description,
             schema,
             strict,
         } => {
+            let schema = if own {
+                schema.clone()
+            } else if !other_vendor {
+                normalize_schema(schema)
+            } else {
+                match object_rooted(schema) {
+                    Some(rooted) => normalize_schema(&rooted),
+                    None => {
+                        let mut text = JSON_SCHEMA_INSTRUCTION.to_string();
+                        if let Some(name) = name.as_deref().filter(|n| !n.trim().is_empty()) {
+                            text.push_str(&format!("\nSchema name: {name}"));
+                        }
+                        if let Some(description) =
+                            description.as_deref().filter(|d| !d.trim().is_empty())
+                        {
+                            text.push_str(&format!("\nSchema description: {description}"));
+                        }
+                        text.push_str(&format!("\nJSON Schema:\n{schema}"));
+                        return OutputFormat {
+                            field: None,
+                            instruction: Some(text),
+                        };
+                    }
+                }
+            };
             let mut spec = Map::new();
             // `name` is mandatory in Chat; other protocols have no such field.
             spec.insert("name".into(), json!(name.as_deref().unwrap_or("response")));
             if let Some(description) = description {
                 spec.insert("description".into(), json!(description));
             }
-            spec.insert(
-                "schema".into(),
-                if foreign_schema {
-                    normalize_schema(schema)
-                } else {
-                    schema.clone()
-                },
-            );
+            spec.insert("schema".into(), schema);
             if let Some(strict) = strict {
                 spec.insert("strict".into(), json!(strict));
             }
-            json!({"type": "json_schema", "json_schema": Value::Object(spec)})
+            OutputFormat {
+                field: Some(json!({"type": "json_schema", "json_schema": Value::Object(spec)})),
+                instruction: None,
+            }
         }
     }
+}
+
+/// The parameters of the function that stands in for a free-form (custom)
+/// tool: its raw input as the one string argument (notes 08 §1.3).
+fn custom_tool_parameters() -> Value {
+    json!({
+        "type": "object",
+        "properties": {"input": {"type": "string"}},
+        "required": ["input"],
+    })
 }
 
 /// Returns the `tools` array and, separately, `web_search_options` (Chat's
@@ -955,14 +1190,28 @@ fn encode_response_format(format: &ResponseFormat, foreign_schema: bool) -> Valu
 /// (`foreign_schemas`) are normalised, see [`crate::schema`]: one
 /// argument-less MCP tool declared as `{"type":"object"}` would otherwise
 /// fail the whole request with `invalid_function_parameters`.
-fn encode_tools(request: &Request, foreign_schemas: bool) -> (Vec<Value>, Option<Value>) {
+///
+/// Free-form (custom) tools: a Chat client's own declaration is replayed in
+/// OpenAI's `type: "custom"` spelling. One that came through another
+/// protocol (a Responses client's `apply_patch`) is declared as a function
+/// taking the raw input as its one string argument (notes 08 §1.3), because
+/// the Chat upstream of such a client is a compatible server, and those know
+/// `function` tools only. Calls in the history and a forced choice follow
+/// the declaration; the codec of the client's protocol turns the function
+/// call that comes back into the custom call the client declared.
+fn encode_tools(
+    request: &Request,
+    foreign_schemas: bool,
+    names: &UpstreamNames,
+) -> (Vec<Value>, Option<Value>) {
+    let openai_source = request.source.family() == Family::Openai;
     let mut tools = Vec::new();
     let mut web_search = None;
     for tool in &request.tools {
         match tool {
             Tool::Function(f) => {
                 let mut spec = Map::new();
-                spec.insert("name".into(), json!(f.name));
+                spec.insert("name".into(), json!(names.wire(&f.name)));
                 if let Some(description) = &f.description {
                     spec.insert("description".into(), json!(description));
                 }
@@ -974,21 +1223,32 @@ fn encode_tools(request: &Request, foreign_schemas: bool) -> (Vec<Value>, Option
                         f.parameters_or_empty()
                     },
                 );
-                if let Some(strict) = f.strict {
+                // `strict` of another vendor's client is not forwarded:
+                // OpenAI's strict mode wants every property listed in
+                // `required` (and unions spelled its way), which a schema
+                // written for Anthropic's strict tools does not promise, and
+                // answers anything else with a 400. Without the flag the
+                // same tool simply works.
+                if let Some(strict) = f.strict.filter(|_| openai_source) {
                     spec.insert("strict".into(), json!(strict));
                 }
                 tools.push(json!({"type": "function", "function": Value::Object(spec)}));
             }
             Tool::Custom(c) => {
                 let mut spec = Map::new();
-                spec.insert("name".into(), json!(c.name));
+                spec.insert("name".into(), json!(names.wire(&c.name)));
                 if let Some(description) = &c.description {
                     spec.insert("description".into(), json!(description));
                 }
-                if let Some(format) = &c.format {
-                    spec.insert("format".into(), format.clone());
+                if foreign_schemas {
+                    spec.insert("parameters".into(), custom_tool_parameters());
+                    tools.push(json!({"type": "function", "function": Value::Object(spec)}));
+                } else {
+                    if let Some(format) = &c.format {
+                        spec.insert("format".into(), format.clone());
+                    }
+                    tools.push(json!({"type": "custom", "custom": Value::Object(spec)}));
                 }
-                tools.push(json!({"type": "custom", "custom": Value::Object(spec)}));
             }
             Tool::Builtin(b) => match (b.origin, &b.kind) {
                 (Protocol::OpenaiChat, _) => match b.raw.get("web_search_options") {
@@ -1033,23 +1293,43 @@ fn web_search_options_from_responses(raw: &Value) -> Value {
     Value::Object(options)
 }
 
-fn encode_tool_choice(choice: &ToolChoice, request: &Request) -> Value {
+/// A forced tool that is not among the declared functions (a provider tool
+/// of another protocol that Chat cannot run, say) is refused by OpenAI
+/// ("tool_choice.function.name ... not found in 'tools'"). The request then
+/// says `none`: a restriction that cannot be honoured must not turn into
+/// permission to call any tool. A Chat client's own request is replayed.
+fn encode_tool_choice(choice: &ToolChoice, request: &Request, names: &UpstreamNames) -> Value {
     match choice {
         ToolChoice::Auto => json!("auto"),
         ToolChoice::None => json!("none"),
         ToolChoice::Required => json!("required"),
         ToolChoice::Tool { name } => {
-            let is_custom = request
+            // Built-in tools have no name: only functions and custom tools
+            // can be found here.
+            let declared = request
                 .tools
                 .iter()
-                .any(|t| matches!(t, Tool::Custom(c) if c.name == *name));
-            if is_custom {
-                json!({"type": "custom", "custom": {"name": name}})
-            } else {
-                json!({"type": "function", "function": {"name": name}})
+                .find(|t| t.name() == Some(name.as_str()));
+            let wire = names.wire(name);
+            match declared {
+                // A Chat client's own custom tool; anyone else's is declared
+                // as the function standing in for it.
+                Some(Tool::Custom(_)) if request.source == PROTOCOL => {
+                    json!({"type": "custom", "custom": {"name": wire}})
+                }
+                None if request.source != PROTOCOL => json!("none"),
+                _ => json!({"type": "function", "function": {"name": wire}}),
             }
         }
     }
+}
+
+/// How the names and ids of a request are written for the upstream.
+struct Spelling {
+    names: UpstreamNames,
+    ids: UpstreamIds,
+    /// The request was written for another protocol.
+    foreign: bool,
 }
 
 fn message_role(m: &Value) -> &str {

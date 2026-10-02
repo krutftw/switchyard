@@ -658,8 +658,10 @@ fn encode_reasoning_with_signatures() {
                 // the wrong vendor ...
                 {"type": "reasoning.text", "text": "Claude thinks.", "signature": "sy1.a.ErUB", "index": 0},
                 {"type": "reasoning.encrypted", "data": "sy1.a.REDACTED", "index": 1},
-                // ... blobs of the OpenAI family are native to this client.
-                {"type": "reasoning.text", "text": "Summary.", "signature": "gAAAA", "id": "rs_1", "index": 2}
+                // ... and that includes the encrypted reasoning of a
+                // Responses upstream: bare, it would come back as a blob a
+                // Chat upstream issued and be replayed to one.
+                {"type": "reasoning.text", "text": "Summary.", "signature": "sy1.r.gAAAA", "id": "rs_1", "index": 2}
             ],
             "refusal": null
         })
@@ -720,6 +722,14 @@ fn encode_refusal() {
         message(&body),
         &json!({"role": "assistant", "content": null, "refusal": "I can't help with that."})
     );
+    // A refusal the model wrote out is a completed answer: Chat Completions
+    // reports it with `finish_reason: "stop"` next to `message.refusal`
+    // (notes 08 §8.2: a `completed` response without tool calls is `stop`).
+    assert_eq!(body["choices"][0]["finish_reason"], json!("stop"));
+
+    // A refusal without refusal text (Anthropic's `stop_reason: "refusal"`:
+    // a classifier withheld the answer) is not a completed answer.
+    let body = encode(&response(vec![Part::text("I can")], FinishReason::Refusal));
     assert_eq!(body["choices"][0]["finish_reason"], json!("content_filter"));
 }
 

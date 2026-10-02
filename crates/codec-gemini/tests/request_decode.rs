@@ -455,11 +455,39 @@ fn tool_config_modes() {
 
 #[test]
 fn tool_config_that_the_canonical_choice_cannot_express_is_kept_raw() {
+    // Several allowed names: "call one of them" is the mode, the list of
+    // functions is narrowed to the allowed ones (no other protocol can say
+    // "only these"), and the raw object is kept for a Gemini upstream.
     let several =
         json!({"functionCallingConfig": {"mode": "ANY", "allowedFunctionNames": ["a", "b"]}});
+    let declared = json!([
+        {"functionDeclarations": [{"name": "a"}, {"name": "b"}, {"name": "c"}]},
+        {"googleSearch": {}}
+    ]);
+    let request = decode(json!({
+        "contents": [user("go")], "tools": declared, "toolConfig": several
+    }));
+    assert_eq!(request.tool_choice, Some(ToolChoice::Required));
+    assert_eq!(request.extra.get("toolConfig"), Some(&several));
+    let names: Vec<Option<&str>> = request.tools.iter().map(Tool::name).collect();
+    // Provider-executed tools are not function calls and stay.
+    assert_eq!(names, vec![Some("a"), Some("b"), None]);
+
+    // `VALIDATED` with a list: the same restriction, the model may still
+    // answer in text.
+    let validated_some =
+        json!({"functionCallingConfig": {"mode": "VALIDATED", "allowedFunctionNames": ["c"]}});
+    let request = decode(json!({
+        "contents": [user("go")], "tools": declared, "toolConfig": validated_some
+    }));
+    assert_eq!(request.tool_choice, Some(ToolChoice::Auto));
+    let names: Vec<Option<&str>> = request.tools.iter().map(Tool::name).collect();
+    assert_eq!(names, vec![Some("c"), None]);
+
+    // None of the allowed functions is declared: nothing may be called.
     assert_eq!(
         choice_of(several.clone()),
-        (Some(ToolChoice::Required), Some(several))
+        (Some(ToolChoice::None), Some(several))
     );
     let validated = json!({"functionCallingConfig": {"mode": "VALIDATED"}});
     assert_eq!(

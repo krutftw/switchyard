@@ -1,13 +1,13 @@
 //! Client side: canonical [`StreamEvent`]s → a Messages SSE stream.
 
-use crate::blocks::{encode_citation, tool_call_input, tool_input};
+use crate::blocks::{call_signature_for_client, encode_citation, tool_call_input, tool_input};
 use crate::error::encode_error;
 use crate::response::{
     StopHints, ToolNames, encode_part, encode_usage, message_id, stop_reason, tool_use_id,
 };
 use crate::util::THIS;
 use serde_json::{Value, json};
-use switchyard_core::ir::{FinishReason, Part, ToolCallKind};
+use switchyard_core::ir::{FinishReason, Part, Signature, ToolCallKind};
 use switchyard_core::stream::{BlockStart, StreamEvent};
 use switchyard_core::{ApiError, ClientCtx, SseEvent, StreamEncoder, Usage, sig};
 
@@ -70,6 +70,8 @@ enum Open {
 ///   runs a half-written call.
 /// * Tool names are handed back in the client's own spelling
 ///   ([`ToolNames`]).
+/// * A tool call that carries a signature of its own is preceded by a
+///   text-less `thinking` block holding it, as in a complete response.
 /// * `Finish { reason: Error }` and `Error` end the stream with an `error`
 ///   event. A sequence that simply stops is closed with `message_delta`
 ///   (`stop_reason: null`) and `message_stop`.
@@ -207,6 +209,24 @@ impl Encoder {
             self.next_wire += 1;
         }
         *wire
+    }
+
+    /// The `thinking` block that carries a tool call's own signature to the
+    /// client, sent right ahead of the call's `tool_use` block.
+    fn call_signature(&mut self, signature: Option<&Signature>, out: &mut Vec<SseEvent>) {
+        let Some(signature) = call_signature_for_client(signature) else {
+            return;
+        };
+        let wire = self.allocate();
+        out.push(block_start(
+            wire,
+            json!({"type": "thinking", "thinking": "", "signature": ""}),
+        ));
+        out.push(block_delta(
+            wire,
+            json!({"type": "signature_delta", "signature": signature}),
+        ));
+        out.push(block_stop(wire));
     }
 
     fn close_block(&mut self, out: &mut Vec<SseEvent>) {
@@ -349,6 +369,7 @@ impl Encoder {
             }
             Part::ToolCall(call) => {
                 self.hints.tool_use = true;
+                self.call_signature(call.signature.as_ref(), out);
                 let wire = self.allocate();
                 out.push(block_start(
                     wire,
@@ -400,8 +421,14 @@ impl Encoder {
             BlockStart::Reasoning { redacted: true, .. } => {
                 self.open = Some(Open::Redacted { wire: None });
             }
-            BlockStart::ToolCall { id, name, kind, .. } => {
+            BlockStart::ToolCall {
+                id,
+                name,
+                kind,
+                signature,
+            } => {
                 self.hints.tool_use = true;
+                self.call_signature(signature.as_ref(), out);
                 let wire = self.allocate();
                 out.push(block_start(
                     wire,

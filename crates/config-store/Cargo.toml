@@ -17,8 +17,8 @@ toml_edit.workspace = true
 arc-swap.workspace = true
 parking_lot.workspace = true
 notify.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
+sha2.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true

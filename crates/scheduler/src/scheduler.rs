@@ -522,6 +522,51 @@ impl Scheduler {
         }
     }
 
+    /// Records the result of a call that was made with a credential outside
+    /// the [`Scheduler::pick`] → [`Scheduler::report`] cycle: a connectivity
+    /// test from the admin API, which addresses one credential directly
+    /// whatever its state.
+    ///
+    /// The bookkeeping is that of [`Scheduler::report`] — counters, latency,
+    /// failure streak and cooldowns by [`FailureClass`], for
+    /// `upstream_model` on that credential — so a test that succeeds puts a
+    /// resting model back into rotation and one that fails rests it like any
+    /// failed request would. No session binding is involved: the call was
+    /// not made on behalf of a conversation.
+    ///
+    /// Returns false (and records nothing) when no such credential exists.
+    pub fn report_credential(
+        &self,
+        credential_id: &str,
+        upstream_model: &str,
+        outcome: Outcome<'_>,
+        now: SystemTime,
+    ) -> bool {
+        let now = unix_ms(now);
+        let mut guard = self.state.lock();
+        let registry = self.registry();
+        let Some(entry) = registry.credential(credential_id) else {
+            return false;
+        };
+        let credential = guard.credentials.entry(entry.id.clone()).or_default();
+        match outcome {
+            Outcome::Success { latency_ms } => {
+                credential.record_success(upstream_model, latency_ms, now);
+            }
+            Outcome::Failure(error) => {
+                credential.record_failure(
+                    upstream_model,
+                    error,
+                    &registry.config.routing.cooldown,
+                    &entry.view.api_key,
+                    now,
+                );
+            }
+        }
+        credential.prune(now);
+        true
+    }
+
     // ------------------------------------------------------------------
     // Introspection and control
     // ------------------------------------------------------------------
@@ -664,11 +709,24 @@ impl Scheduler {
     /// `None` when a credential is ready, the model is unknown, or no
     /// credential could ever serve it.
     pub fn soonest_recovery(&self, model: &str) -> Option<Duration> {
-        let now = self.now_ms();
         let resolved = self.resolve(model).ok()?;
+        self.soonest_recovery_of(&resolved)
+    }
+
+    /// [`Scheduler::soonest_recovery`] for routes that are already resolved
+    /// — and possibly narrowed with [`Resolved::retain_routes`], which a
+    /// lookup by name would undo.
+    ///
+    /// Every credential behind the routes counts, whether or not a request
+    /// has tried it: the answer to "how long until *anything* could serve
+    /// this", which is what a request that has run out of credentials needs
+    /// to decide whether waiting is worth it. Changes nothing (no rotation,
+    /// no session binding).
+    pub fn soonest_recovery_of(&self, resolved: &Resolved) -> Option<Duration> {
+        let now = self.now_ms();
         let state = self.state.lock();
         let registry = self.registry();
-        let survey = survey(&registry, &state, &resolved, &[], now);
+        let survey = survey(&registry, &state, resolved, &[], now);
         if survey.ready.iter().any(|target| !target.is_empty()) {
             return None;
         }

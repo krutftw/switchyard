@@ -38,13 +38,33 @@
 //! * **Built-in tools** of another vendor are mapped to Gemini's
 //!   (`googleSearch`, `urlContext`, `codeExecution`) only when the request
 //!   declares no functions, because most Gemini models reject the mix.
+//! * **Function names** a client declared are what it is shown in
+//!   `functionCall` parts: an upstream of another protocol that had to be
+//!   given another spelling (no dots or colons on OpenAI and Anthropic)
+//!   calls the function by that spelling, and the client's own is restored.
+//! * **Restricted function calling.** `allowedFunctionNames` with several
+//!   names (or with `VALIDATED`) limits the model to some of the declared
+//!   functions. The canonical model cannot say that, so the decoder narrows
+//!   the tool list to the allowed functions (and keeps the raw `toolConfig`
+//!   for a Gemini upstream): no other upstream may be offered the functions
+//!   the client excluded.
+//! * **Output modes other than JSON** (`responseMimeType: "text/x.enum"`)
+//!   are replayed to a Gemini upstream exactly as the client wrote them. For
+//!   other protocols the schema is all that can be passed on, as a JSON
+//!   schema format: from their upstreams such a client is answered with the
+//!   JSON spelling of the value (a quoted string).
+//! * **Refusals** have no part type here: the text is ordinary text and the
+//!   finish reason is `SAFETY`, whether the upstream reported the refusal as
+//!   a finish reason or as a refusal part of a completed answer.
 //! * **Vertex AI** needs [`adapt_for_vertex`] applied to request bodies.
 
 mod error;
 mod models;
+mod names;
 mod parts;
 mod raw;
 mod reasoning;
+mod redact;
 mod request;
 mod response;
 mod schema;

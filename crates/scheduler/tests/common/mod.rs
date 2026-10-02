@@ -39,8 +39,15 @@ pub struct Fixture {
 }
 
 pub fn fixture(toml: &str) -> Fixture {
+    fixture_from(&config(toml))
+}
+
+/// A fixture over a `Config` built in code, for shapes `Config::validate`
+/// rejects but the scheduler must still cope with (a hot reload or the
+/// management API can hand it one).
+pub fn fixture_from(config: &Config) -> Fixture {
     let clock = Arc::new(ManualClock::at_unix_secs(START_SECS));
-    let scheduler = Scheduler::with_clock(&config(toml), &resolver, clock.clone());
+    let scheduler = Scheduler::with_clock(config, &resolver, clock.clone());
     Fixture { clock, scheduler }
 }
 

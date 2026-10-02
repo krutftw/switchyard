@@ -17,21 +17,19 @@ switchyard-telemetry.workspace = true
 switchyard-config-store.workspace = true
 tokio.workspace = true
 tokio-util.workspace = true
-tokio-stream.workspace = true
 futures.workspace = true
-async-stream.workspace = true
 bytes.workspace = true
 http.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 arc-swap.workspace = true
 parking_lot.workspace = true
-notify.workspace = true
-toml.workspace = true
-toml_edit.workspace = true
+percent-encoding.workspace = true
+# Client keys are compared as SHA-256 digests in constant time.
+sha2.workspace = true
+subtle.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 axum.workspace = true

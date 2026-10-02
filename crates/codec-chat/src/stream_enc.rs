@@ -34,17 +34,18 @@
 //! `finish_reason: "length"` (the answer is incomplete) and `[DONE]`.
 
 use crate::common::{
-    PROTOCOL, citation_to_wire, client_response_id, finish_to_wire, image_to_wire,
-    reconcile_finish, usage_to_wire,
+    blob_for_client, citation_to_wire, client_finish, client_response_id, image_to_wire,
+    usage_to_wire,
 };
 use crate::error::encode_error;
+use crate::names::ClientNames;
 use serde_json::{Map, Value, json};
+use switchyard_core::Usage;
 use switchyard_core::codec::{ClientCtx, StreamEncoder};
 use switchyard_core::ir::{FinishReason, Part, Reasoning, Signature, ToolCallKind};
 use switchyard_core::sse::SseEvent;
 use switchyard_core::stream::{BlockStart, StreamEvent};
 use switchyard_core::util::{new_call_id, now_unix};
-use switchyard_core::{Usage, sig};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Block {
@@ -96,6 +97,10 @@ pub(crate) struct ChatStreamEncoder {
     block_offset: u64,
     usage: Usage,
     saw_tool_call: bool,
+    /// Refusal text was sent (`delta.refusal`).
+    saw_refusal: bool,
+    /// The tool names the client declared; calls are spelled its way.
+    names: ClientNames,
 }
 
 impl ChatStreamEncoder {
@@ -121,6 +126,8 @@ impl ChatStreamEncoder {
             block_offset: 0,
             usage: Usage::default(),
             saw_tool_call: false,
+            saw_refusal: false,
+            names: ClientNames::from_request(Some(&ctx.request)),
         }
     }
 
@@ -180,6 +187,7 @@ impl ChatStreamEncoder {
         } else {
             id.to_string()
         };
+        let name = self.names.restore(name);
         let mut call = Map::new();
         call.insert("index".into(), json!(wire_index));
         call.insert("id".into(), json!(id));
@@ -199,7 +207,7 @@ impl ChatStreamEncoder {
         if let Some(signature) = signature {
             call.insert(
                 "extra_content".into(),
-                json!({"google": {"thought_signature": sig::encode_for_client(signature, PROTOCOL)}}),
+                json!({"google": {"thought_signature": blob_for_client(signature)}}),
             );
         }
         (
@@ -215,7 +223,7 @@ impl ChatStreamEncoder {
         id: Option<&str>,
         signature: &Signature,
     ) -> SseEvent {
-        let blob = sig::encode_for_client(signature, PROTOCOL);
+        let blob = blob_for_client(signature);
         let mut detail = Map::new();
         if redacted {
             detail.insert("type".into(), json!("reasoning.encrypted"));
@@ -328,6 +336,7 @@ impl ChatStreamEncoder {
                     out.extend(t.citations.iter().filter_map(|c| self.annotation_chunk(c)));
                 }
                 Part::Refusal(r) if !r.text.is_empty() => {
+                    self.saw_refusal = true;
                     out.push(self.delta_chunk(json!({"refusal": r.text})));
                 }
                 Part::Reasoning(r) => self.reasoning_whole(r, out),
@@ -358,13 +367,13 @@ impl ChatStreamEncoder {
 
     /// The finish chunk and, if the client asked for it, the usage chunk.
     fn finish_chunks(&mut self, reason: &FinishReason, out: &mut Vec<SseEvent>) {
-        let reason = reconcile_finish(reason.clone(), self.saw_tool_call);
+        let finish_reason = client_finish(reason, self.saw_tool_call, self.saw_refusal);
         out.push(self.chunk(
             json!([{
                 "index": 0,
                 "delta": {},
                 "logprobs": null,
-                "finish_reason": finish_to_wire(&reason),
+                "finish_reason": finish_reason,
             }]),
             None,
         ));
@@ -399,6 +408,7 @@ impl StreamEncoder for ChatStreamEncoder {
             StreamEvent::TextDelta { text, .. } => match self.block {
                 Block::Text => out.extend(self.content_chunk(text)),
                 Block::Refusal if !text.is_empty() => {
+                    self.saw_refusal = true;
                     out.push(self.delta_chunk(json!({"refusal": text})));
                 }
                 _ => {}

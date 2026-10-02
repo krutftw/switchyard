@@ -8,6 +8,7 @@
 //! |---|---|---|
 //! | request | forward the client's JSON, model replaced | [`convert::translate_request`] |
 //! | reasoning depth | [`thinking::plan_reasoning`] + [`thinking::apply_to_body`] | [`thinking::plan_reasoning`] + [`thinking::apply_to_request`] |
+//! | tool names | — (the client speaks the upstream's dialect) | [`toolnames::sanitize_tool_names`], restored through [`toolnames::ToolNames`] |
 //! | lost reasoning blobs | — (the client's own blobs are forwarded) | [`reasoning_store::ReasoningStore::restore`] |
 //! | operator patches | [`payload::apply_payload_rules`] | [`payload::apply_payload_rules`] |
 //! | response | forward, model rewritten ([`transcode::rewrite_model_text`]) | [`convert::translate_response`] |
@@ -28,6 +29,7 @@ pub mod payload;
 pub mod reasoning_store;
 mod splice;
 pub mod thinking;
+pub mod toolnames;
 pub mod transcode;
 
 #[cfg(test)]
@@ -41,4 +43,5 @@ pub use thinking::{
     ReasoningInputs, ReasoningPlan, apply_to_body, apply_to_request, effective_label,
     plan_reasoning, plan_with_label,
 };
+pub use toolnames::{ToolNames, is_valid_tool_name, sanitize_tool_names};
 pub use transcode::{CodecRef, Transcoder, rewrite_model_text};

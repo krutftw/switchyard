@@ -369,9 +369,9 @@ fn reasoning_signatures_travel_in_reasoning_details() {
             delta(json!({"reasoning_details": [
                 {"type": "reasoning.text", "signature": "sy1.a.ErUB", "index": 0}
             ]})),
-            // ... the OpenAI family's is native.
+            // ... and so is a Responses upstream's, with its exact origin.
             delta(json!({"reasoning_details": [
-                {"type": "reasoning.encrypted", "data": "gAAAA", "id": "rs_1", "index": 1}
+                {"type": "reasoning.encrypted", "data": "sy1.r.gAAAA", "id": "rs_1", "index": 1}
             ]})),
             delta(json!({"content": "Done."})),
             finish("stop"),

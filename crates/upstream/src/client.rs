@@ -132,6 +132,27 @@ impl UpstreamResponse {
     }
 }
 
+/// How the body of a 2xx answer is handed to the caller, and which deadline
+/// applies while it is read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BodyMode {
+    /// Read completely before returning, within [`Timeouts::request`].
+    Buffered,
+    /// Handed over as a byte stream with no overall deadline (streaming
+    /// generation calls).
+    Stream,
+    /// Handed over as a byte stream that is still bound by
+    /// [`Timeouts::request`], so the caller can cap how much it buffers.
+    Unbuffered,
+}
+
+impl BodyMode {
+    /// Whether the call is exempt from the overall request deadline.
+    fn unbounded(self) -> bool {
+        self == BodyMode::Stream
+    }
+}
+
 /// Which part of a call failed.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Phase {
@@ -517,14 +538,62 @@ impl UpstreamClient {
             .await
     }
 
+    /// [`UpstreamClient::send`] without buffering the answer: the body of a
+    /// 2xx response is always an [`UpstreamBody::Stream`], whatever the
+    /// operation, so the caller decides how much of it to keep in memory
+    /// (and can refuse a response that is larger than it is willing to
+    /// hold).
+    ///
+    /// The time limits are those of `send`: a non-streaming operation is
+    /// still bound by [`Timeouts::request`] until the last byte has been
+    /// read from the stream — a read past the deadline yields a `timeout:`
+    /// transport error with status `408` — and a streaming generation call
+    /// has no overall deadline. Failed calls (non-2xx, transport errors) are
+    /// reported exactly as `send` reports them, with the error body read
+    /// and classified here.
+    pub async fn send_unbuffered(
+        &self,
+        target: &Target,
+        op: &Operation,
+        body: Bytes,
+        client_headers: &HeaderMap,
+        timeouts: Timeouts,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let built = build_request(target, op, &body, client_headers)?;
+        let mode = if op.is_stream() {
+            BodyMode::Stream
+        } else {
+            BodyMode::Unbuffered
+        };
+        self.send_built_as(target, built, body, mode, timeouts)
+            .await
+    }
+
     /// Sends an already described request. Used by [`UpstreamClient::send`]
     /// and by model discovery.
     pub(crate) async fn send_built(
         &self,
         target: &Target,
-        mut built: BuiltRequest,
+        built: BuiltRequest,
         body: Bytes,
         stream: bool,
+        timeouts: Timeouts,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        let mode = if stream {
+            BodyMode::Stream
+        } else {
+            BodyMode::Buffered
+        };
+        self.send_built_as(target, built, body, mode, timeouts)
+            .await
+    }
+
+    async fn send_built_as(
+        &self,
+        target: &Target,
+        mut built: BuiltRequest,
+        body: Bytes,
+        mode: BodyMode,
         timeouts: Timeouts,
     ) -> Result<UpstreamResponse, UpstreamError> {
         let http = self.http.client(&target.proxy, timeouts.connect)?;
@@ -538,7 +607,7 @@ impl UpstreamClient {
             target,
             &built,
             body.clone(),
-            stream,
+            mode,
             timeouts,
             &scrubber,
         )
@@ -553,7 +622,7 @@ impl UpstreamClient {
                 let (fresh, _) = source.token_and_origin(&http).await?;
                 built.set_bearer(&fresh)?;
                 scrubber.add(&fresh);
-                execute(&http, target, &built, body, stream, timeouts, &scrubber).await
+                execute(&http, target, &built, body, mode, timeouts, &scrubber).await
             }
             (result, _) => result,
         }
@@ -565,7 +634,7 @@ async fn execute(
     target: &Target,
     built: &BuiltRequest,
     body: Bytes,
-    stream: bool,
+    mode: BodyMode,
     timeouts: Timeouts,
     scrubber: &Scrubber,
 ) -> Result<UpstreamResponse, UpstreamError> {
@@ -573,7 +642,7 @@ async fn execute(
         provider = %target.provider,
         method = %built.method,
         url = %redact_url(&built.url),
-        stream,
+        stream = mode.unbounded(),
         "upstream request"
     );
     let mut request = http
@@ -584,7 +653,7 @@ async fn execute(
         request = request.body(body);
     }
     // Streams have no overall deadline; error messages must not name one.
-    let timeouts = if stream {
+    let timeouts = if mode.unbounded() {
         Timeouts {
             request: Duration::ZERO,
             ..timeouts
@@ -620,7 +689,7 @@ async fn execute(
     }
 
     let headers = filter_response_headers(&headers);
-    if stream {
+    if mode != BodyMode::Buffered {
         let url = built.url.clone();
         let proxy = target.proxy.clone();
         let bytes = response

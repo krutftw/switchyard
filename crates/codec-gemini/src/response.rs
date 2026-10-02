@@ -2,6 +2,8 @@
 //! canonical response for a Gemini client. The pieces shared with the stream
 //! codecs (usage, finish reasons, part rendering, grounding) live here too.
 
+use crate::error::clean_message;
+use crate::names::ClientNames;
 use crate::parts::{
     CANDIDATE_METADATA, call_args_text, call_name, candidate_metadata, decode_file_data,
     decode_inline_data, encode_media, explicit_id, is_metadata_only, opaque, response_signature,
@@ -142,8 +144,16 @@ pub(crate) fn decode_finish(reason: &str) -> FinishReason {
 
 /// Canonical finish reason -> Gemini `finishReason`. A turn that ends in
 /// function calls is a plain `STOP` for Gemini.
-pub(crate) fn encode_finish(reason: &FinishReason) -> String {
+///
+/// `refused`: the turn carries a refusal the model wrote out. The two OpenAI
+/// protocols report one differently (Chat Completions as `stop` next to
+/// `message.refusal`, Responses as a `completed` response with a refusal
+/// part), which decode to `Stop` and `Refusal`. A Gemini client is told
+/// `SAFETY` for both, so the same answer reads the same whichever upstream
+/// gave it.
+pub(crate) fn encode_finish(reason: &FinishReason, refused: bool) -> String {
     match reason {
+        FinishReason::Stop if refused => "SAFETY".to_string(),
         FinishReason::Stop | FinishReason::ToolCalls | FinishReason::PauseTurn => {
             "STOP".to_string()
         }
@@ -557,7 +567,8 @@ pub(crate) fn decode_response(body: &Value) -> Result<Response, CodecError> {
             .and_then(Value::as_str)
             .unwrap_or("unknown error");
         return Err(CodecError::upstream(format!(
-            "error payload in a success response: {message}"
+            "error payload in a success response: {}",
+            clean_message(message)
         )));
     }
     let candidates = pick_in(map, &["candidates"]);
@@ -627,41 +638,48 @@ pub(crate) fn decode_response(body: &Value) -> Result<Response, CodecError> {
 /// The `thoughtSignature` value handed to a Gemini client: native blobs as
 /// they are, foreign ones tagged with their origin (and armoured as base64,
 /// which the field must be) so they are recognised when they come back.
-fn client_signature(signature: Option<&Signature>) -> Option<String> {
+/// `redacted` marks the payload of withheld reasoning.
+fn client_signature(signature: Option<&Signature>, redacted: bool) -> Option<String> {
     signature
         .filter(|s| !s.data.is_empty())
-        .map(signature_for_client)
+        .map(|s| signature_for_client(s, redacted))
 }
 
 /// Renders a function call for a client: `args` is always an object and the
 /// call id is passed on, so the client's `functionResponse.id` pairs the
-/// result with the call exactly.
-pub(crate) fn client_function_call(call: &ToolCall) -> Value {
+/// result with the call exactly. The function is named the way the client
+/// declared it, whatever spelling the upstream had to be given.
+pub(crate) fn client_function_call(call: &ToolCall, names: &ClientNames) -> Value {
     let args = match call.kind {
         ToolCallKind::Custom => json!({"input": call.arguments}),
         ToolCallKind::Function => call.arguments_value(),
     };
     let mut function_call = Map::new();
-    function_call.insert("name".to_string(), Value::String(call.name.clone()));
+    function_call.insert(
+        "name".to_string(),
+        Value::String(names.restore(&call.name).to_string()),
+    );
     function_call.insert("args".to_string(), args);
     if !call.id.is_empty() {
         function_call.insert("id".to_string(), Value::String(call.id.clone()));
     }
     let mut part = Map::new();
     part.insert("functionCall".to_string(), Value::Object(function_call));
-    if let Some(signature) = client_signature(call.signature.as_ref()) {
+    if let Some(signature) = client_signature(call.signature.as_ref(), false) {
         part.insert("thoughtSignature".to_string(), Value::String(signature));
     }
     Value::Object(part)
 }
 
-/// Renders the thought text / signature of a reasoning part.
+/// Renders the thought text / signature of a reasoning part. `redacted`
+/// says the provider withheld the text and the signature is its payload.
 pub(crate) fn client_reasoning(
     text: &str,
     signature: Option<&Signature>,
     thought: bool,
+    redacted: bool,
 ) -> Option<Value> {
-    let signature = client_signature(signature);
+    let signature = client_signature(signature, redacted);
     if text.is_empty() && signature.is_none() {
         return None;
     }
@@ -679,10 +697,10 @@ pub(crate) fn client_reasoning(
 /// Renders one canonical part as a Gemini part for a client. `None` for parts
 /// Gemini cannot express (tool results, other vendors' opaque blocks) and for
 /// candidate-level metadata, which does not live in `parts`.
-pub(crate) fn client_part(part: &Part) -> Option<Value> {
+pub(crate) fn client_part(part: &Part, names: &ClientNames) -> Option<Value> {
     match part {
         Part::Text(text) => {
-            let signature = client_signature(text.signature.as_ref());
+            let signature = client_signature(text.signature.as_ref(), false);
             if text.text.is_empty() && signature.is_none() {
                 return None;
             }
@@ -699,8 +717,9 @@ pub(crate) fn client_part(part: &Part) -> Option<Value> {
             &reasoning.text,
             reasoning.signature.as_ref(),
             !reasoning.text.is_empty(),
+            reasoning.redacted,
         ),
-        Part::ToolCall(call) => Some(client_function_call(call)),
+        Part::ToolCall(call) => Some(client_function_call(call, names)),
         Part::Image(_) | Part::Audio(_) | Part::Document(_) => encode_media(part, true),
         Part::Refusal(refusal) => (!refusal.text.is_empty()).then(|| json!({"text": refusal.text})),
         Part::Opaque(opaque) => (opaque.origin.family() == Family::Google
@@ -713,6 +732,7 @@ pub(crate) fn client_part(part: &Part) -> Option<Value> {
 
 /// Renders a complete response for a Gemini client.
 pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Value, CodecError> {
+    let names = ClientNames::from_request(&ctx.request);
     let mut parts = Vec::with_capacity(response.parts.len());
     let mut metadata: Vec<(&'static str, Value)> = Vec::new();
     let mut grounding = GroundingBuilder::default();
@@ -725,7 +745,7 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
             metadata.push((key, value.clone()));
             continue;
         }
-        let Some(rendered) = client_part(part) else {
+        let Some(rendered) = client_part(part, &names) else {
             continue;
         };
         if let Part::Text(text) = part {
@@ -750,7 +770,13 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
     );
     candidate.insert(
         "finishReason".to_string(),
-        Value::String(encode_finish(&response.finish)),
+        Value::String(encode_finish(
+            &response.finish,
+            response
+                .parts
+                .iter()
+                .any(|part| matches!(part, Part::Refusal(refusal) if !refusal.text.is_empty())),
+        )),
     );
     candidate.insert("index".to_string(), Value::from(0));
     for (key, value) in metadata {

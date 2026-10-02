@@ -108,8 +108,8 @@ fn snapshot_serialises_in_the_documented_shape() {
         value[0]["credentials"][0],
         json!({
             "id": id,
-            "label": "sk-pro…-one",
-            "masked_key": "sk-pro…-one",
+            "label": "sk-p…one",
+            "masked_key": "sk-p…one",
             "disabled": false,
             "usable": true,
             "status": "ready",
@@ -238,7 +238,7 @@ fn nothing_serialisable_contains_a_secret() {
     }
     assert!(!dump.contains("SECRETSECRET"));
     // The masked forms are there instead.
-    assert!(dump.contains("sk-pro…-one"));
+    assert!(dump.contains("sk-p…one"));
     assert!(dump.contains("[redacted]"));
 }
 

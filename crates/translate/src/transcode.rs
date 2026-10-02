@@ -48,6 +48,32 @@
 //! * After [`Transcoder::finish`] or [`Transcoder::fail`] the transcoder is
 //!   closed: further calls return nothing.
 //!
+//! # Tool names
+//!
+//! On the translation path the gateway may have rewritten tool names the
+//! upstream would refuse ([`crate::toolnames::sanitize_tool_names`]). Give
+//! the resulting map to the transcoder with [`Transcoder::with_tool_names`]
+//! and every tool call the upstream opens is reported to the client — and
+//! recorded in the accumulated response — under the name the client declared.
+//!
+//! # Secrets and unrequested events
+//!
+//! Two hooks let the gateway decide what of an upstream stream a client may
+//! see, without the transcoder knowing any protocol:
+//!
+//! * [`Transcoder::with_scrubber`] — a function that removes the upstream
+//!   credential from text. It is applied to what an upstream says **about a
+//!   failure** (an in-stream error event, the description of an undecodable
+//!   stream, the error given to [`Transcoder::fail`]), in both modes, before
+//!   the client and [`Transcoder::error`] see it: careless upstreams quote
+//!   the key they were called with. Ordinary content is never touched —
+//!   self-hosted servers use keys such as `ollama` or `lm-studio`, and a
+//!   model must stay free to write those words.
+//! * [`Transcoder::with_passthrough_filter`] — a predicate that keeps an
+//!   upstream event from being forwarded in passthrough mode (a usage chunk
+//!   the gateway asked the upstream for but the client did not). The side
+//!   decoder still reads such an event.
+//!
 //! # Bootstrap
 //!
 //! The gateway may retry a streamed attempt on another credential as long as
@@ -63,6 +89,7 @@
 //! an answer.
 
 use crate::splice::splice;
+use crate::toolnames::ToolNames;
 use serde_json::Value;
 use std::fmt;
 use std::sync::Arc;
@@ -123,6 +150,14 @@ impl<C: Codec> From<Arc<C>> for CodecRef {
     }
 }
 
+/// Removes secrets from text an upstream wrote. See
+/// [`Transcoder::with_scrubber`].
+type Scrub = Box<dyn Fn(&str) -> String + Send>;
+
+/// Decides whether an upstream event is forwarded in passthrough mode. See
+/// [`Transcoder::with_passthrough_filter`].
+type Keep = Box<dyn Fn(&SseEvent) -> bool + Send>;
+
 enum Mode {
     Translate {
         encoder: Box<dyn StreamEncoder>,
@@ -155,6 +190,13 @@ pub struct Transcoder {
     truncated: bool,
     /// `finish()` or `fail()` has run (or a decode failure ended the stream).
     closed: bool,
+    /// Translation only: rewritten tool names to turn back into the client's
+    /// own before events are accumulated and encoded.
+    tool_names: Option<ToolNames>,
+    /// Removes the upstream credential from failure descriptions.
+    scrub: Option<Scrub>,
+    /// Passthrough only: which upstream events are forwarded.
+    keep: Option<Keep>,
     events_in: u64,
     events_out: u64,
 }
@@ -217,6 +259,9 @@ impl Transcoder {
             report_truncation: false,
             truncated: false,
             closed: false,
+            tool_names: None,
+            scrub: None,
+            keep: None,
             events_in: 0,
             events_out: 0,
         }
@@ -238,6 +283,64 @@ impl Transcoder {
     /// whether the stream was complete.
     pub fn report_truncation(mut self, report: bool) -> Self {
         self.report_truncation = report;
+        self
+    }
+
+    /// Restores the client's own tool names in a **translated** stream.
+    ///
+    /// `names` is the map [`crate::toolnames::sanitize_tool_names`] returned
+    /// for the request this stream answers. Every canonical event that opens
+    /// a tool call has its name looked up in it before the event is
+    /// accumulated and encoded, so both the client and
+    /// [`Transcoder::response_snapshot`] see the name the client declared.
+    ///
+    /// Has no effect in passthrough mode, where the upstream speaks the
+    /// client's protocol and no name was rewritten.
+    pub fn with_tool_names(mut self, names: ToolNames) -> Self {
+        self.tool_names = (!names.is_empty() && !self.is_passthrough()).then_some(names);
+        self
+    }
+
+    /// Removes secrets from what the upstream says about a failure.
+    ///
+    /// `scrub` returns its argument without the credentials the upstream
+    /// call presented (the gateway passes `Target::redact`). It is applied
+    ///
+    /// * to the message, code and parameter of every upstream error event
+    ///   before it is recorded ([`Transcoder::error`]) and encoded for the
+    ///   client (translation);
+    /// * to the data of a forwarded event that the side decoder read as an
+    ///   error — an error event, or a terminal event with reason `Error` —
+    ///   and, once the side decoder has given up on the stream and can no
+    ///   longer tell errors from content, to every forwarded event
+    ///   (passthrough);
+    /// * to the description of a stream that could not be decoded and to the
+    ///   error given to [`Transcoder::fail`].
+    ///
+    /// Content is left alone on purpose: see the module docs.
+    pub fn with_scrubber(mut self, scrub: impl Fn(&str) -> String + Send + 'static) -> Self {
+        self.scrub = Some(Box::new(scrub));
+        self
+    }
+
+    /// Chooses which upstream events a **passthrough** stream forwards.
+    ///
+    /// `keep` is asked about every upstream event after the side decoder
+    /// has read it; an event it answers `false` for is counted (usage, the
+    /// accumulated response, [`Transcoder::saw_first_event`]) but not
+    /// returned by [`Transcoder::push`]. The gateway uses it to hold back
+    /// events that exist only because of something it added to the upstream
+    /// request.
+    ///
+    /// Has no effect in translation mode, where the client's encoder decides
+    /// what the client sees.
+    pub fn with_passthrough_filter(
+        mut self,
+        keep: impl Fn(&SseEvent) -> bool + Send + 'static,
+    ) -> Self {
+        if self.is_passthrough() {
+            self.keep = Some(Box::new(keep));
+        }
         self
     }
 
@@ -276,8 +379,13 @@ impl Transcoder {
         };
 
         let out = if self.is_passthrough() {
+            // Whether this event describes a failure — or, with the side
+            // decoder out of action, might.
+            let mut about_failure = self.decode_error.is_some();
             match decoded {
-                Ok(events) => {
+                Ok(mut events) => {
+                    about_failure |= events.iter().any(is_failure);
+                    self.scrub_errors(&mut events);
                     for canonical in &events {
                         self.absorb(canonical, true);
                     }
@@ -285,20 +393,29 @@ impl Transcoder {
                 Err(error) => {
                     tracing::debug!(%error, "side decoder failed on a passthrough stream; usage accounting stops");
                     self.decode_error = Some(error);
+                    about_failure = true;
                     // Nothing more will ever be learned from the decoder, and
                     // the stream is forwarded regardless: a caller holding
                     // output back for the first event must not wait forever.
                     self.saw_first_event = true;
                 }
             }
-            vec![self.forward(event)]
+            if self.keep.as_ref().is_some_and(|keep| !keep(event)) {
+                Vec::new()
+            } else {
+                vec![self.forward(event, about_failure)]
+            }
         } else {
             match decoded {
-                Ok(events) => self.encode_all(&events, true),
+                Ok(mut events) => {
+                    self.scrub_errors(&mut events);
+                    self.restore_tool_names(&mut events);
+                    self.encode_all(&events, true)
+                }
                 Err(error) => {
-                    let api = ApiError::upstream(format!(
-                        "upstream stream could not be decoded: {error}"
-                    ));
+                    let api = ApiError::upstream(
+                        self.scrubbed(&format!("upstream stream could not be decoded: {error}")),
+                    );
                     self.decode_error = Some(error);
                     self.closed = true;
                     self.end_with(api)
@@ -337,11 +454,13 @@ impl Transcoder {
         self.closed = true;
         let ended_by_upstream = self.accumulator.finished();
 
-        let tail = if self.decode_error.is_some() {
+        let mut tail = if self.decode_error.is_some() {
             Vec::new()
         } else {
             self.decoder.finish()
         };
+        self.scrub_errors(&mut tail);
+        self.restore_tool_names(&mut tail);
         let mut out = self.encode_all(&tail, false);
 
         if !self.accumulator.finished() && self.decode_error.is_none() {
@@ -403,11 +522,12 @@ impl Transcoder {
     /// recorded: translation mode returns only the encoder's terminators,
     /// passthrough mode returns nothing. Returns nothing if the transcoder is
     /// already closed.
-    pub fn fail(&mut self, error: ApiError) -> Vec<SseEvent> {
+    pub fn fail(&mut self, mut error: ApiError) -> Vec<SseEvent> {
         if self.closed {
             return Vec::new();
         }
         self.closed = true;
+        self.scrub_error(&mut error);
         let out = self.end_with(error);
         self.events_out += out.len() as u64;
         out
@@ -513,6 +633,48 @@ impl Transcoder {
         self.events_out
     }
 
+    /// Turns rewritten tool names back into the client's (translation mode
+    /// with a name map only).
+    fn restore_tool_names(&self, events: &mut [StreamEvent]) {
+        if let Some(names) = &self.tool_names {
+            for event in events {
+                names.restore_event(event);
+            }
+        }
+    }
+
+    /// `text` without the upstream's credentials, as far as a scrubber was
+    /// given.
+    fn scrubbed(&self, text: &str) -> String {
+        match &self.scrub {
+            Some(scrub) => scrub(text),
+            None => text.to_string(),
+        }
+    }
+
+    /// Removes the upstream's credentials from an error's texts.
+    fn scrub_error(&self, error: &mut ApiError) {
+        let Some(scrub) = &self.scrub else {
+            return;
+        };
+        error.message = scrub(&error.message);
+        for text in [&mut error.code, &mut error.param].into_iter().flatten() {
+            *text = scrub(text);
+        }
+    }
+
+    /// [`Transcoder::scrub_error`] for every error event among `events`.
+    fn scrub_errors(&self, events: &mut [StreamEvent]) {
+        if self.scrub.is_none() {
+            return;
+        }
+        for event in events {
+            if let StreamEvent::Error(error) = event {
+                self.scrub_error(error);
+            }
+        }
+    }
+
     /// Records one canonical event. Returns whether it belongs to the stream
     /// (and should be encoded); events after the terminal one do not.
     fn absorb(&mut self, event: &StreamEvent, from_upstream: bool) -> bool {
@@ -602,21 +764,42 @@ impl Transcoder {
         }
     }
 
-    /// The event to forward in passthrough mode.
-    fn forward(&self, event: &SseEvent) -> SseEvent {
-        if let Mode::Passthrough {
-            codec,
-            client_model: Some(model),
-        } = &self.mode
-            && let Some(data) = rewrite_model_text(codec.get(), &event.data, model)
-        {
-            return SseEvent {
-                event: event.event.clone(),
-                data,
-            };
+    /// The event to forward in passthrough mode: the original, with the
+    /// model renamed and — when it is `about_failure` — the upstream's
+    /// credentials removed.
+    fn forward(&self, event: &SseEvent, about_failure: bool) -> SseEvent {
+        let mut out = match &self.mode {
+            Mode::Passthrough {
+                codec,
+                client_model: Some(model),
+            } => match rewrite_model_text(codec.get(), &event.data, model) {
+                Some(data) => SseEvent {
+                    event: event.event.clone(),
+                    data,
+                },
+                None => event.clone(),
+            },
+            _ => event.clone(),
+        };
+        if about_failure && let Some(scrub) = &self.scrub {
+            out.data = scrub(&out.data);
         }
-        event.clone()
+        out
     }
+}
+
+/// Whether a canonical event reports that the response failed: an error
+/// event, or a terminal event with reason `Error` (whose wire form may carry
+/// the upstream's description of what went wrong).
+fn is_failure(event: &StreamEvent) -> bool {
+    matches!(
+        event,
+        StreamEvent::Error(_)
+            | StreamEvent::Finish {
+                reason: FinishReason::Error,
+                ..
+            }
+    )
 }
 
 /// Rewrites the model name inside a response payload given as JSON *text* —
@@ -1882,6 +2065,298 @@ mod tests {
             rewrite_model_text(&codec, body, "alias").as_deref(),
             Some("{\n  \"id\": \"r\",\n  \"model\": \"alias\",\n  \"usage\": {\"total\": 3}\n}")
         );
+    }
+
+    // ----- tool names --------------------------------------------------------
+
+    fn tool_start(index: u32, name: &str) -> StreamEvent {
+        StreamEvent::BlockStart {
+            index,
+            block: BlockStart::ToolCall {
+                id: format!("call_{index}"),
+                name: name.into(),
+                kind: Default::default(),
+                signature: None,
+            },
+        }
+    }
+
+    /// The map for a request that declared `mcp.server:get-data` and was
+    /// sent to an upstream that only accepts `[a-zA-Z0-9_-]`.
+    fn renamed() -> ToolNames {
+        use switchyard_core::ir::{FunctionTool, Request, Tool};
+        let mut request = Request::new("m", Protocol::Gemini);
+        request.tools.push(Tool::Function(FunctionTool {
+            name: "mcp.server:get-data".into(),
+            description: None,
+            parameters: Value::Null,
+            strict: None,
+            cache_control: None,
+        }));
+        let names = crate::toolnames::sanitize_tool_names(&mut request, Protocol::OpenaiChat);
+        assert_eq!(
+            names.original("mcp_server_get-data"),
+            Some("mcp.server:get-data")
+        );
+        names
+    }
+
+    #[test]
+    fn translated_tool_calls_carry_the_clients_names() {
+        let mut t = translator().with_tool_names(renamed());
+        let out = push_all(
+            &mut t,
+            &[
+                start(),
+                tool_start(0, "mcp_server_get-data"),
+                StreamEvent::ToolArgsDelta {
+                    index: 0,
+                    fragment: "{\"q\":\"mcp_server_get-data\"}".into(),
+                },
+                StreamEvent::BlockStop { index: 0 },
+                tool_start(1, "untouched"),
+                StreamEvent::BlockStop { index: 1 },
+                StreamEvent::Finish {
+                    reason: FinishReason::ToolCalls,
+                    stop_sequence: None,
+                },
+            ],
+        );
+        let seen = canonical(&out);
+        assert_eq!(seen[1], tool_start(0, "mcp.server:get-data"));
+        // Arguments are data, not names.
+        assert_eq!(
+            seen[2],
+            StreamEvent::ToolArgsDelta {
+                index: 0,
+                fragment: "{\"q\":\"mcp_server_get-data\"}".into(),
+            }
+        );
+        assert_eq!(seen[4], tool_start(1, "untouched"));
+        validate_sequence(&seen).unwrap();
+        // The accumulated response agrees with what the client saw.
+        let names: Vec<String> = t
+            .response_snapshot()
+            .tool_calls()
+            .map(|call| call.name.clone())
+            .collect();
+        assert_eq!(names, vec!["mcp.server:get-data", "untouched"]);
+    }
+
+    #[test]
+    fn tool_names_in_the_decoders_tail_are_restored_too() {
+        // A decoder that buffers a tool call until the stream closes hands
+        // its BlockStart over from `finish()`.
+        struct Buffering(Vec<StreamEvent>);
+        impl StreamDecoder for Buffering {
+            fn decode(&mut self, event: &SseEvent) -> Result<Vec<StreamEvent>, CodecError> {
+                if let Some(canonical) = unwire(event) {
+                    self.0.push(canonical);
+                }
+                Ok(Vec::new())
+            }
+            fn finish(&mut self) -> Vec<StreamEvent> {
+                std::mem::take(&mut self.0)
+            }
+        }
+        let client = FakeCodec::new(Protocol::Anthropic, DOWN);
+        let mut t = Transcoder::translate(
+            Box::new(Buffering(Vec::new())),
+            client.stream_encoder(&ClientCtx::new("alias")),
+        )
+        .with_tool_names(renamed());
+        push_all(
+            &mut t,
+            &[
+                start(),
+                tool_start(0, "mcp_server_get-data"),
+                StreamEvent::BlockStop { index: 0 },
+                finish_stop(),
+            ],
+        );
+        let seen = canonical(&t.finish());
+        assert_eq!(seen[1], tool_start(0, "mcp.server:get-data"));
+    }
+
+    #[test]
+    fn tool_names_are_never_rewritten_in_passthrough() {
+        let mut t = forwarder(None).with_tool_names(renamed());
+        let event = wire(UP, &tool_start(0, "mcp_server_get-data"));
+        push_all(&mut t, &[start()]);
+        assert_eq!(t.push(&event), vec![event.clone()]);
+        let names: Vec<String> = t
+            .response_snapshot()
+            .tool_calls()
+            .map(|call| call.name.clone())
+            .collect();
+        assert_eq!(names, vec!["mcp_server_get-data"]);
+    }
+
+    #[test]
+    fn an_empty_name_map_changes_nothing() {
+        let mut t = translator().with_tool_names(ToolNames::new());
+        let out = push_all(&mut t, &[start(), tool_start(0, "mcp_server_get-data")]);
+        assert_eq!(canonical(&out)[1], tool_start(0, "mcp_server_get-data"));
+    }
+
+    // ----- scrubbing and filtering ------------------------------------------
+
+    const KEY: &str = "sk-upstream-key-0123456789";
+
+    fn scrub(text: &str) -> String {
+        text.replace(KEY, "[redacted]")
+    }
+
+    fn leaking_error() -> ApiError {
+        let mut error = ApiError::upstream(format!("worker crashed while serving key {KEY}"));
+        error.code = Some(format!("bad_key_{KEY}"));
+        error
+    }
+
+    #[test]
+    fn a_translated_upstream_error_is_scrubbed_for_the_client_and_the_record() {
+        let mut t = translator().with_scrubber(scrub);
+        let mut out = push_all(
+            &mut t,
+            &[
+                start(),
+                text_start(0),
+                text_delta(0, "Hel"),
+                StreamEvent::Error(leaking_error()),
+            ],
+        );
+        out.extend(t.finish());
+        let wire_text: String = out.iter().map(|event| event.data.clone()).collect();
+        assert!(!wire_text.contains(KEY), "{wire_text}");
+        assert!(wire_text.contains("worker crashed while serving key [redacted]"));
+        let recorded = t.error().expect("the error is recorded");
+        assert_eq!(
+            recorded.message,
+            "worker crashed while serving key [redacted]"
+        );
+        assert_eq!(recorded.code.as_deref(), Some("bad_key_[redacted]"));
+    }
+
+    #[test]
+    fn content_is_never_scrubbed() {
+        // A self-hosted upstream whose "key" is an ordinary word: the model
+        // must stay free to write it.
+        let hide = |text: &str| text.replace("ollama", "[redacted]");
+        let events = [start(), text_start(0), text_delta(0, "ollama is a server")];
+
+        let mut translated = translator().with_scrubber(hide);
+        let out = push_all(&mut translated, &events);
+        assert_eq!(canonical(&out)[2], text_delta(0, "ollama is a server"));
+
+        let mut forwarded = forwarder(None).with_scrubber(hide);
+        let wire_event = wire(UP, &events[2]);
+        push_all(&mut forwarded, &events[..2]);
+        assert_eq!(forwarded.push(&wire_event), vec![wire_event.clone()]);
+    }
+
+    #[test]
+    fn a_forwarded_upstream_error_event_is_scrubbed() {
+        let mut t = forwarder(Some("alias")).with_scrubber(scrub);
+        push_all(&mut t, &[start(), text_start(0), text_delta(0, "Hel")]);
+        let event = wire(UP, &StreamEvent::Error(leaking_error()));
+        let out = t.push(&event);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].event, event.event);
+        assert!(!out[0].data.contains(KEY), "{}", out[0].data);
+        assert_eq!(out[0].data, event.data.replace(KEY, "[redacted]"));
+        assert!(!t.error().expect("recorded").message.contains(KEY));
+    }
+
+    #[test]
+    fn a_forwarded_error_finish_is_scrubbed() {
+        // Some protocols end a failed response with a terminal event that
+        // carries the upstream's description (Responses `response.failed`).
+        // The fake decoder reads any JSON with these fields as that event.
+        let mut t = forwarder(None).with_scrubber(scrub);
+        push_all(&mut t, &[start()]);
+        let mut value = serde_json::to_value(finish_error()).unwrap();
+        value["detail"] = serde_json::json!(format!("key {KEY} was refused"));
+        let event = SseEvent::named(UP, value.to_string());
+        let out = t.push(&event);
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].data.contains(KEY), "{}", out[0].data);
+        assert!(t.failed());
+    }
+
+    #[test]
+    fn after_a_side_decoder_failure_every_forwarded_event_is_scrubbed() {
+        // The decoder can no longer tell an error from content, so nothing
+        // that quotes the credential may pass.
+        let mut t = forwarder(None).with_scrubber(scrub);
+        push_all(&mut t, &[start()]);
+        assert_eq!(t.push(&SseEvent::data(CORRUPT)).len(), 1);
+        let later = SseEvent::data(format!("{{\"oops\":\"{KEY}\"}}"));
+        let out = t.push(&later);
+        assert_eq!(out[0].data, "{\"oops\":\"[redacted]\"}");
+    }
+
+    #[test]
+    fn the_gateways_own_failure_and_an_undecodable_stream_are_scrubbed() {
+        let mut t = translator().with_scrubber(scrub);
+        push_all(&mut t, &[start()]);
+        let out = t.fail(ApiError::upstream(format!("read failed for {KEY}")));
+        let text: String = out.iter().map(|event| event.data.clone()).collect();
+        assert!(!text.contains(KEY), "{text}");
+        assert_eq!(t.error().unwrap().message, "read failed for [redacted]");
+
+        let mut t = forwarder(None).with_scrubber(scrub);
+        push_all(&mut t, &[start()]);
+        let out = t.fail(ApiError::upstream(format!("read failed for {KEY}")));
+        assert!(out.iter().all(|event| !event.data.contains(KEY)));
+    }
+
+    #[test]
+    fn without_a_scrubber_errors_pass_as_they_are() {
+        let mut t = translator();
+        let out = push_all(&mut t, &[start(), StreamEvent::Error(leaking_error())]);
+        assert_eq!(canonical(&out)[1], StreamEvent::Error(leaking_error()));
+    }
+
+    #[test]
+    fn a_passthrough_filter_holds_events_back_but_still_counts_them() {
+        let usage = StreamEvent::Usage(Usage {
+            input_tokens: 11,
+            output_tokens: 7,
+            ..Usage::default()
+        });
+        let hidden = wire(UP, &usage);
+        let hidden_data = hidden.data.clone();
+        let mut t = forwarder(None).with_passthrough_filter(move |event| event.data != hidden_data);
+        let out = push_all(
+            &mut t,
+            &[
+                start(),
+                text_start(0),
+                text_delta(0, "hi"),
+                StreamEvent::BlockStop { index: 0 },
+                usage.clone(),
+                finish_stop(),
+            ],
+        );
+        assert_eq!(out.len(), 5, "the usage event is not forwarded");
+        assert!(out.iter().all(|event| *event != hidden));
+        assert_eq!(t.usage().input_tokens, 11);
+        assert_eq!(t.usage().output_tokens, 7);
+        assert_eq!(t.events_in(), 6);
+        assert_eq!(t.events_out(), 5);
+    }
+
+    #[test]
+    fn a_held_back_first_event_still_opens_the_bootstrap_gate() {
+        let mut t = forwarder(None).with_passthrough_filter(|_| false);
+        assert_eq!(push_all(&mut t, &[start()]), Vec::new());
+        assert!(t.saw_first_event());
+    }
+
+    #[test]
+    fn a_passthrough_filter_does_nothing_in_translation_mode() {
+        let mut t = translator().with_passthrough_filter(|_| false);
+        assert_eq!(push_all(&mut t, &[start()]).len(), 1);
     }
 
     #[test]

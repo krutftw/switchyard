@@ -11,13 +11,39 @@
 //! [`repair_tool_pairs`], [`ws_error_frame`] and [`prewarm_frames`].
 //!
 //! Opaque reasoning blobs (`reasoning.encrypted_content`) are tagged with the
-//! protocol that issued them. Blobs of another vendor family reach a
-//! Responses client wrapped (`sy1.<tag>.<blob>`), are unwrapped again when
-//! the client replays them, and are never sent to a Responses upstream.
+//! protocol that issued them. Blobs of any other protocol — Chat Completions
+//! included, although it is the same vendor family: its blobs are the
+//! signatures of the compatible servers behind it — reach a Responses client
+//! wrapped (`sy1.<tag>.<blob>`), are unwrapped again when the client replays
+//! them, and are never sent to a Responses upstream.
+//!
+//! Tool names written for another protocol are fitted to OpenAI's rules on
+//! the way to an upstream (`^[a-zA-Z0-9_-]{1,64}$`), and a tool call an
+//! upstream of another protocol makes is reported to the client under the
+//! name the client declared, whatever spelling that upstream was given.
+//!
+//! Tool choice across protocols:
+//!
+//! * a client's `allowed_tools` choice restricts the model to some of the
+//!   declared tools. The canonical model cannot say that, so the decoder
+//!   narrows the tool list to the allowed tools (and keeps the raw choice
+//!   for a Responses upstream): no other upstream may be offered the tools
+//!   the client excluded;
+//! * a forced provider tool of another vendor that was mapped to a hosted
+//!   tool (a Messages client's `web_search`) forces the hosted tool; a
+//!   forced tool the body does not offer becomes `"none"`.
+//!
+//! Requests written for another protocol are also fitted where this API is
+//! stricter: `strict` of another vendor's tool is not taken over, a JSON
+//! schema format whose root is not an object schema is described in
+//! `instructions` instead, `json_object` mode gets the mention of "JSON" the
+//! API insists on, and a Chat Completions client's `reasoning_effort` asks
+//! for reasoning summaries (it has no other way to).
 
 mod common;
 mod error;
 mod models;
+mod names;
 mod reasoning;
 mod request;
 mod response;
@@ -114,8 +140,11 @@ impl Codec for ResponsesCodec {
 
     /// Encodes a request for a Responses upstream. Beyond the plain mapping:
     ///
-    /// * reasoning items are replayed only with a blob of this vendor family,
-    ///   and not at all to a model known not to reason;
+    /// * reasoning items are replayed only with a blob a Responses upstream
+    ///   issued, and not at all to a model known not to reason;
+    /// * tool names of a request written for another protocol are made
+    ///   valid for this API (declarations, calls in the history and
+    ///   `tool_choice` alike);
     /// * `store: false` (plus `include: ["reasoning.encrypted_content"]`) is
     ///   set when the model may reason and the request does not rely on
     ///   stored state, and `store: false` alone for any request from another

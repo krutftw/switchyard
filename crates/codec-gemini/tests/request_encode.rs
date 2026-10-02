@@ -1222,8 +1222,11 @@ fn thinking(req: &Request, ctx: &UpstreamCtx<'_>) -> Option<Value> {
 
 #[test]
 fn reasoning_depth_is_written_as_given() {
+    // A Messages client: its depth says nothing about seeing the thoughts
+    // (a Chat client's does, see the next test).
     let with = |config: ReasoningConfig| {
-        let mut req = chat(vec![Message::user_text("hi")]);
+        let mut req = request(Protocol::Anthropic);
+        req.messages = vec![Message::user_text("hi")];
         req.reasoning = Some(config);
         req
     };
@@ -1299,6 +1302,48 @@ fn reasoning_depth_is_written_as_given() {
         ),
         None
     );
+    assert_eq!(thinking(&with(ReasoningConfig::default()), &unknown), None);
+}
+
+/// A Chat Completions client has no field that asks for reasoning text:
+/// turning reasoning on with `reasoning_effort` is how it asks to see it
+/// (notes 12 §8.1, the implicit reading), so its depth brings
+/// `includeThoughts` along. An explicit statement about visibility wins.
+#[test]
+fn a_chat_clients_depth_also_asks_for_the_thoughts() {
+    let with = |config: ReasoningConfig| {
+        let mut req = chat(vec![Message::user_text("hi")]);
+        req.reasoning = Some(config);
+        req
+    };
+    let unknown = UpstreamCtx::default();
+    assert_eq!(
+        thinking(
+            &with(ReasoningConfig::with_depth(Depth::Budget(8192))),
+            &unknown
+        ),
+        Some(json!({"thinkingConfig": {"thinkingBudget": 8192, "includeThoughts": true}}))
+    );
+    assert_eq!(
+        thinking(&with(ReasoningConfig::with_depth(Depth::Auto)), &unknown),
+        Some(json!({"thinkingConfig": {"thinkingBudget": -1, "includeThoughts": true}}))
+    );
+    // Reasoning switched off asks for nothing.
+    assert_eq!(
+        thinking(&with(ReasoningConfig::with_depth(Depth::Off)), &unknown),
+        Some(json!({"thinkingConfig": {"thinkingBudget": 0}}))
+    );
+    assert_eq!(
+        thinking(
+            &with(ReasoningConfig {
+                depth: Some(Depth::Level(Effort::Low)),
+                summary: Some(Summary::Off)
+            }),
+            &unknown
+        ),
+        Some(json!({"thinkingConfig": {"thinkingLevel": "low", "includeThoughts": false}}))
+    );
+    // Nothing said about reasoning: nothing written.
     assert_eq!(thinking(&with(ReasoningConfig::default()), &unknown), None);
 }
 

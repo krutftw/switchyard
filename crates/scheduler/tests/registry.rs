@@ -3,7 +3,7 @@
 
 mod common;
 
-use common::{fixture, resolver};
+use common::{fixture, fixture_from, resolver};
 use pretty_assertions::assert_eq;
 use switchyard_core::config::ProviderKind;
 use switchyard_core::util::mask_secret;
@@ -949,15 +949,22 @@ fn credential_id_depends_on_provider_kind_key_and_base_url() {
 
 #[test]
 fn duplicate_credentials_get_numbered_ids() {
-    let f = fixture(
+    // `Config::validate` rejects a key listed twice, so the config is built
+    // in code: the scheduler must still tell such credentials apart.
+    let mut config = common::config(
         r#"
 [[providers]]
 name = "openai"
 kind = "openai"
-api_keys = ["sk-dup-aaaaaaaaaaaaaaaaaaaa", "sk-dup-aaaaaaaaaaaaaaaaaaaa", "sk-dup-aaaaaaaaaaaaaaaaaaaa"]
+api_keys = ["sk-dup-aaaaaaaaaaaaaaaaaaaa"]
 "#,
     );
+    let key = config.providers[0].api_keys[0].clone();
+    config.providers[0].api_keys.push(key.clone());
+    config.providers[0].api_keys.push(key);
+    let f = fixture_from(&config);
     let ids: Vec<String> = f.all_credentials().into_iter().map(|c| c.id).collect();
+    assert_eq!(ids.len(), 3);
     assert_eq!(ids[1], format!("{}-1", ids[0]));
     assert_eq!(ids[2], format!("{}-2", ids[0]));
 }
@@ -1143,7 +1150,7 @@ fn debug_output_never_shows_the_key() {
         !printed.contains("sk-openai-aaaaaaaaaaaaaaaaaaaa"),
         "{printed}"
     );
-    assert!(printed.contains("sk-ope…aaaa"));
+    assert!(printed.contains("sk-o…aaa"));
 }
 
 // ---------------------------------------------------------------------------
@@ -1177,6 +1184,7 @@ name = "chatonly"
 kind = "openai"
 wire_api = "chat"
 legacy_max_tokens = true
+stream_usage = false
 api_keys = ["sk-chatonly-aaaaaaaaaaaaaaaaaa"]
 
 [[providers.models]]
@@ -1225,6 +1233,16 @@ id = "gpt-chat-only"
     let chat_only = pick("gpt-chat-only", Protocol::OpenaiResponses);
     assert_eq!(chat_only.upstream_protocol, Protocol::OpenaiChat);
     assert_eq!(chat_only.quirks.max_tokens_field, MaxTokensField::MaxTokens);
+    // `stream_usage` is on unless the provider switches it off.
+    assert!(pick("gpt-5.5", Protocol::OpenaiChat).quirks.stream_usage);
+    assert!(
+        pick("local-model", Protocol::OpenaiChat)
+            .quirks
+            .stream_usage
+    );
+    assert!(!chat_only.quirks.stream_usage);
+    // The lease carries exactly what the provider config derives.
+    assert_eq!(chat_only.quirks, chat_only.provider_config.quirks());
     assert_eq!(chat_only.provider_config.name, "chatonly");
     assert_eq!(chat_only.credential.kind, ProviderKind::Openai);
 }

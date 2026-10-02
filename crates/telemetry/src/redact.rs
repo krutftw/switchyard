@@ -23,7 +23,7 @@
 //! `x-ratelimit-remaining-tokens`, …) are never touched: the name test
 //! excludes them and name-based JSON redaction only ever rewrites strings.
 //!
-//! Redaction recognises its own output (`abc…wxyz`, `•••`, `[redacted]`)
+//! Redaction recognises its own output (`sk-pro…wxyz`, `•••`, `[redacted]`)
 //! and leaves it alone, so headers, bodies and messages can safely pass
 //! through it more than once.
 //!
@@ -86,21 +86,37 @@ pub fn is_secret_key(name: &str) -> bool {
     false
 }
 
+/// The `(prefix, suffix)` lengths [`mask_secret`] keeps around its `…`, from
+/// the shortest secret it shows anything of to the longest: `ab…c`,
+/// `abc…de`, `abcd…efg`, `abcdef…ghij`.
+const MASK_SHAPES: [(usize, usize); 4] = [(2, 1), (3, 2), (4, 3), (6, 4)];
+
 /// Whether a value is the output of this module: [`REDACTED`], the bullets
-/// [`mask_secret`] turns a short secret into, or its `abc…wxyz` /
-/// `abcdef…wxyz` form. Masking such a value again would only destroy the
+/// [`mask_secret`] turns a short secret into, or one of its
+/// [`MASK_SHAPES`]. Masking such a value again would only destroy the
 /// prefix an operator uses to recognise a key.
 ///
-/// The test is on the exact shape, not on "contains an ellipsis": text that
-/// was merely truncated with `…` by someone else is still redacted.
+/// The test is on the exact shape, not on "contains an ellipsis": the kept
+/// prefix and suffix must have exactly the lengths [`mask_secret`] produces,
+/// and the suffix must end the value or be followed by punctuation (a
+/// sentence's full stop, the `", "` of joined header values). Text that was
+/// merely truncated with `…` by someone else is still redacted.
 fn already_redacted(value: &str) -> bool {
     if value.starts_with('•') || value.starts_with("[redacted") {
         return true;
     }
-    let head: Vec<char> = value.chars().take(11).collect();
-    [3usize, 6]
-        .into_iter()
-        .any(|prefix| head.len() >= prefix + 5 && head[prefix] == '…')
+    let head: Vec<char> = value.chars().take(12).collect();
+    // The kept characters are the secret's own, so anything but a blank: a
+    // secret someone else truncated masks to `abc…8…`.
+    let kept = |c: &char| !c.is_whitespace();
+    MASK_SHAPES.into_iter().any(|(prefix, suffix)| {
+        let end = prefix + 1 + suffix;
+        head.len() >= end
+            && head[prefix] == '…'
+            && head[..prefix].iter().all(kept)
+            && head[prefix + 1..end].iter().all(kept)
+            && head.get(end).is_none_or(|next| !next.is_alphanumeric())
+    })
 }
 
 fn mask(value: &str) -> String {
@@ -831,9 +847,13 @@ mod tests {
             "•••••",
             "[redacted]",
             "[redacted",
-            "abc…6789",
+            "ab…6",
+            "abc…89",
+            "sk-a…tuv",
             "sk-pro…wxyz",
             "sk-pro…wxyz, sk-pro…abcd",
+            "ab…6, Bearer abc…89",
+            "sk-pro…wxyz.",
         ] {
             assert!(already_redacted(value), "{value}");
         }
@@ -843,10 +863,38 @@ mod tests {
             // Truncated by someone else: the ellipsis is not ours.
             "hunter2…",
             "abcdefgh12345678…",
+            "ab…",
+            "abc… (truncated)",
+            // Not the lengths `mask_secret` keeps.
             "ab…cdefg",
             "abc…def",
+            "abc…6789",
+            "abcde…fghi",
+            "a…b",
         ] {
             assert!(!already_redacted(value), "{value}");
+        }
+    }
+
+    #[test]
+    fn every_mask_shape_is_recognised_and_stable() {
+        // One secret of every length `mask_secret` treats differently, made
+        // of the characters real keys use.
+        const ALPHABET: &[u8] = b"sk-Zx81_kqPlmN7.vbnQw+/=~0aB";
+        for len in 1..=80usize {
+            let secret: String = (0..len)
+                .map(|i| char::from(ALPHABET[(i * 7 + len) % ALPHABET.len()]))
+                .collect();
+            let masked = mask(&secret);
+            assert!(already_redacted(&masked), "{len}: {masked}");
+            assert_eq!(mask(&masked), masked, "{len}");
+            assert_eq!(redact_header_value("x-api-key", &masked), masked, "{len}");
+            // Nothing but the kept prefix and suffix survives.
+            let shown = masked.chars().filter(|c| *c != '…' && *c != '•').count();
+            assert!(shown * 3 <= len, "{len}: {shown} shown");
+            if len > 11 {
+                assert!(!masked.contains(&secret[2..len - 1]), "{len}: {masked}");
+            }
         }
     }
 
@@ -887,7 +935,7 @@ mod tests {
         ]);
         assert_eq!(
             once["authorization"],
-            format!("Bearer {KEY_MASKED}, Bearer abc…f456")
+            format!("Bearer {KEY_MASKED}, Bearer ab…6")
         );
         let twice = redact_headers(once.iter());
         assert_eq!(twice, once);
@@ -917,7 +965,7 @@ mod tests {
         // An unknown first word is not assumed to be a scheme: it may be
         // the secret itself.
         let out = redact_header_value("authorization", "s3cr3t-part-one part-two");
-        assert_eq!(out, "s3cr3t…-two");
+        assert_eq!(out, "s3cr…two");
         assert_eq!(
             redact_header_value(
                 "authorization",
@@ -959,11 +1007,11 @@ mod tests {
         );
         assert_eq!(
             headers["sec-websocket-protocol"],
-            "realtime, openai-insecure-api-key.my-…od-1, openai-beta.realtime-v1"
+            "realtime, openai-insecure-api-key.my-…-1, openai-beta.realtime-v1"
         );
         assert_eq!(
             headers["referer"],
-            "https://app.example/chat?access_token=abcdef…cdef"
+            "https://app.example/chat?access_token=abc…ef"
         );
         assert_eq!(headers["x-upstream-auth"], format!("Bearer {KEY_MASKED}"));
         assert_eq!(headers["x-proxy"], "http://[redacted]@10.0.0.1:3128");
@@ -1148,12 +1196,12 @@ mod tests {
             body["logprobs"]["content"][0]["top_logprobs"][0]["token"],
             "Hello"
         );
-        assert_eq!(body["token"], "an-act…oken");
+        assert_eq!(body["token"], "an-…en");
 
         // A string under `logprob` proves nothing about its sibling.
         let mut body = json!({"token": "an-actual-secret-token", "logprob": "n/a"});
         assert!(redact_json_secrets(&mut body));
-        assert_eq!(body["token"], "an-act…oken");
+        assert_eq!(body["token"], "an-…en");
     }
 
     #[test]
@@ -1238,16 +1286,16 @@ mod tests {
         );
         assert_eq!(
             redact_text("groq gsk_abcdefghijklmnopqrstuvwx and xai-abcdefghijklmnopqrstuvwx"),
-            "groq gsk_ab…uvwx and xai-ab…uvwx"
+            "groq gsk_…vwx and xai-…vwx"
         );
         // A bearer credential outside an authorization header.
         assert_eq!(
             redact_text("client sent Bearer abc123def456ghi, rejected."),
-            "client sent Bearer abc…6ghi, rejected."
+            "client sent Bearer ab…i, rejected."
         );
         assert_eq!(
             redact_text("got bearer Zx81kqPlmN7vbnQw."),
-            "got bearer Zx8…bnQw."
+            "got bearer Zx8…Qw."
         );
     }
 
@@ -1269,7 +1317,7 @@ mod tests {
             // Shorter than anything the context-free Bearer rule accepts.
             (
                 "Authorization: Bearer abc123def456".to_string(),
-                "Authorization: Bearer abc…f456".to_string(),
+                "Authorization: Bearer ab…6".to_string(),
             ),
             (
                 "authorization=Bearer sy-test&x=1".to_string(),
@@ -1277,17 +1325,17 @@ mod tests {
             ),
             (
                 "Authorization: Token 0123456789abcdef0123".to_string(),
-                "Authorization: Token 012345…0123".to_string(),
+                "Authorization: Token 012…23".to_string(),
             ),
             // A bare credential.
             (
                 "authorization: abcdef0123456789".to_string(),
-                "authorization: abc…6789".to_string(),
+                "authorization: abc…89".to_string(),
             ),
             // JSON carried inside a JSON string: the quotes are escaped.
             (
                 r#"{"body":"{\"Authorization\":\"Bearer abc123def456\"}"}"#.to_string(),
-                r#"{"body":"{\"Authorization\":\"Bearer abc…f456\"}"}"#.to_string(),
+                r#"{"body":"{\"Authorization\":\"Bearer ab…6\"}"}"#.to_string(),
             ),
         ] {
             assert_eq!(redact_text(&input), expected, "{input}");
@@ -1296,16 +1344,16 @@ mod tests {
         // does a first word that is not a plain word.
         assert_eq!(
             redact_text("Authorization: Custom Zx81kq0PlmN7 rest"),
-            "Authorization: Custom Zx8…lmN7 rest"
+            "Authorization: Custom Zx…7 rest"
         );
         assert_eq!(
             redact_text("Authorization: s3cr3t-part-one Zx81kq0PlmN7"),
-            "Authorization: s3c…-one Zx8…lmN7"
+            "Authorization: s3…e Zx…7"
         );
         // Quoted, it is a header value whatever it looks like.
         assert_eq!(
             redact_text(r#"{"authorization": "mysecretkey"}"#),
-            r#"{"authorization": "mys…tkey"}"#
+            r#"{"authorization": "••••••••"}"#
         );
         assert_eq!(
             redact_text(r#"{"Authorization": "Bearer hunter"}"#),
@@ -1400,16 +1448,16 @@ mod tests {
         );
         assert_eq!(
             redact_text("config api_key=abcdef0123456789 password: correct-horse-battery"),
-            "config api_key=abc…6789 password: [redacted]"
+            "config api_key=abc…89 password: [redacted]"
         );
         assert_eq!(
             redact_text(r#"data: {"x-api-key":"abcdef0123456789","max_tokens":100}"#),
-            r#"data: {"x-api-key":"abc…6789","max_tokens":100}"#
+            r#"data: {"x-api-key":"abc…89","max_tokens":100}"#
         );
         // Environment-style and dotted names.
         assert_eq!(
             redact_text("OPENAI_API_KEY=abcdef0123456789 started"),
-            "OPENAI_API_KEY=abc…6789 started"
+            "OPENAI_API_KEY=abc…89 started"
         );
         assert_eq!(
             redact_text("db.password = 'p@ss, word; 1' loaded"),
@@ -1425,7 +1473,7 @@ mod tests {
             redact_text(
                 r#"Config { api_key: Some("abcdef0123456789"), password: None, refresh_token: "r-0123456789" }"#
             ),
-            r#"Config { api_key: Some("abc…6789"), password: None, refresh_token: "r-0…6789" }"#
+            r#"Config { api_key: Some("abc…89"), password: None, refresh_token: "r-…9" }"#
         );
         // JSON inside a JSON string.
         assert_eq!(
@@ -1466,7 +1514,7 @@ mod tests {
         // A literal key in the code is still a key.
         assert_eq!(
             redact_text("api_key = \"abcdef0123456789\"  # do not commit"),
-            "api_key = \"abc…6789\"  # do not commit"
+            "api_key = \"abc…89\"  # do not commit"
         );
     }
 
@@ -1538,7 +1586,7 @@ mod tests {
         let redacted = redact_body(&gemini_response);
         assert_eq!(
             redacted,
-            gemini_response.replace("next page please", "nex…ease")
+            gemini_response.replace("next page please", "nex…se")
         );
     }
 
@@ -1694,7 +1742,7 @@ mod tests {
         assert_eq!(redact_body(""), "");
         assert_eq!(
             redact_body("upstream said: Bearer abc123def456ghi"),
-            "upstream said: Bearer abc…6ghi"
+            "upstream said: Bearer ab…i"
         );
     }
 
@@ -1735,7 +1783,7 @@ mod tests {
         );
         assert_eq!(
             redact_body(&body),
-            "{\"n\":1,\"token\":\"abc…6789\"}\nAuthorization: Bearer sk-pro…wxyz\n[redacted]\n[1,2,3]\ntail password=[redacted]"
+            "{\"n\":1,\"token\":\"abc…89\"}\nAuthorization: Bearer sk-pro…wxyz\n[redacted]\n[1,2,3]\ntail password=[redacted]"
         );
         let once = redact_body(&body);
         assert_eq!(redact_body(&once), once);

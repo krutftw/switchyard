@@ -48,7 +48,7 @@ fn encode_error_for_every_kind() {
         (ErrorKind::Upstream, "server_error", json!("upstream_error")),
         (
             ErrorKind::Unavailable,
-            "server_error",
+            "service_unavailable_error",
             json!("service_unavailable"),
         ),
         (ErrorKind::Timeout, "server_error", json!("request_timeout")),

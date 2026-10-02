@@ -603,9 +603,12 @@ fn encode_reasoning_with_signatures() {
             {"text": "gemini thought", "thought": true, "thoughtSignature": "R1NJRw=="},
             // Foreign blobs are tagged so they are recognised when replayed,
             // and armoured because `thoughtSignature` must be base64:
-            // base64("sy1.a.ErACkgE=") and base64("sy1.r.gAAAAAB").
+            // base64("sy1.a.ErACkgE="). The payload of withheld reasoning is
+            // marked as such inside the tag, because a Gemini part has no
+            // other way to say "this blob is the reasoning":
+            // base64("sy1.r.redacted:gAAAAAB").
             {"text": "claude thought", "thought": true, "thoughtSignature": "c3kxLmEuRXJBQ2tnRT0="},
-            {"text": "", "thoughtSignature": "c3kxLnIuZ0FBQUFBQg=="},
+            {"text": "", "thoughtSignature": "c3kxLnIucmVkYWN0ZWQ6Z0FBQUFBQg=="},
             {"text": "unsigned", "thought": true},
             {"text": "Answer.", "thoughtSignature": "VFNJRw=="},
             {"text": "", "thoughtSignature": "VFJBSUw="}

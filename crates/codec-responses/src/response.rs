@@ -28,9 +28,9 @@
 //! Responses client (the vendor documents `reason` as an open enum).
 
 use crate::common::{
-    P, ToolIndex, annotation_from_citation, i64_field, id_base, non_empty, parts_from_output_item,
-    response_id, signature_for_client, tool_item_id, unwrap_custom_input, usage_from_wire,
-    usage_to_wire,
+    P, ToolIndex, annotation_from_citation, call_signature_for_client, i64_field, id_base,
+    non_empty, parts_from_output_item, response_id, signature_for_client, tool_item_id,
+    unwrap_custom_input, usage_from_wire, usage_to_wire,
 };
 use crate::error::sanitize_message;
 use serde_json::{Map, Value, json};
@@ -578,6 +578,9 @@ pub(crate) fn cuts_output(finish: &FinishReason) -> bool {
 /// `reasoning` item; each tool call a `function_call` (or `custom_tool_call`)
 /// item whose `call_id` is the IR call id and whose item id is derived from
 /// it. Ids that already have the vendor's shape (`resp_…`, `rs_…`) are kept.
+/// A tool call that carries a signature of its own is preceded by a
+/// summary-less `reasoning` item whose `encrypted_content` holds it, so a
+/// client that replays its output items returns it.
 /// When generation was cut short the trailing message or tool call is marked
 /// `incomplete` (and the call's arguments are left as far as they got).
 pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Value, CodecError> {
@@ -625,6 +628,13 @@ pub(crate) fn encode_response(response: &Response, ctx: &ClientCtx) -> Result<Va
             }
             Part::ToolCall(call) => {
                 flush(&mut output, &mut content, "completed");
+                // A call that carries a signature of its own (Gemini signs
+                // the `functionCall` part): the item has no field for it,
+                // so it travels on a reasoning item directly ahead.
+                if let Some(blob) = call_signature_for_client(call.signature.as_ref()) {
+                    let id = reasoning_item_id(None, &base, output.len());
+                    output.push(reasoning_item(&id, "", Some(&blob)));
+                }
                 let view = ToolView::new(&index, &call.id, &call.name, call.kind);
                 // Generation stopped inside this call: its arguments are
                 // whatever had been produced, not a finished document.

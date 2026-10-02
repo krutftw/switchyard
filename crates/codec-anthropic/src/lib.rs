@@ -15,15 +15,24 @@
 //! [`switchyard_core::sig::decode_from_client`], blobs written to a client
 //! through [`switchyard_core::sig::encode_for_client`], and a request sent
 //! upstream only ever carries blobs Anthropic issued.
+//!
+//! A request translated from another protocol is fitted to the rules of the
+//! Claude generation it is addressed to (read off the model id): no assistant
+//! prefill from Claude 4.6 on, no forced tool use on Opus 5.5 / Sonnet 5.5 /
+//! Fable 5.1 / Mythos 5.1 and their successors. A forced tool the body does
+//! not offer becomes `tool_choice: none`. A Messages client's own request is
+//! replayed as written.
 
 mod blocks;
 mod error;
 mod models;
 mod passthrough;
 mod reasoning;
+mod redact;
 mod request_dec;
 mod request_enc;
 mod response;
+mod schema;
 mod stream_dec;
 mod stream_enc;
 mod util;

@@ -509,17 +509,28 @@ fn encode_tools_of_every_kind() {
             raw: json!({"type": "file_search"}),
         }),
     ];
+    // `strict` of another protocol's client is not forwarded: Anthropic holds
+    // a strict tool to its structured-output dialect and per-request limits
+    // that schemas written for OpenAI's strict mode do not meet.
     assert_eq!(
         encode_request(&req)["tools"],
         json!([
             {"name": "get_weather", "description": "Get the weather",
              "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
-             "strict": true, "cache_control": {"type": "ephemeral"}},
+             "cache_control": {"type": "ephemeral"}},
             {"name": "mcp_server_ping", "input_schema": {"type": "object", "properties": {}}},
             {"name": "apply_patch", "description": "Apply a patch",
              "input_schema": {"type": "object", "properties": {"input": {"type": "string"}}, "required": ["input"]}},
             native_search
         ])
+    );
+    // A Messages client wrote its `strict` for this API: it is kept.
+    req.source = Protocol::Anthropic;
+    assert_eq!(
+        encode_request(&req)["tools"][0],
+        json!({"name": "get_weather", "description": "Get the weather",
+               "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}, "required": ["city"]},
+               "strict": true, "cache_control": {"type": "ephemeral"}})
     );
 }
 
@@ -1139,12 +1150,21 @@ fn encode_json_schema_and_effort_share_output_config() {
         strict: None,
     });
     req.reasoning = Some(ReasoningConfig::with_depth(Depth::Level(Effort::Low)));
+    // The schema was written for another protocol, so it is fitted to the
+    // dialect `output_config.format` takes: objects are closed.
+    let fitted = json!({"type": "object", "additionalProperties": false});
     assert_eq!(
         encode_request(&req)["output_config"],
-        json!({"format": {"type": "json_schema", "schema": {"type": "object"}}, "effort": "low"})
+        json!({"format": {"type": "json_schema", "schema": fitted}, "effort": "low"})
     );
     // Turning thinking off removes the effort but not the format.
     req.reasoning = Some(ReasoningConfig::with_depth(Depth::Off));
+    assert_eq!(
+        encode_request(&req)["output_config"],
+        json!({"format": {"type": "json_schema", "schema": fitted}})
+    );
+    // A Messages client's own schema is sent as written.
+    req.source = Protocol::Anthropic;
     assert_eq!(
         encode_request(&req)["output_config"],
         json!({"format": {"type": "json_schema", "schema": {"type": "object"}}})

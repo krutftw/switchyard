@@ -29,7 +29,8 @@
 //! protocol.
 
 use crate::common::{
-    ToolIndex, annotation_from_citation, id_base, response_id, signature_for_client,
+    ToolIndex, annotation_from_citation, call_signature_for_client, id_base, response_id,
+    signature_for_client,
 };
 use crate::error::stream_error_event;
 use crate::response::{
@@ -248,8 +249,31 @@ impl Encoder {
                     part_open: false,
                 };
             }
-            BlockStart::ToolCall { id, name, kind, .. } => {
+            BlockStart::ToolCall {
+                id,
+                name,
+                kind,
+                signature,
+            } => {
                 self.close_message(out, "completed");
+                // The call's own signature travels on a reasoning item
+                // directly ahead of it, as in a complete response.
+                if let Some(blob) = call_signature_for_client(signature.as_ref()) {
+                    let output_index = self.output.len();
+                    let id = reasoning_item_id(None, &self.base, output_index);
+                    self.emit(
+                        out,
+                        "response.output_item.added",
+                        json!({"output_index": output_index, "item": reasoning_item(&id, "", None)}),
+                    );
+                    let item = reasoning_item(&id, "", Some(&blob));
+                    self.emit(
+                        out,
+                        "response.output_item.done",
+                        json!({"output_index": output_index, "item": item.clone()}),
+                    );
+                    self.output.push(item);
+                }
                 let output_index = self.output.len();
                 let view = ToolView::new(&self.tools, id, name, *kind);
                 self.emit(
@@ -304,7 +328,7 @@ impl Encoder {
                         id: call.id.clone(),
                         name: call.name.clone(),
                         kind: call.kind,
-                        signature: None,
+                        signature: call.signature.clone(),
                     },
                 );
                 self.args_delta(out, &call.arguments);

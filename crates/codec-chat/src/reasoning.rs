@@ -44,11 +44,16 @@ fn either<'a>(holder: &'a Value, snake: &str, camel: &str) -> Option<&'a Value> 
 
 /// Reads depth and summary intent from a Chat request body.
 ///
-/// The summary intent is only taken from fields that talk about visibility
-/// explicitly. `reasoning_effort` alone says nothing about whether the
-/// client wants to *see* reasoning: inferring "yes" would make translated
-/// requests ask an OpenAI Responses upstream for reasoning summaries, which
-/// that API refuses for organisations that are not verified.
+/// The summary intent is taken from fields that talk about visibility
+/// explicitly, with one exception: `reasoning_effort: "none"` also says "no
+/// summaries" (notes 12 §8.1). The other half of that rule, an effort that
+/// turns reasoning *on* means "show it to me", is not applied here, because
+/// it does not hold for every target: on an Anthropic upstream a Chat effort
+/// controls depth and nothing else (notes 12 §8.1, the "translated" reader),
+/// and the config read here cannot say which kind of statement it came from.
+/// The two upstream protocols that return reasoning text only on request
+/// apply it in their own encoders: Gemini (`includeThoughts`) and Responses
+/// (`reasoning.summary`).
 pub(crate) fn read_reasoning(body: &Value) -> ReasoningConfig {
     if !body.is_object() {
         return ReasoningConfig::default();
@@ -173,10 +178,20 @@ fn read_summary(body: &Value) -> Option<Summary> {
     if let Some(include) = body.get("include_reasoning").and_then(Value::as_bool) {
         return Some(on_off(include));
     }
-    reasoning
+    if let Some(enabled) = reasoning
         .and_then(|r| r.get("enabled"))
         .and_then(Value::as_bool)
-        .map(on_off)
+    {
+        return Some(on_off(enabled));
+    }
+    // A client that switches reasoning off does not want to be shown any,
+    // which matters on models that cannot stop reasoning: they are given the
+    // smallest depth they accept, and without this they would be asked for
+    // the thoughts of that as well.
+    let effort = body.get("reasoning_effort").and_then(Value::as_str);
+    effort
+        .is_some_and(|effort| effort.trim().eq_ignore_ascii_case("none"))
+        .then_some(Summary::Off)
 }
 
 /// The `reasoning_effort` value for a fitted depth, or `None` when the field

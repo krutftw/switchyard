@@ -15,6 +15,12 @@
 //!   constraint is lost, the request is not); `patternProperties` entries
 //!   keyed by such a pattern are removed likewise.
 //!
+//! * the root of a function's `parameters` has to be an object schema
+//!   ("schema must be a JSON Schema of 'type: \"object\"'"). Gemini accepts
+//!   declarations whose root names no type, so a root without `type` is
+//!   given `"type": "object"`, and a root that declares another type (which
+//!   no function call could satisfy) becomes the empty object schema.
+//!
 //! Only schema positions are visited. Data positions (`default`, `enum`,
 //! `const`, `examples`) are never touched, so a default value that happens to
 //! contain a `pattern` key survives.
@@ -56,9 +62,24 @@ const LISTS: &[&str] = &["prefixItems", "anyOf", "oneOf", "allOf"];
 /// `Value::Null` (no parameters) and anything that is not a schema object
 /// become the canonical empty object schema.
 pub(crate) fn normalize_parameters(schema: &Value) -> Value {
-    match schema {
-        Value::Object(_) => normalize_schema(schema),
-        _ => empty_object_schema(),
+    let Value::Object(root) = schema else {
+        return empty_object_schema();
+    };
+    if declares_object(root) {
+        return normalize_schema(schema);
+    }
+    match root.get("type") {
+        None | Some(Value::Null) => {
+            let mut typed = Map::new();
+            typed.insert("type".into(), Value::String("object".into()));
+            typed.extend(
+                root.iter()
+                    .filter(|(key, _)| key.as_str() != "type")
+                    .map(|(key, value)| (key.clone(), value.clone())),
+            );
+            normalize_schema(&Value::Object(typed))
+        }
+        Some(_) => empty_object_schema(),
     }
 }
 
@@ -138,6 +159,32 @@ mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
     use serde_json::json;
+
+    #[test]
+    fn a_parameters_root_is_always_an_object_schema() {
+        assert_eq!(
+            normalize_parameters(&json!({})),
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            normalize_parameters(
+                &json!({"properties": {"q": {"type": "string"}}, "required": ["q"]})
+            ),
+            json!({"type": "object", "properties": {"q": {"type": "string"}}, "required": ["q"]})
+        );
+        assert_eq!(
+            normalize_parameters(&json!({"type": null, "properties": {"q": {}}})),
+            json!({"type": "object", "properties": {"q": {}}})
+        );
+        assert_eq!(
+            normalize_parameters(&json!({"type": "string"})),
+            json!({"type": "object", "properties": {}})
+        );
+        assert_eq!(
+            normalize_parameters(&json!({"type": ["object", "null"]})),
+            json!({"type": ["object", "null"], "properties": {}})
+        );
+    }
 
     #[test]
     fn missing_and_non_object_parameters_become_the_empty_object_schema() {

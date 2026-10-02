@@ -123,6 +123,55 @@ pub(crate) fn targets_claude(body: &serde_json::Map<String, Value>) -> bool {
         .is_some_and(|model| model.to_ascii_lowercase().contains("claude"))
 }
 
+/// Family and generation of a Claude model, read off its id in the current
+/// naming scheme, `claude-<family>-<major>[-<minor>]…`: `claude-sonnet-4-5`,
+/// `claude-opus-5-5-20260301`, `anthropic.claude-opus-4-6-v1:0`,
+/// `claude-opus-4-1@20250805`, `claude-opus-4-20250514` (minor 0).
+///
+/// `None` for the older scheme (`claude-3-5-sonnet-…`, whose models none of
+/// the rules keyed on this apply to), for an id without a version, and for a
+/// model that is not Claude. Like [`targets_claude`], this reads the model
+/// id because it is the only evidence of the model a codec has.
+pub(crate) fn claude_generation(model: &str) -> Option<(String, u32, u32)> {
+    let lower = model.to_ascii_lowercase();
+    let rest = &lower[lower.find("claude")? + "claude".len()..];
+    let mut tokens = rest
+        .split(|c: char| !c.is_ascii_alphanumeric())
+        .filter(|token| !token.is_empty());
+    let family = tokens
+        .next()
+        .filter(|token| token.chars().all(|c| c.is_ascii_alphabetic()))?;
+    // A version number has one or two digits; a longer run is a date.
+    let version = |token: &str| {
+        (token.len() <= 2 && token.chars().all(|c| c.is_ascii_digit()))
+            .then(|| token.parse::<u32>().ok())
+            .flatten()
+    };
+    let major = tokens.next().and_then(version)?;
+    let minor = tokens.next().and_then(version).unwrap_or(0);
+    Some((family.to_string(), major, minor))
+}
+
+/// Whether the model refuses a conversation that ends with an assistant
+/// message: "This model does not support assistant message prefill. The
+/// conversation must end with a user message." Claude 4.6 and everything
+/// newer (notes 15 §5.2).
+pub(crate) fn rejects_prefill(model: &str) -> bool {
+    claude_generation(model).is_some_and(|(_, major, minor)| (major, minor) >= (4, 6))
+}
+
+/// Whether the model refuses forced tool use: `tool_choice: type "tool" and
+/// "any" are not supported for this model.` Claude Opus 5.5, Sonnet 5.5,
+/// Fable 5.1 and Mythos 5.1 (notes 15 §5.2), and the later generations of
+/// those families.
+pub(crate) fn rejects_forced_tool_choice(model: &str) -> bool {
+    claude_generation(model).is_some_and(|(family, major, minor)| match family.as_str() {
+        "opus" | "sonnet" => (major, minor) >= (5, 5),
+        "fable" | "mythos" => (major, minor) >= (5, 1),
+        _ => false,
+    })
+}
+
 /// Whether a content block has the given `type`.
 pub(crate) fn is_block(block: &Value, kind: &str) -> bool {
     str_field(block, "type") == Some(kind)
@@ -301,6 +350,52 @@ pub(crate) fn sniff_image_type(data: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_generations_are_read_off_the_model_id() {
+        let generation = claude_generation;
+        assert_eq!(
+            generation("claude-sonnet-4-5"),
+            Some(("sonnet".into(), 4, 5))
+        );
+        assert_eq!(
+            generation("claude-opus-5-5-20260301"),
+            Some(("opus".into(), 5, 5))
+        );
+        assert_eq!(
+            generation("anthropic.claude-opus-4-6-v1:0"),
+            Some(("opus".into(), 4, 6))
+        );
+        assert_eq!(
+            generation("claude-opus-4-1@20250805"),
+            Some(("opus".into(), 4, 1))
+        );
+        // A date is not a minor version.
+        assert_eq!(
+            generation("claude-opus-4-20250514"),
+            Some(("opus".into(), 4, 0))
+        );
+        assert_eq!(generation("Claude-Fable-5.1"), Some(("fable".into(), 5, 1)));
+        // The older naming scheme, ids without a version, other models.
+        assert_eq!(generation("claude-3-5-sonnet-20241022"), None);
+        assert_eq!(generation("claude-sonnet"), None);
+        assert_eq!(generation("gpt-5.5"), None);
+        assert_eq!(generation(""), None);
+
+        assert!(!rejects_prefill("claude-sonnet-4-5"));
+        assert!(rejects_prefill("claude-sonnet-4-6"));
+        assert!(rejects_prefill("claude-haiku-5-0"));
+        assert!(!rejects_prefill("claude-3-7-sonnet-20250219"));
+        assert!(!rejects_prefill("deepseek-chat"));
+
+        assert!(!rejects_forced_tool_choice("claude-opus-4-6"));
+        assert!(!rejects_forced_tool_choice("claude-opus-5-0"));
+        assert!(rejects_forced_tool_choice("claude-opus-5-5"));
+        assert!(rejects_forced_tool_choice("claude-sonnet-5-5-20260601"));
+        assert!(rejects_forced_tool_choice("claude-fable-5-1"));
+        assert!(rejects_forced_tool_choice("claude-mythos-5-1"));
+        assert!(!rejects_forced_tool_choice("claude-haiku-5-5"));
+    }
 
     #[test]
     fn rfc3339_known_instants() {

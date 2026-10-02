@@ -456,7 +456,7 @@ fn encode_fragmented_tool_arguments_and_parallel_calls() {
             id: id.into(),
             name: name.into(),
             kind: ToolCallKind::Function,
-            signature: Some(Signature::new(Protocol::Gemini, "CcallSig")),
+            signature: None,
         },
     };
     let fragment = |index: u32, text: &str| StreamEvent::ToolArgsDelta {
@@ -513,6 +513,81 @@ fn encode_fragmented_tool_arguments_and_parallel_calls() {
     assert_eq!(wire[10]["response"]["output"].as_array().unwrap().len(), 2);
     // No usage event was seen: the terminal usage is all zeros, not null.
     assert_eq!(wire[10]["response"]["usage"]["total_tokens"], json!(0));
+}
+
+/// A `function_call` item has no field for the signature another vendor put
+/// on the call (Gemini's `thoughtSignature`), a `reasoning` item does. The
+/// signature travels on a summary-less reasoning item directly ahead of the
+/// call, marked as a call signature and tagged with its origin, so the
+/// request decoder can put it back on the call.
+#[test]
+fn encode_call_signature_rides_on_a_reasoning_item_ahead_of_the_call() {
+    let tool = |index: u32, id: &str, signature: Option<Signature>| StreamEvent::BlockStart {
+        index,
+        block: BlockStart::ToolCall {
+            id: id.into(),
+            name: "get_weather".into(),
+            kind: ToolCallKind::Function,
+            signature,
+        },
+    };
+    let events = vec![
+        start(),
+        tool(
+            0,
+            "call_a",
+            Some(Signature::new(Protocol::Gemini, "CcallSig")),
+        ),
+        StreamEvent::ToolArgsDelta {
+            index: 0,
+            fragment: "{}".into(),
+        },
+        StreamEvent::BlockStop { index: 0 },
+        // An unsigned call next to it gets no carrier.
+        tool(1, "call_b", None),
+        StreamEvent::BlockStop { index: 1 },
+        finish(FinishReason::ToolCalls),
+    ];
+    let wire = run(&events);
+    assert_eq!(
+        types(&wire),
+        vec![
+            "response.created",
+            "response.in_progress",
+            // The carrier: opened and closed at once.
+            "response.output_item.added",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.function_call_arguments.delta",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.output_item.added",
+            "response.function_call_arguments.done",
+            "response.output_item.done",
+            "response.completed",
+        ]
+    );
+    let carrier = json!({"id": "rs_1_0", "type": "reasoning", "summary": [],
+                         "encrypted_content": "sy1.g.call:CcallSig"});
+    assert_eq!(
+        wire[2],
+        json!({"type": "response.output_item.added", "sequence_number": 2, "output_index": 0,
+               "item": {"id": "rs_1_0", "type": "reasoning", "summary": []}})
+    );
+    assert_eq!(
+        wire[3],
+        json!({"type": "response.output_item.done", "sequence_number": 3, "output_index": 0,
+               "item": carrier})
+    );
+    assert_eq!(wire[4]["output_index"], json!(1));
+    assert_eq!(wire[4]["item"]["call_id"], json!("call_a"));
+    assert_eq!(wire[8]["output_index"], json!(2));
+    assert_eq!(wire[8]["item"]["call_id"], json!("call_b"));
+    let output = wire[11]["response"]["output"].as_array().unwrap();
+    assert_eq!(output.len(), 3);
+    assert_eq!(output[0], carrier);
+    assert_eq!(output[1]["type"], json!("function_call"));
+    assert_eq!(output[2]["type"], json!("function_call"));
 }
 
 #[test]

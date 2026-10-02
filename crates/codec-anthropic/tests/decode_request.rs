@@ -271,12 +271,41 @@ fn decode_document_with_custom_content_source_is_kept_opaque() {
         "model": "m", "max_tokens": 1,
         "messages": [{"role": "user", "content": [block.clone()]}]
     }));
+    // The block itself for an Anthropic upstream, followed by the rendering
+    // every other upstream is shown in its place (they drop foreign opaque
+    // blocks, which would silently remove what the user attached).
     assert_eq!(
         request.messages[0].parts,
-        vec![Part::Opaque(OpaquePart {
+        vec![
+            Part::Opaque(OpaquePart {
+                origin: Protocol::Anthropic,
+                raw: block
+            }),
+            Part::text("<document>\nchunk\n</document>"),
+        ]
+    );
+}
+
+#[test]
+fn decode_opaque_user_block_without_readable_content_has_no_rendering() {
+    // A custom-content document that holds nothing a model could read, and a
+    // block of a kind the codec does not know: opaque, and nothing else.
+    let empty = json!({"type": "document", "source": {"type": "content", "content": [
+        {"type": "text", "text": "  "}]}});
+    let unknown = json!({"type": "container_upload", "file_id": "file_1"});
+    let request = decode_request(&json!({
+        "model": "m", "max_tokens": 1,
+        "messages": [{"role": "user", "content": [empty.clone(), unknown.clone()]}]
+    }));
+    let opaque = |raw: Value| {
+        Part::Opaque(OpaquePart {
             origin: Protocol::Anthropic,
-            raw: block
-        })]
+            raw,
+        })
+    };
+    assert_eq!(
+        request.messages[0].parts,
+        vec![opaque(empty), opaque(unknown)]
     );
 }
 
@@ -692,7 +721,17 @@ fn decode_server_tool_blocks_are_opaque() {
                     Part::text("Rust is a language.")
                 ]
             ),
-            Message::new(Role::User, vec![opaque(&search_result)]),
+            // A `search_result` is content the user wants read: it is
+            // followed by its rendering for upstreams of other protocols.
+            Message::new(
+                Role::User,
+                vec![
+                    opaque(&search_result),
+                    Part::text(
+                        "<search_result title=\"KB\" source=\"https://kb\">\nfact\n</search_result>"
+                    ),
+                ]
+            ),
         ]
     );
 }

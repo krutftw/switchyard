@@ -57,7 +57,18 @@ pub(crate) fn raw_signature(part: &Value) -> Option<&str> {
 /// standard and the URL-safe alphabet.
 const ARMOUR_PREFIX: &str = "c3kxL";
 
-/// Renders a signature for a Gemini client.
+/// Marker put in front of a foreign redacted-reasoning payload before it is
+/// tagged and armoured for a client. A Gemini part has one opaque slot
+/// (`thoughtSignature`) and nothing that says "the provider withheld this
+/// reasoning; the blob *is* the reasoning" (Anthropic `redacted_thinking`, a
+/// Chat relay's `reasoning.encrypted`), so that fact has to ride inside the
+/// blob or the payload comes back as the signature of an empty thought, which
+/// the vendor that issued it refuses. Base64 never contains `:`, so the
+/// marker cannot collide with a blob.
+const REDACTED_MARKER: &str = "redacted:";
+
+/// Renders a signature for a Gemini client. `redacted` says the signature
+/// is the payload of withheld reasoning (see [`REDACTED_MARKER`]).
 ///
 /// `Part.thoughtSignature` is a protobuf `bytes` field, so on the wire it
 /// must be base64: typed SDKs (Go, Python) decode it while parsing and fail
@@ -65,14 +76,35 @@ const ARMOUR_PREFIX: &str = "c3kxL";
 /// delivered as it is. A blob of another vendor is first tagged with its
 /// origin by [`sig::encode_for_client`] (`sy1.<tag>.<blob>`); the dots in
 /// that are not base64 characters, so the tagged string is armoured as
-/// standard base64 on top. [`signature_from_client`] undoes both layers.
-pub(crate) fn signature_for_client(signature: &Signature) -> String {
-    let wire = sig::encode_for_client(signature, Protocol::Gemini);
+/// standard base64 on top. [`signature_from_client`] undoes both layers and
+/// [`split_redacted`] the marker.
+pub(crate) fn signature_for_client(signature: &Signature, redacted: bool) -> String {
     if signature.valid_for(Protocol::Gemini) {
-        wire
-    } else {
-        STANDARD.encode(wire)
+        return sig::encode_for_client(signature, Protocol::Gemini);
     }
+    let tagged = if redacted {
+        let marked = Signature::new(
+            signature.origin,
+            format!("{REDACTED_MARKER}{}", signature.data),
+        );
+        sig::encode_for_client(&marked, Protocol::Gemini)
+    } else {
+        sig::encode_for_client(signature, Protocol::Gemini)
+    };
+    STANDARD.encode(tagged)
+}
+
+/// Takes the [`REDACTED_MARKER`] off a signature read from a client request.
+/// The flag says the signature is the payload of withheld reasoning. Only a
+/// blob of another vendor can carry the marker.
+pub(crate) fn split_redacted(mut signature: Signature) -> (Signature, bool) {
+    if !signature.valid_for(Protocol::Gemini)
+        && let Some(payload) = signature.data.strip_prefix(REDACTED_MARKER)
+    {
+        signature.data = payload.to_string();
+        return (signature, true);
+    }
+    (signature, false)
 }
 
 /// The tagged signature (`sy1.<tag>.<blob>`) inside an armoured one, or

@@ -150,7 +150,31 @@ fn sampling_parameters() {
             "max_completion_tokens": 256,
             "temperature": 0.2,
             "top_p": 0.9,
-            // `top_k` from another protocol is not an OpenAI parameter.
+            // `top_k` from another protocol is not an OpenAI parameter, a
+            // candidate count written for one would only make the upstream
+            // generate completions nobody reads, and `prompt_cache_key` /
+            // `store` exist on OpenAI's own platform only.
+            "stop": ["END"],
+            "seed": 7,
+            "presence_penalty": 0.5,
+            "frequency_penalty": -0.5,
+            "user": "u1",
+            "stream": false
+        })
+    );
+
+    // A Chat client wrote its request for this protocol: all of it is
+    // replayed.
+    req.source = Protocol::OpenaiChat;
+    assert_eq!(
+        encode_request(&req),
+        json!({
+            "model": "gpt-4o",
+            "messages": [{"role": "user", "content": "hi"}],
+            "max_completion_tokens": 256,
+            "temperature": 0.2,
+            "top_p": 0.9,
+            "top_k": 40,
             "n": 2,
             "stop": ["END"],
             "seed": 7,
@@ -216,36 +240,46 @@ fn streaming_asks_for_usage_unless_the_upstream_cannot() {
 }
 
 #[test]
-fn metadata_and_service_tier_are_vendor_scoped() {
-    let mut req = request(Protocol::OpenaiResponses);
-    req.metadata = json!({"trace": "abc"}).as_object().cloned();
-    req.service_tier = Some("flex".into());
-    req.store = Some(true);
-    let body = encode_request(&req);
+fn openai_platform_fields_are_replayed_only_for_chat_clients() {
+    let platform = |source: Protocol| {
+        let mut req = request(source);
+        req.messages.push(Message::user_text("hi"));
+        req.metadata = json!({"trace": "abc"}).as_object().cloned();
+        req.service_tier = Some("flex".into());
+        req.prompt_cache_key = Some("conv-1".into());
+        req.store = Some(true);
+        req.extra
+            .insert("safety_identifier".into(), json!("user-hash"));
+        encode_request(&req)
+    };
+    // What a Chat client wrote is replayed as written.
+    let body = platform(Protocol::OpenaiChat);
     assert_eq!(body["metadata"], json!({"trace": "abc"}));
     assert_eq!(body["service_tier"], json!("flex"));
+    assert_eq!(body["prompt_cache_key"], json!("conv-1"));
+    assert_eq!(body["store"], json!(true));
+    assert_eq!(body["safety_identifier"], json!("user-hash"));
 
-    // Chat rejects `metadata` unless the completion is stored; Responses
-    // has no such rule, so its metadata only travels with `store: true`.
-    for store in [None, Some(false)] {
-        req.store = store;
-        assert!(encode_request(&req).get("metadata").is_none(), "{store:?}");
+    // A request of another protocol is only translated to Chat when the
+    // provider speaks nothing else: an OpenAI-compatible server. Stored
+    // completions, cache routing and service tiers exist on OpenAI's own
+    // platform only, and servers that validate their request schema refuse
+    // the fields (notes 08 §5.1: "everything else: dropped").
+    for source in [
+        Protocol::OpenaiResponses,
+        Protocol::Anthropic,
+        Protocol::Gemini,
+    ] {
+        assert_eq!(
+            platform(source),
+            json!({
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": false
+            }),
+            "{source}"
+        );
     }
-    // What a Chat client wrote is replayed as written.
-    let mut req = request(Protocol::OpenaiChat);
-    req.metadata = json!({"trace": "abc"}).as_object().cloned();
-    assert_eq!(encode_request(&req)["metadata"], json!({"trace": "abc"}));
-
-    // Anthropic's metadata and tier names mean nothing to OpenAI.
-    let mut req = request(Protocol::Anthropic);
-    req.metadata = json!({"user_id": "u"}).as_object().cloned();
-    req.service_tier = Some("standard_only".into());
-    let body = encode_request(&req);
-    assert!(body.get("metadata").is_none());
-    assert!(body.get("service_tier").is_none());
-
-    req.service_tier = Some("auto".into());
-    assert_eq!(encode_request(&req)["service_tier"], json!("auto"));
 }
 
 #[test]
@@ -558,21 +592,28 @@ fn tools_and_tool_choice_variants() {
     assert_eq!(
         body["tools"],
         json!([
+            // `strict` of another vendor's client is not forwarded: OpenAI's
+            // strict mode wants every property in `required`, which a schema
+            // written for Anthropic's strict tools does not promise.
             {"type": "function", "function": {
                 "name": "get_weather",
                 "description": "Weather",
-                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}},
-                "strict": true
+                "parameters": {"type": "object", "properties": {"city": {"type": "string"}}}
             }},
             // A schema is mandatory: "no parameters" becomes the empty object schema.
             {"type": "function", "function": {
                 "name": "ping",
                 "parameters": {"type": "object", "properties": {}}
             }},
-            {"type": "custom", "custom": {
+            // A free-form tool of another protocol's client: Chat-compatible
+            // servers know `function` tools only, so it is declared as a
+            // function taking the raw input as its one string argument
+            // (notes 08 §1.3).
+            {"type": "function", "function": {
                 "name": "run_sql",
                 "description": "Runs SQL",
-                "format": {"type": "text"}
+                "parameters": {"type": "object", "properties": {"input": {"type": "string"}},
+                               "required": ["input"]}
             }}
         ])
     );
@@ -592,10 +633,38 @@ fn tools_and_tool_choice_variants() {
         }),
         json!({"type": "function", "function": {"name": "get_weather"}})
     );
+    // Forcing the free-form tool forces the function that stands in for it.
     assert_eq!(
         choice(ToolChoice::Tool {
             name: "run_sql".into()
         }),
+        json!({"type": "function", "function": {"name": "run_sql"}})
+    );
+
+    // A Responses client wrote `strict` for the same rules: it is kept.
+    req.source = Protocol::OpenaiResponses;
+    assert_eq!(
+        encode_request(&req)["tools"][0]["function"]["strict"],
+        json!(true)
+    );
+
+    // A Chat client's own custom tool is replayed in OpenAI's spelling.
+    req.source = Protocol::OpenaiChat;
+    req.tool_choice = Some(ToolChoice::Tool {
+        name: "run_sql".into(),
+    });
+    let body = encode_request(&req);
+    assert_eq!(body["tools"][0]["function"]["strict"], json!(true));
+    assert_eq!(
+        body["tools"][2],
+        json!({"type": "custom", "custom": {
+            "name": "run_sql",
+            "description": "Runs SQL",
+            "format": {"type": "text"}
+        }})
+    );
+    assert_eq!(
+        body["tool_choice"],
         json!({"type": "custom", "custom": {"name": "run_sql"}})
     );
 }
@@ -912,6 +981,18 @@ fn custom_tool_call_in_history() {
             cache_control: None,
         })],
     )];
+    // A Responses client's `custom_tool_call`: a call of the function that
+    // stands in for the custom tool, the raw input as its one argument
+    // (notes 08 §5.2).
+    assert_eq!(
+        encoded_messages(&req),
+        json!([{"role": "assistant", "content": "", "tool_calls": [
+            {"id": "c9", "type": "function",
+             "function": {"name": "run_sql", "arguments": "{\"input\":\"SELECT 1\"}"}}
+        ]}])
+    );
+    // A Chat client's own custom call is replayed as it was written.
+    req.source = Protocol::OpenaiChat;
     assert_eq!(
         encoded_messages(&req),
         json!([{"role": "assistant", "content": "", "tool_calls": [
