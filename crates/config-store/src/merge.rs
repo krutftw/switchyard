@@ -173,12 +173,6 @@ fn tree_of_text(text: &str) -> Option<Map<String, Json>> {
     tree_of(&config).ok()
 }
 
-/// Whether text can serve as the base of a merge: it is TOML and matches the
-/// schema (it need not pass semantic validation).
-pub(crate) fn is_readable(text: &str) -> bool {
-    tree_of_text(text).is_some()
-}
-
 #[derive(Debug)]
 enum MergeError {
     /// The existing text is not a readable configuration.

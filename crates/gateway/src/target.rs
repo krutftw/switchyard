@@ -389,7 +389,10 @@ impl Inner {
     /// The parsed service-account key file at `file` (relative to the
     /// configuration file's directory), read once and remembered until the
     /// configuration changes.
-    async fn service_account(&self, file: &str) -> Result<Arc<ServiceAccount>, UpstreamError> {
+    pub(crate) async fn service_account(
+        &self,
+        file: &str,
+    ) -> Result<Arc<ServiceAccount>, UpstreamError> {
         let path: PathBuf = self.store.resolve_path(file);
         if let Some(account) = self.service_accounts.lock().get(&path) {
             return Ok(Arc::clone(account));

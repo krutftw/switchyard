@@ -220,27 +220,73 @@ fn is_bare(text: &str) -> bool {
 // ---------------------------------------------------------------------------
 
 /// Filters and paging of `GET /logs`. Deserialises straight from a query
-/// string; empty values count as absent and garbage is ignored.
+/// string. The filters combine: a line is returned when it passes all of
+/// them.
+///
+/// # Values that cannot be used
+///
+/// A query never fails. Like the other list queries of this crate
+/// ([`crate::RequestQuery`], [`crate::UsageQuery`]) it reads what it can and
+/// falls back for the rest, so that a dashboard with an odd or outdated
+/// parameter still gets an answer. Each parameter falls back as follows —
+/// this is the documented behaviour of `GET /logs`, not an accident:
+///
+/// | parameter | missing or empty | not usable | out of range |
+/// |---|---|---|---|
+/// | `limit` | [`DEFAULT_LOG_PAGE`] lines | not a whole number: [`DEFAULT_LOG_PAGE`] lines | `0` returns one line; more than the buffer holds returns the whole buffer ([`LogBuffer::capacity`], [`DEFAULT_LOG_CAPACITY`] by default) |
+/// | `level` | every level | not a level name (`trace`, `debug`, `info`, `warn`/`warning`, `error`/`err`/`fatal`, in any case): every level | — |
+/// | `q` | no text filter | — (any text is searched for; surrounding white space is ignored) | — |
+/// | `target` | every target | — (any text is compared; surrounding white space is ignored) | — |
+/// | `before` | the newest lines | not a whole number of 0 or more: the newest lines | `0` and `1` return no line (sequence numbers start at 1); beyond the newest line returns the newest lines |
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct LogQuery {
-    /// Page size; defaults to [`DEFAULT_LOG_PAGE`].
+    /// Page size; defaults to [`DEFAULT_LOG_PAGE`], at least 1 and at most
+    /// the capacity of the buffer.
     #[serde(deserialize_with = "lenient::opt_usize")]
     pub limit: Option<usize>,
-    /// Least severe level to return.
+    /// Least severe level to return. A value that names no level is
+    /// ignored: no level filter.
     #[serde(deserialize_with = "opt_level")]
     pub level: Option<LogLevel>,
     /// Case-insensitive substring searched in the message, the target and
     /// the fields.
     #[serde(deserialize_with = "lenient::opt_string")]
     pub q: Option<String>,
-    /// Cursor: only lines with a smaller `seq`.
+    /// The target (module path) of the lines to return, ignoring case:
+    ///
+    /// * `switchyard_gateway::pipeline` — exactly that target;
+    /// * `switchyard_gateway::` (ends with `::`) — that module and
+    ///   everything below it: the target `switchyard_gateway` itself and
+    ///   every target starting with `switchyard_gateway::`;
+    /// * `switchyard_*` (ends with `*`) — every target starting with what
+    ///   precedes the `*`; a lone `*` matches everything.
+    ///
+    /// Unlike `q`, which also finds a target by substring, this can be
+    /// combined with a search text.
+    #[serde(deserialize_with = "lenient::opt_string")]
+    pub target: Option<String>,
+    /// Cursor: only lines with a smaller `seq`. A value that is not a whole
+    /// number is ignored: the newest lines are returned.
     #[serde(deserialize_with = "lenient::opt_u64")]
     pub before: Option<u64>,
 }
 
 fn opt_level<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<LogLevel>, D::Error> {
     Ok(lenient::opt_string(d)?.and_then(|text| text.parse().ok()))
+}
+
+/// Whether a line's target is selected by the `target` filter (see
+/// [`LogQuery::target`]). `pattern` is trimmed and lower-cased.
+fn target_matches(target: &str, pattern: &str) -> bool {
+    let target = target.to_lowercase();
+    if let Some(prefix) = pattern.strip_suffix('*') {
+        return target.starts_with(prefix.trim_end_matches('*'));
+    }
+    match pattern.strip_suffix("::") {
+        Some(module) => target == module || target.starts_with(pattern),
+        None => target == pattern,
+    }
 }
 
 /// One page of log lines, oldest first (newest last).
@@ -251,6 +297,12 @@ pub struct LogPage {
     /// nothing older that matches.
     pub next_before: Option<u64>,
     pub has_more: bool,
+    /// `seq` of the newest line in the buffer when the page was taken,
+    /// whatever the filters; `0` when the buffer is empty. A client that
+    /// combines a filtered page with the live `log` events knows from it
+    /// where the page ends: every event with a larger `seq` is news, and
+    /// none in between was missed.
+    pub last_seq: u64,
 }
 
 struct Ring {
@@ -372,16 +424,18 @@ impl LogBuffer {
         q: Option<&str>,
         before: Option<u64>,
     ) -> Vec<Arc<LogLine>> {
-        self.select(limit, min_level, q, before).lines
+        self.select(limit, min_level, q, None, before).lines
     }
 
-    /// [`query`](LogBuffer::query) driven by a parsed query string, with the
-    /// cursor for the next older page.
+    /// [`query`](LogBuffer::query) driven by a parsed query string — with
+    /// its `target` filter as well — and with the cursor for the next older
+    /// page and the newest sequence number in the buffer.
     pub fn page(&self, query: &LogQuery) -> LogPage {
         self.select(
             query.limit.unwrap_or(DEFAULT_LOG_PAGE),
             query.level,
             query.q.as_deref(),
+            query.target.as_deref(),
             query.before,
         )
     }
@@ -391,14 +445,19 @@ impl LogBuffer {
         limit: usize,
         min_level: Option<LogLevel>,
         q: Option<&str>,
+        target: Option<&str>,
         before: Option<u64>,
     ) -> LogPage {
-        let needle = q
-            .map(str::trim)
-            .filter(|q| !q.is_empty())
-            .map(str::to_lowercase);
+        let lowered = |text: Option<&str>| {
+            text.map(str::trim)
+                .filter(|text| !text.is_empty())
+                .map(str::to_lowercase)
+        };
+        let needle = lowered(q);
+        let target = lowered(target);
         let ring = self.inner.ring.lock();
         let limit = limit.clamp(1, ring.capacity);
+        let last_seq = ring.lines.back().map_or(0, |line| line.seq);
         let mut lines = Vec::new();
         let mut has_more = false;
         for line in ring.lines.iter().rev() {
@@ -406,6 +465,12 @@ impl LogBuffer {
                 continue;
             }
             if min_level.is_some_and(|min| line.severity() < min) {
+                continue;
+            }
+            if target
+                .as_deref()
+                .is_some_and(|pattern| !target_matches(&line.target, pattern))
+            {
                 continue;
             }
             if needle
@@ -429,6 +494,7 @@ impl LogBuffer {
             lines,
             next_before,
             has_more,
+            last_seq,
         }
     }
 }
@@ -1146,6 +1212,182 @@ mod tests {
         assert_eq!(value["lines"][0]["seq"], 7);
         assert_eq!(value["next_before"], 7);
         assert_eq!(value["has_more"], true);
+        assert_eq!(value["last_seq"], 7);
+    }
+
+    /// Regression: a filtered page said nothing about the newest line in
+    /// the buffer, so a client joining it with live events could not tell
+    /// whether lines were missed in between.
+    #[test]
+    fn a_page_reports_the_newest_sequence_number_whatever_the_filter() {
+        let query =
+            |value: serde_json::Value| -> LogQuery { serde_json::from_value(value).unwrap() };
+        let empty = LogBuffer::new(4);
+        let page = empty.page(&LogQuery::default());
+        assert_eq!((page.lines.len(), page.last_seq), (0, 0));
+
+        let buffer = sample_buffer();
+        for value in [
+            json!({}),
+            json!({"level": "error"}),
+            json!({"q": "nothing like this"}),
+            json!({"target": "hyper::proto"}),
+            json!({"before": 2}),
+            json!({"limit": 1, "before": 1}),
+        ] {
+            assert_eq!(buffer.page(&query(value.clone())).last_seq, 6, "{value}");
+        }
+        // The newest line itself may be filtered out of the page.
+        let errors = buffer.page(&query(json!({"level": "error"})));
+        assert_eq!(errors.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [4]);
+        assert_eq!(errors.last_seq, 6);
+
+        // It follows the ring: evicted lines do not lower it, new ones
+        // raise it, and an emptied buffer reports 0 again.
+        let small = LogBuffer::new(2);
+        for i in 0..5 {
+            small.push(line(T0 + i, "info", "m"));
+        }
+        assert_eq!(small.page(&LogQuery::default()).last_seq, 5);
+        small.clear();
+        assert_eq!(small.page(&LogQuery::default()).last_seq, 0);
+        small.push(line(T0 + 9, "info", "m"));
+        assert_eq!(small.page(&LogQuery::default()).last_seq, 6);
+    }
+
+    /// Regression: `q` finds a target only as a substring among message and
+    /// fields, so "lines of this module that mention X" could not be asked.
+    #[test]
+    fn the_target_filter_is_exact_or_a_prefix_and_combines_with_the_others() {
+        let buffer = LogBuffer::new(100);
+        for (target, level, message) in [
+            ("switchyard_gateway", "info", "configuration applied"),
+            ("switchyard_gateway::pipeline", "warn", "request failed"),
+            ("switchyard_gateway::pipeline", "info", "request finished"),
+            (
+                "switchyard_gateway::pipeline::stream",
+                "debug",
+                "stream closed",
+            ),
+            ("switchyard_gateway_extras", "info", "request finished"),
+            ("switchyard_server::app", "info", "request"),
+            ("hyper::proto", "trace", "request flushed"),
+        ] {
+            buffer.push(LogLine::new(T0, level, target, message));
+        }
+        let query =
+            |value: serde_json::Value| -> LogQuery { serde_json::from_value(value).unwrap() };
+        let targets = |value: serde_json::Value| -> Vec<String> {
+            buffer
+                .page(&query(value))
+                .lines
+                .iter()
+                .map(|line| format!("{} {}", line.target, line.message))
+                .collect()
+        };
+
+        // Exact, whatever the case or padding.
+        assert_eq!(
+            targets(json!({"target": " Switchyard_Gateway::Pipeline "})),
+            [
+                "switchyard_gateway::pipeline request failed",
+                "switchyard_gateway::pipeline request finished"
+            ]
+        );
+        assert_eq!(
+            targets(json!({"target": "switchyard_gateway"})),
+            ["switchyard_gateway configuration applied"]
+        );
+        // `module::` is the module and everything below it — and not a
+        // module whose name merely starts the same.
+        assert_eq!(targets(json!({"target": "switchyard_gateway::"})).len(), 4);
+        assert_eq!(
+            targets(json!({"target": "switchyard_gateway::pipeline::"})).len(),
+            3
+        );
+        // `*` is a plain prefix.
+        assert_eq!(targets(json!({"target": "switchyard_gateway*"})).len(), 5);
+        assert_eq!(targets(json!({"target": "switchyard_*"})).len(), 6);
+        assert_eq!(targets(json!({"target": "*"})).len(), 7);
+        assert_eq!(targets(json!({"target": "nope::"})).len(), 0);
+        // A substring is not a match (that is what `q` is for).
+        assert_eq!(targets(json!({"target": "pipeline"})).len(), 0);
+        assert_eq!(targets(json!({"q": "pipeline"})).len(), 3);
+        // Empty means no target filter.
+        assert_eq!(targets(json!({"target": "  "})).len(), 7);
+
+        // Combined with level, text and paging.
+        assert_eq!(
+            targets(json!({"target": "switchyard_gateway::", "q": "request"})),
+            [
+                "switchyard_gateway::pipeline request failed",
+                "switchyard_gateway::pipeline request finished"
+            ]
+        );
+        assert_eq!(
+            targets(json!({"target": "switchyard_gateway::", "q": "request", "level": "warn"})),
+            ["switchyard_gateway::pipeline request failed"]
+        );
+        let page = buffer.page(&query(
+            json!({"target": "switchyard_gateway::", "limit": 2}),
+        ));
+        assert_eq!(page.lines.iter().map(|l| l.seq).collect::<Vec<_>>(), [3, 4]);
+        assert_eq!(
+            (page.has_more, page.next_before, page.last_seq),
+            (true, Some(3), 7)
+        );
+        let older = buffer.page(&query(
+            json!({"target": "switchyard_gateway::", "limit": 2, "before": 3}),
+        ));
+        assert_eq!(
+            older.lines.iter().map(|l| l.seq).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert!(!older.has_more);
+    }
+
+    /// The fallbacks the rustdoc of [`LogQuery`] promises, one by one.
+    #[test]
+    fn unusable_parameters_fall_back_as_documented() {
+        let buffer = sample_buffer();
+        let query =
+            |value: serde_json::Value| -> LogQuery { serde_json::from_value(value).unwrap() };
+        let seqs = |value: serde_json::Value| -> Vec<u64> {
+            buffer
+                .page(&query(value))
+                .lines
+                .iter()
+                .map(|line| line.seq)
+                .collect()
+        };
+        let all = vec![1, 2, 3, 4, 5, 6];
+        // limit: default page, one line for 0, the whole buffer at most.
+        assert_eq!(seqs(json!({"limit": "many"})), all);
+        assert_eq!(seqs(json!({"limit": "-3"})), all);
+        assert_eq!(seqs(json!({"limit": 0})), [6]);
+        assert_eq!(seqs(json!({"limit": 5000})), all);
+        assert_eq!(
+            LogBuffer::new(DEFAULT_LOG_CAPACITY)
+                .page(&LogQuery::default())
+                .lines
+                .len(),
+            0
+        );
+        // level: an unknown name is no filter.
+        assert_eq!(seqs(json!({"level": "bogus"})), all);
+        assert_eq!(seqs(json!({"level": "WARNING"})), [3, 4]);
+        assert_eq!(seqs(json!({"level": "fatal"})), [4]);
+        // before: not a number is no cursor; 0 and 1 are before everything;
+        // beyond the newest line is the newest page.
+        assert_eq!(seqs(json!({"before": "abc"})), all);
+        assert_eq!(seqs(json!({"before": "-1"})), all);
+        assert_eq!(seqs(json!({"before": 0})), Vec::<u64>::new());
+        assert_eq!(seqs(json!({"before": 1})), Vec::<u64>::new());
+        assert_eq!(seqs(json!({"before": 1_000_000})), all);
+        // q and target: empty is no filter.
+        assert_eq!(seqs(json!({"q": "", "target": ""})), all);
+        // Unknown parameters are ignored.
+        assert_eq!(seqs(json!({"colour": "blue"})), all);
     }
 
     // -- layer --------------------------------------------------------------

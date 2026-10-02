@@ -80,6 +80,46 @@ export function formatCountdown(seconds) {
   return h > 0 ? `${h}:${pad(m)}:${pad(s % 60)}` : `${m}:${pad(s % 60)}`;
 }
 
+/**
+ * Seconds to a countdown in words, in whole seconds, for running text
+ * ("back in 42s"): 42 -> "42s", 1781 -> "29m 41s", 3720 -> "1h 02m",
+ * 90000 -> "1d 1h". Rounds up, so it never reads "0s" while time is left.
+ */
+export function formatCountdownWords(seconds) {
+  if (!isNum(seconds)) return DASH;
+  const s = Math.max(0, Math.ceil(seconds));
+  const pad = (v) => String(v).padStart(2, '0');
+  if (s < 60) return `${s}s`;
+  if (s < 3600) return `${Math.floor(s / 60)}m ${pad(s % 60)}s`;
+  const minutes = Math.ceil(s / 60);
+  if (minutes < 1440) return `${Math.floor(minutes / 60)}h ${pad(minutes % 60)}m`;
+  const hours = Math.ceil(minutes / 60);
+  return `${Math.floor(hours / 24)}d ${hours % 24}h`;
+}
+
+/**
+ * Milliseconds to a duration in words, for hints under settings and for
+ * sentences: 30000 -> "30 seconds", 1800000 -> "30 minutes",
+ * 5400000 -> "1 hour 30 minutes", 86400000 -> "1 day". The two largest units
+ * are named; what is left over makes it "about 1 hour 30 minutes".
+ * (Seconds in hand? formatDurationWords(seconds * 1000).)
+ */
+export function formatDurationWords(ms) {
+  if (!isNum(ms) || ms < 0) return DASH;
+  let rest = Math.round(ms / 1000);
+  if (rest === 0) return ms > 0 ? 'less than a second' : '0 seconds';
+  const parts = [];
+  for (const [name, size] of [['day', 86_400], ['hour', 3600], ['minute', 60], ['second', 1]]) {
+    if (parts.length === 2) break;
+    const n = Math.floor(rest / size);
+    if (n > 0) {
+      parts.push(`${intFmt.format(n)} ${n === 1 ? name : `${name}s`}`);
+      rest -= n * size;
+    }
+  }
+  return `${rest > 0 ? 'about ' : ''}${parts.join(' ')}`;
+}
+
 /** Accepts a Date, epoch milliseconds, epoch seconds or an ISO string. */
 export function toDate(value) {
   if (value == null || value === '') return null;
@@ -114,29 +154,54 @@ export function formatRelativeTime(value, now = Date.now()) {
 
 const pad2 = (v) => String(v).padStart(2, '0');
 
-/** "14:03:27" in local time; with `ms`, "14:03:27.512". */
-export function formatTime(value, { ms = false } = {}) {
+/** "14:03:27" in local time; with `ms`, "14:03:27.512"; with `utc`, the UTC clock. */
+export function formatTime(value, { ms = false, utc = false } = {}) {
   const d = toDate(value);
   if (!d) return DASH;
-  const base = `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
-  return ms ? `${base}.${String(d.getMilliseconds()).padStart(3, '0')}` : base;
+  const base = utc
+    ? `${pad2(d.getUTCHours())}:${pad2(d.getUTCMinutes())}:${pad2(d.getUTCSeconds())}`
+    : `${pad2(d.getHours())}:${pad2(d.getMinutes())}:${pad2(d.getSeconds())}`;
+  return ms ? `${base}.${String(utc ? d.getUTCMilliseconds() : d.getMilliseconds()).padStart(3, '0')}` : base;
 }
 
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 
-/** "2 Oct 2026"; the year is dropped when it is the current one. */
-export function formatDate(value, now = new Date()) {
+/**
+ * "2 Oct 2026"; the year is dropped when it is the current one. With
+ * `{ utc: true }` the date is the UTC one (for buckets cut at UTC midnight).
+ */
+export function formatDate(value, now = new Date(), { utc = false } = {}) {
   const d = toDate(value);
   if (!d) return DASH;
-  const base = `${d.getDate()} ${MONTHS[d.getMonth()]}`;
-  return d.getFullYear() === now.getFullYear() ? base : `${base} ${d.getFullYear()}`;
+  const base = utc ? `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}` : `${d.getDate()} ${MONTHS[d.getMonth()]}`;
+  const year = utc ? d.getUTCFullYear() : d.getFullYear();
+  const thisYear = utc ? now.getUTCFullYear() : now.getFullYear();
+  return year === thisYear ? base : `${base} ${year}`;
 }
 
-/** "2 Oct 14:03:27" (local time). */
-export function formatDateTime(value) {
+/** "2 Oct 14:03:27" (local time, or UTC with `{ utc: true }`). */
+export function formatDateTime(value, { utc = false } = {}) {
   const d = toDate(value);
   if (!d) return DASH;
-  return `${formatDate(d)} ${formatTime(d)}`;
+  return `${formatDate(d, new Date(), { utc })} ${formatTime(d, { utc })}`;
+}
+
+/**
+ * The whole instant, for detail views and title attributes:
+ * "2 Oct 2026 14:03:27.512". The year is always there and so are the
+ * milliseconds. `zone: true` appends the offset of the local time
+ * ("… UTC+02:00"); `utc: true` prints the UTC time and says so ("… UTC").
+ */
+export function formatTimestamp(value, { utc = false, zone = false } = {}) {
+  const d = toDate(value);
+  if (!d) return DASH;
+  const day = utc ? `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]} ${d.getUTCFullYear()}` : `${d.getDate()} ${MONTHS[d.getMonth()]} ${d.getFullYear()}`;
+  const text = `${day} ${formatTime(d, { ms: true, utc })}`;
+  if (utc) return `${text} UTC`;
+  if (!zone) return text;
+  const offset = -d.getTimezoneOffset();
+  const abs = Math.abs(offset);
+  return `${text} UTC${offset < 0 ? '−' : '+'}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
 }
 
 /** 0 -> "0 B", 1536 -> "1.5 KB", 5242880 -> "5 MB". Binary units, decimal labels. */
@@ -192,6 +257,21 @@ export function formatDelta(ratio, decimals = 1) {
   const text = formatPercent(Math.abs(ratio), decimals);
   if (ratio === 0) return text;
   return `${ratio > 0 ? '+' : '−'}${text}`;
+}
+
+/**
+ * A message of the gateway as a sentence. Its messages start in lower case
+ * and come without a full stop ("the request body is not valid JSON"); text
+ * that follows one would run into it. A plain first word is capitalised (not
+ * a path or an identifier: "routing.max_attempts: …" and "rate_limit_rpm
+ * must …" are left as they are) and a full stop is added unless the message
+ * already ends in ., !, ?, : or an ellipsis.
+ */
+export function sentence(message) {
+  const text = String(message ?? '').trim();
+  if (!text) return '';
+  const head = /^[a-z]+(?=[ ,;:]|$)/.test(text) ? text[0].toUpperCase() + text.slice(1) : text;
+  return /[.!?:…]$/.test(head) ? head : `${head}.`;
 }
 
 /** "1 request", "2 requests". Pass the plural when it is irregular. */

@@ -4,6 +4,7 @@
 //   const off = live.on('request.finished', (data, frame) => { ... });
 //   useLive('stats', (data) => setStats(data));       // inside a component
 //   const { status } = useStore(liveState);
+//   useLiveGap(() => list.refresh());                 // frames may be missing
 //
 // The gateway pushes JSON text frames {"type": ..., "data": ...} over
 // GET /admin/api/ws?ticket=... . Browsers cannot set headers on WebSockets,
@@ -12,13 +13,27 @@
 // The client reconnects on its own with exponential backoff, re-subscribes
 // to the topics that have listeners, and reports its state in `liveState` so
 // the top bar can show whether the page is live.
+//
+// A live stream can have holes. While the socket is down nothing arrives,
+// and a connection that falls behind is sent a `lagged` frame ({ missed })
+// in place of the events the gateway dropped for it. Either way a page that
+// builds its view from frames has to load it again: that is what
+// useLiveGap (or live.onGap) is for.
 
 import { useEffect, useRef } from '../../vendor/preact-htm.js';
 import { api, API_BASE, auth, ApiError } from './api.js';
 import { createStore } from './store.js';
 
-/** Frame types the gateway emits (DESIGN.md section 11). */
-export const TOPICS = ['hello', 'request.started', 'request.finished', 'log', 'credential', 'config.reloaded', 'stats'];
+/**
+ * Frame types the gateway emits (crates/admin/src/ws.rs). `lagged` is not
+ * subscribed to: the gateway sends it to every connection that fell behind,
+ * whatever its subscription. Listen with useLive('lagged', ({ missed }) => …)
+ * or, for "reload what I show", with useLiveGap.
+ */
+export const TOPICS = ['hello', 'request.started', 'request.finished', 'log', 'credential', 'config.reloaded', 'stats', 'lagged'];
+
+/** Sent whatever the subscription says; never asked for. */
+const UNSOLICITED = new Set(['lagged']);
 
 const BACKOFF_MS = [500, 1000, 2000, 4000, 8000, 15000];
 /** After this many failed attempts in a row the state reads "offline". */
@@ -46,8 +61,11 @@ export const liveState = createStore({
 });
 
 const listeners = new Map(); // pattern -> Set<fn>
+const gapListeners = new Set();
 let socket = null;
 let wanted = false;
+/** This session has had an open connection before: the next one is a reconnect. */
+let wasOpen = false;
 let attempt = 0;
 let retryTimer = null;
 let generation = 0; // invalidates callbacks from superseded connections
@@ -67,14 +85,25 @@ function matches(pattern, type) {
 
 /** The concrete topics the current listeners need. */
 function wantedTopics() {
-  const patterns = [...listeners.keys()];
+  const patterns = [...listeners.keys()].filter((p) => !UNSOLICITED.has(p));
   if (patterns.length === 0) return [];
-  const topics = TOPICS.filter((topic) => topic === 'hello' || patterns.some((p) => matches(p, topic)));
+  const topics = TOPICS.filter((topic) => !UNSOLICITED.has(topic) && (topic === 'hello' || patterns.some((p) => matches(p, topic))));
   // Unknown exact topics (a newer gateway) are passed through as written.
   for (const p of patterns) {
     if (p !== '*' && !p.endsWith('.*') && !topics.includes(p)) topics.push(p);
   }
   return topics;
+}
+
+/** Tell the gap listeners that frames may be missing. */
+function announceGap(gap) {
+  for (const fn of [...gapListeners]) {
+    try {
+      fn(gap);
+    } catch (error) {
+      console.error('live gap listener failed', error);
+    }
+  }
 }
 
 function sendSubscription() {
@@ -99,6 +128,7 @@ function dispatch(frame) {
   const type = frame.type;
   if (typeof type !== 'string') return;
   if (type === 'hello') liveState.set({ hello: frame.data ?? null });
+  if (type === 'lagged') announceGap({ reason: 'lagged', missed: frame.data?.missed ?? null });
   for (const [pattern, fns] of listeners) {
     if (!matches(pattern, type)) continue;
     for (const fn of [...fns]) {
@@ -162,6 +192,9 @@ async function connect() {
     // that accepts the socket and drops it at once must still back off.
     setStatus('open', { retryAt: null });
     sendSubscription();
+    // Whatever happened while there was no connection was not seen.
+    if (wasOpen) announceGap({ reason: 'reconnect', missed: null });
+    wasOpen = true;
   };
   ws.onmessage = (event) => {
     if (mine !== generation || typeof event.data !== 'string') return;
@@ -196,6 +229,7 @@ function start() {
 
 function stop() {
   wanted = false;
+  wasOpen = false;
   generation += 1;
   clearTimeout(retryTimer);
   retryTimer = null;
@@ -239,7 +273,21 @@ function on(topic, fn) {
   };
 }
 
-export const live = { start, stop, on, reconnectNow };
+/**
+ * Listen for holes in the stream. `fn({ reason, missed })` is called when
+ * frames may have been missed:
+ *   reason "reconnect"  the connection is open again after being down
+ *                       (not on the first connection of a session)
+ *   reason "lagged"     the gateway dropped `missed` events for this
+ *                       connection because it fell behind
+ * Returns an unsubscribe function.
+ */
+function onGap(fn) {
+  gapListeners.add(fn);
+  return () => gapListeners.delete(fn);
+}
+
+export const live = { start, stop, on, onGap, reconnectNow };
 
 if (typeof window !== 'undefined') {
   window.addEventListener('online', reconnectNow);
@@ -265,4 +313,24 @@ export function useLive(topic, handler, { enabled = true } = {}) {
     if (!enabled) return undefined;
     return on(topic, (data, frame) => ref.current(data, frame));
   }, [topic, enabled]);
+}
+
+/**
+ * Call `handler({ reason, missed })` when live frames may have been missed:
+ * after a reconnect, and when the gateway says this connection lagged. A
+ * page that keeps a list up to date from frames refetches here:
+ *
+ *   const requests = useResource('/requests');
+ *   useLive('request.finished', prepend);
+ *   useLiveGap(requests.refresh);
+ *
+ * The handler may change between renders. `enabled: false` pauses it.
+ */
+export function useLiveGap(handler, { enabled = true } = {}) {
+  const ref = useRef(handler);
+  ref.current = handler;
+  useEffect(() => {
+    if (!enabled) return undefined;
+    return onGap((gap) => ref.current(gap));
+  }, [enabled]);
 }

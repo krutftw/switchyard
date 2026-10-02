@@ -826,6 +826,9 @@ async fn vertex_harness() -> Harness {
         "token_uri": format!("{}/token", harness.fake.base()),
     });
     std::fs::write(harness.dir.path().join("sa.json"), key_file.to_string()).unwrap();
+    // The gateway looked for the file when it applied the configuration,
+    // found none and set the credential aside; have it look again.
+    harness.reload().await;
     harness
 }
 
@@ -906,39 +909,28 @@ async fn vertex_claude_models_are_spoken_to_in_anthropic_messages() {
     );
 }
 
+/// The file is looked for when the configuration is applied: a credential
+/// whose file cannot be read is set aside with the reason, instead of
+/// looking ready until the first request fails on it. (The marks
+/// themselves are tested in `integration_pass.rs`.)
 #[tokio::test]
-async fn an_unreadable_service_account_file_fails_the_attempt_not_the_gateway() {
+async fn an_unreadable_service_account_file_sets_the_credential_aside_not_the_gateway() {
     // No sa.json is written.
     let harness = Harness::start(VERTEX).await;
-    let output = harness.ask(Protocol::Gemini, "gemini-vx", false).await;
-    assert_eq!(output.status, 502);
-    assert!(
-        output.json()["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("rejected the gateway's credential")
-            || output.json()["error"]["message"]
-                .as_str()
-                .unwrap()
-                .contains("credential"),
-        "{:?}",
-        output.body
-    );
-    let record = harness.record(&output.request_id);
-    assert_eq!(record.attempts.len(), 1);
-    assert!(
-        record.attempts[0]
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("sa.json"),
-        "{:?}",
-        record.attempts[0]
-    );
-    // The absolute path is not disclosed.
-    assert!(!record.attempts[0].error.as_deref().unwrap().contains(":\\"));
     let credential = &harness.gateway.scheduler().snapshot()[0].credentials[0];
-    assert_eq!(credential.cooldown_reason, Some(FailureClass::Auth));
+    assert!(!credential.usable, "{credential:?}");
+    let reason = credential.unusable_reason.as_deref().unwrap_or_default();
+    assert!(reason.contains("sa.json"), "{reason}");
+    // The absolute path is not disclosed.
+    assert!(!reason.contains(":\\") && !reason.contains('/'), "{reason}");
+
+    let output = harness.ask(Protocol::Gemini, "gemini-vx", false).await;
+    assert_eq!(output.status, 503, "{:?}", output.body);
+    let record = harness.record(&output.request_id);
+    assert!(record.attempts.is_empty(), "{:?}", record.attempts);
+    // Nothing is held against the credential: it was never tried.
+    let credential = &harness.gateway.scheduler().snapshot()[0].credentials[0];
+    assert_eq!(credential.cooldown_reason, None);
     assert_eq!(harness.fake.count(), 0);
 }
 
@@ -955,7 +947,6 @@ name = "oai"
 kind = "openai"
 base_url = "{base}/v1"
 api_keys = ["key-ws-a", "key-ws-b"]
-websocket = true
 [[providers.models]]
 id = "gpt-realtime-up"
 alias = "realtime"

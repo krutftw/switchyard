@@ -40,6 +40,22 @@ pub(crate) struct AdminState {
 
 pub(crate) type Shared = Arc<AdminState>;
 
+/// The part of the configuration a request body stands for, as a path
+/// prefix: `providers[3]` for a provider entry, `auth.keys[0]` for a client
+/// key, `aliases` for the alias list. Empty: the body is the configuration
+/// itself (the settings patch), or the request has no body.
+///
+/// An edit sets it as soon as it knows the place — which, for an entry of a
+/// list, is only known inside the store's lock.
+#[derive(Debug, Default)]
+pub(crate) struct Scope(String);
+
+impl Scope {
+    pub fn set(&mut self, prefix: impl Into<String>) {
+        self.0 = prefix.into();
+    }
+}
+
 /// The admin settings in effect for one request: the live configuration
 /// with the environment overrides applied.
 #[derive(Clone, Debug)]
@@ -113,10 +129,30 @@ impl AdminState {
     /// result that does not validate, or that holds a value the file cannot
     /// (see [`writable`]), is a 422 listing the issues; in every such case
     /// nothing changes.
+    ///
+    /// `edit` also says, through its [`Scope`], which part of the
+    /// configuration the request body is — `providers[3]`, `aliases` — so
+    /// that the issues of a 422 name fields by their place in that body,
+    /// whoever found them: the edit itself, [`writable`] or the store's
+    /// validation.
     pub async fn edit_config<T, F>(&self, edit: F) -> Result<(Arc<Config>, T), ApiFailure>
     where
         T: Send,
-        F: FnOnce(&mut Config) -> Result<T, ApiFailure> + Send,
+        F: FnOnce(&mut Config, &mut Scope) -> Result<T, ApiFailure> + Send,
+    {
+        let mut scope = Scope::default();
+        let result = self.edit_config_scoped(edit, &mut scope).await;
+        result.map_err(|failure| failure.relative_to(&scope.0))
+    }
+
+    async fn edit_config_scoped<T, F>(
+        &self,
+        edit: F,
+        scope: &mut Scope,
+    ) -> Result<(Arc<Config>, T), ApiFailure>
+    where
+        T: Send,
+        F: FnOnce(&mut Config, &mut Scope) -> Result<T, ApiFailure> + Send,
     {
         // Subscribed before the edit so its announcement cannot be missed.
         let events = self.gateway.telemetry().subscribe();
@@ -128,10 +164,11 @@ impl AdminState {
             .config_store()
             .update(|config| {
                 let before = config.clone();
-                let outcome = edit(config).and_then(|value| {
+                let outcome = edit(config, scope).and_then(|value| {
                     changed = *config != before;
                     if changed {
                         writable(config)?;
+                        self.stays_reachable(config)?;
                     }
                     Ok(value)
                 });
@@ -165,8 +202,51 @@ impl AdminState {
         }
     }
 
+    /// Refuses a configuration that would switch off the admin interface
+    /// this very request came through: `admin.enabled = false`, or no admin
+    /// secret left (and none from the environment). The request would be
+    /// answered and every one after it would be a 404, with no way back
+    /// from the dashboard — an empty text pasted into the raw editor does
+    /// exactly that. Turning the admin interface off stays possible where it
+    /// cannot happen by accident: in the configuration file itself.
+    fn stays_reachable(&self, config: &Config) -> Result<(), ApiFailure> {
+        let issue = |path: &str, message: &str| {
+            ApiFailure::invalid_config(vec![ConfigIssue {
+                path: path.to_string(),
+                message: message.to_string(),
+            }])
+        };
+        if !config.admin.enabled {
+            return Err(issue(
+                "admin.enabled",
+                "turning this off here would lock the dashboard out; to switch the admin \
+                 interface off, edit the configuration file itself",
+            ));
+        }
+        let from_env = self
+            .options
+            .secret_override
+            .as_deref()
+            .is_some_and(|secret| !secret.trim().is_empty());
+        let from_file = resolve_secret(&config.admin.secret).is_ok_and(|secret| !secret.is_empty());
+        if !from_env && !from_file {
+            return Err(issue(
+                "admin.secret",
+                "is missing: saving this would leave the admin interface without a secret and \
+                 lock the dashboard out; keep an admin secret, or edit the configuration file \
+                 itself to switch the admin interface off",
+            ));
+        }
+        Ok(())
+    }
+
     /// Replaces the whole file (the raw editor) and waits for the gateway.
     pub async fn replace_config_text(&self, text: &str) -> Result<Arc<Config>, ApiFailure> {
+        // A text that does not validate is refused by the store below, with
+        // its issues; only a valid one can be checked for what it would do.
+        if let Ok(config) = switchyard_config_store::validate_text(text) {
+            self.stays_reachable(&config)?;
+        }
         let events = self.gateway.telemetry().subscribe();
         let config = self.gateway.config_store().replace_text(text).await?;
         self.wait_applied(events).await;

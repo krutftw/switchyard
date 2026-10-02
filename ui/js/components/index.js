@@ -8,7 +8,7 @@
 
 export { Icon, LogoMark, ICON_NAMES } from './icons.js';
 export { Button, IconButton, CopyButton, Spinner } from './button.js';
-export { StatusLamp, Badge, Kbd, toneForStatus, TONES } from './status.js';
+export { StatusLamp, Badge, Kbd, toneForStatus, toneWord, TONES } from './status.js';
 export {
   Page,
   Panel,

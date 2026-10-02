@@ -340,8 +340,17 @@ pub fn normalize_depth(depth: Depth, model: ModelThinking<'_>, target: Protocol)
         d => d,
     };
 
-    // 2. Dynamic thinking on a model that needs an explicit value.
-    if depth == Depth::Auto && !caps.dynamic_allowed {
+    // 2. "Let the provider decide". Each vendor spells that differently:
+    //    on OpenAI's APIs it is simply the absence of an effort; on Anthropic
+    //    it is adaptive thinking, which every model that takes effort levels
+    //    has; on Gemini it is the dynamic budget, which the model must allow.
+    //    Only a model with no such mode needs an explicit value instead.
+    let auto_is_native = match target.family() {
+        crate::protocol::Family::Openai => true,
+        crate::protocol::Family::Anthropic => has_levels || caps.dynamic_allowed,
+        crate::protocol::Family::Google => caps.dynamic_allowed,
+    };
+    if depth == Depth::Auto && !auto_is_native {
         depth = if has_levels && !has_range {
             Depth::Level(Effort::Medium)
         } else {
@@ -491,12 +500,52 @@ mod tests {
         let c = caps(0, 0, false, false, &[Minimal, Low, Medium, High]);
         let t = Protocol::OpenaiResponses;
         assert_eq!(fit(Depth::Off, &c, t), Depth::Level(Minimal));
-        assert_eq!(fit(Depth::Auto, &c, t), Depth::Level(Medium));
         assert_eq!(fit(Depth::Budget(64000), &c, t), Depth::Level(High));
         assert_eq!(fit(Depth::Level(Xhigh), &c, t), Depth::Level(High));
         let c = caps(0, 0, false, false, &[Low, High]);
         assert_eq!(fit(Depth::Budget(8192), &c, t), Depth::Level(Low));
-        assert_eq!(fit(Depth::Auto, &c, t), Depth::Level(Low));
+    }
+
+    #[test]
+    fn auto_is_whatever_the_vendor_calls_provider_decides() {
+        // OpenAI: omitting the effort is "auto", whatever the model lists.
+        let levels_only = caps(0, 0, false, false, &[Low, Medium, High]);
+        assert_eq!(
+            fit(Depth::Auto, &levels_only, Protocol::OpenaiResponses),
+            Depth::Auto
+        );
+        assert_eq!(
+            fit(Depth::Auto, &levels_only, Protocol::OpenaiChat),
+            Depth::Auto
+        );
+        // Anthropic: a model that takes effort levels has adaptive thinking.
+        let claude_hybrid = caps(1024, 128_000, true, false, &[Low, Medium, High, Max]);
+        assert_eq!(
+            fit(Depth::Auto, &claude_hybrid, Protocol::Anthropic),
+            Depth::Auto
+        );
+        // …a budget-only Claude does not, and gets the middle of its range.
+        let claude_manual = caps(1024, 128_000, true, false, &[]);
+        assert_eq!(
+            fit(Depth::Auto, &claude_manual, Protocol::Anthropic),
+            Depth::Budget(64512)
+        );
+        // Gemini: only when the model allows the dynamic budget.
+        let gemini_dynamic = caps(128, 32768, false, true, &[Low, High]);
+        assert_eq!(
+            fit(Depth::Auto, &gemini_dynamic, Protocol::Gemini),
+            Depth::Auto
+        );
+        let gemini_fixed = caps(0, 0, false, false, &[Low, High]);
+        assert_eq!(
+            fit(Depth::Auto, &gemini_fixed, Protocol::Gemini),
+            Depth::Level(Low)
+        );
+        let gemini_fixed = caps(0, 0, false, false, &[Minimal, Low, Medium, High]);
+        assert_eq!(
+            fit(Depth::Auto, &gemini_fixed, Protocol::Gemini),
+            Depth::Level(Medium)
+        );
     }
 
     #[test]

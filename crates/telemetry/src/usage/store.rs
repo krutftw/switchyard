@@ -411,10 +411,13 @@ impl<'a> Filter<'a> {
     }
 
     fn matches(&self, r: &RequestRecord) -> bool {
+        // The aggregation name is compared as well: it is `unknown` for a
+        // request without a model, the row the summaries list it under.
         if let Some(model) = self.model
             && !(r.requested_model.eq_ignore_ascii_case(model)
                 || eq_opt(&r.client_model, model)
-                || eq_opt(&r.upstream_model, model))
+                || eq_opt(&r.upstream_model, model)
+                || r.model_name().eq_ignore_ascii_case(model))
         {
             return false;
         }
@@ -669,6 +672,9 @@ impl UsageStore {
     /// requests keep arriving: a page never repeats or skips a record that
     /// is still in memory.
     ///
+    /// Only finished requests are listed (a record is made when a request
+    /// ends), and of those the most recent [`RequestPage::capacity`].
+    ///
     /// The ring holds the most recently *recorded* requests, i.e. the ones
     /// that finished last. A request that ran for a long time is listed at
     /// the position of its start time, which can be below records that were
@@ -688,6 +694,7 @@ impl UsageStore {
                         next_before: None,
                         has_more: false,
                         total: 0,
+                        capacity: state.capacity,
                     };
                 }
             },
@@ -719,6 +726,7 @@ impl UsageStore {
             next_before,
             has_more,
             total,
+            capacity: state.capacity,
         }
     }
 
@@ -918,6 +926,7 @@ impl UsageStore {
             },
             p50_ms: latency.p50,
             p95_ms: latency.p95,
+            latency_samples: latency.samples,
         }
     }
 
@@ -1628,6 +1637,8 @@ mod tests {
         assert_eq!((tick.rpm, tick.tpm), (3, 3 * 174));
         assert!((tick.error_rate_1m - 1.0 / 3.0).abs() < 1e-12);
         assert_eq!((tick.p50_ms, tick.p95_ms), (500, 500));
+        // The percentiles cover the last hour: all four requests.
+        assert_eq!(tick.latency_samples, 4);
         // Half a minute later two of them have slid out.
         let tick = store.stats_tick(base + 31 * SECOND_MS);
         assert_eq!(tick.rpm, 1);
@@ -1635,6 +1646,45 @@ mod tests {
         // After two idle minutes the rates are zero.
         let tick = store.stats_tick(base + 2 * MINUTE_MS);
         assert_eq!((tick.rpm, tick.tpm, tick.error_rate_1m), (0, 0, 0.0));
+        // …while the percentiles still have their samples.
+        assert_eq!((tick.p50_ms, tick.latency_samples), (500, 4));
+    }
+
+    /// Regression: without a sample count a dashboard could not tell "no
+    /// request in the last hour" (percentiles 0) from requests that really
+    /// took 0 ms, and showed "0ms".
+    #[test]
+    fn stats_tick_says_how_many_samples_the_percentiles_have() {
+        let store = UsageStore::in_memory();
+        let fresh = store.stats_tick(T0);
+        assert_eq!(
+            (fresh.p50_ms, fresh.p95_ms, fresh.latency_samples),
+            (0, 0, 0)
+        );
+        let base = T0 + 3 * HOUR_MS;
+        store.record(&simple("a", base - 500, 200));
+        store.record(&simple("b", base - 500, 502));
+        let tick = store.stats_tick(base);
+        assert_eq!(tick.latency_samples, 2);
+        assert_eq!(
+            tick.latency_samples,
+            store.summary(Range::Hour, base).latency.samples
+        );
+        // An hour later nothing is left to measure.
+        let later = store.stats_tick(base + HOUR_MS + MINUTE_MS);
+        assert_eq!(
+            (later.p50_ms, later.p95_ms, later.latency_samples),
+            (0, 0, 0)
+        );
+        let value = serde_json::to_value(tick).unwrap();
+        assert_eq!(value["latency_samples"], json!(2));
+        // Frames written before the field existed still read.
+        let old: StatsTick = serde_json::from_value(json!({
+            "at": 1, "in_flight": 0, "active_streams": 0, "ws_connections": 0,
+            "rpm": 0, "tpm": 0, "error_rate_1m": 0.0, "p50_ms": 7, "p95_ms": 9
+        }))
+        .unwrap();
+        assert_eq!(old.latency_samples, 0);
     }
 
     #[test]
@@ -1913,6 +1963,104 @@ mod tests {
             run(json!({"model": "gpt-5", "status": "error", "key": "laptop"})),
             ["req-00"]
         );
+    }
+
+    /// Regression: the summaries list requests without a model under
+    /// `unknown`, but `model=unknown` selected nothing, so that row of the
+    /// usage page opened an empty list. (`provider=unknown` and
+    /// `key=anonymous` already matched their rows.)
+    #[test]
+    fn the_unknown_model_row_of_the_summary_selects_its_requests() {
+        let store = UsageStore::in_memory();
+        store.record(&simple("with-model", T0, 200));
+        // Refused before a model could be read from the body.
+        let start = RequestStart::new(
+            Protocol::OpenaiChat,
+            "POST /v1/chat/completions",
+            "",
+            T0 + 1_000,
+        )
+        .with_id("no-model");
+        let mut builder = RecordBuilder::new(start);
+        builder.set_error(RecordError::new("invalid_request", "the body is not JSON"));
+        let record = builder.finish(400, T0 + 1_001);
+        assert_eq!(record.requested_model, "");
+        assert_eq!(record.model_name(), crate::UNKNOWN);
+        store.record(&record);
+
+        let by_model = store.summary(Range::Hour, T0 + 2_000).by_model;
+        let names: Vec<&str> = by_model.iter().map(|g| g.name.as_str()).collect();
+        assert!(names.contains(&"unknown"), "{names:?}");
+
+        let run = |value: serde_json::Value| {
+            let page = store.requests(&query(value));
+            page.items
+                .iter()
+                .map(|r| r.id.clone())
+                .collect::<Vec<String>>()
+        };
+        assert_eq!(run(json!({"model": "unknown"})), ["no-model"]);
+        assert_eq!(run(json!({"model": "UNKNOWN"})), ["no-model"]);
+        assert_eq!(
+            run(json!({"model": "unknown", "provider": "unknown", "key": "anonymous"})),
+            ["no-model"]
+        );
+        assert_eq!(run(json!({"model": "gpt-5"})), ["with-model"]);
+        assert_eq!(run(json!({"model": "unknown", "status": "ok"})).len(), 0);
+
+        // A model that is really called "unknown" is selected by its name
+        // as any other model is.
+        let mut named = Spec {
+            id: "named-unknown".to_string(),
+            model: "unknown",
+            provider: Some("openai"),
+            key: None,
+            started_at: T0 + 2_000,
+            duration_ms: 10,
+            status: 200,
+        }
+        .build();
+        named.client_model = None;
+        store.record(&named);
+        assert_eq!(
+            run(json!({"model": "unknown"})),
+            ["named-unknown", "no-model"]
+        );
+    }
+
+    /// Regression: the list holds the newest N finished requests and
+    /// `total` stops there, but nothing in the answer said what N is.
+    #[test]
+    fn the_page_says_how_many_requests_the_list_can_hold() {
+        let store = UsageStore::new(UsageStoreOptions {
+            recent_capacity: 4,
+            ..UsageStoreOptions::default()
+        });
+        let empty = store.requests(&RequestQuery::default());
+        assert_eq!((empty.total, empty.capacity), (0, 4));
+        for i in 0..9 {
+            store.record(&simple(&format!("r{i}"), T0 + i * 1_000, 200));
+        }
+        let page = store.requests(&RequestQuery::default());
+        assert_eq!((page.total, page.capacity), (4, 4));
+        // Whatever the filter or the cursor, an unusable cursor included.
+        for value in [
+            json!({"model": "nope"}),
+            json!({"limit": 1}),
+            json!({"before": "not-a-cursor"}),
+        ] {
+            assert_eq!(store.requests(&query(value)).capacity, 4);
+        }
+        assert_eq!(serde_json::to_value(&page).unwrap()["capacity"], json!(4));
+        assert_eq!(
+            UsageStore::in_memory()
+                .requests(&RequestQuery::default())
+                .capacity,
+            DEFAULT_RECENT_CAPACITY
+        );
+        // Clearing the statistics does not change what the list can hold.
+        store.clear();
+        assert_eq!(store.requests(&RequestQuery::default()).capacity, 4);
     }
 
     #[test]

@@ -3,14 +3,62 @@
 // without a browser. Used by dom.mjs.
 //
 // What it has: a node tree, attributes, events with capture and bubbling,
-// focus, a small selector matcher, and fixed layout numbers. What it does not
-// have: CSS, real layout, painting. Anything about how a component looks
+// focus (which falls to <body> when the focused element leaves the
+// document), a small selector matcher (no spaces inside attribute values),
+// a MutationObserver that reports child-list changes, and made-up sizes:
+// 10x10 for an element in the document, 0 for one that is not, and whatever
+// a test assigns. What it does not have: CSS, real layout, painting,
+// ResizeObserver, the Navigation API. Anything about how a component looks
 // still has to be checked in a browser.
 //
 // installDom() puts document, window and friends on globalThis and returns
 // helpers. Import the modules under test BEFORE calling it: they are written
 // to load without a document, and this keeps their import-time side effects
 // (theme, live connection) out of the tests.
+
+// ---- MutationObserver: child-list changes only, reported in a microtask ----
+
+const observers = new Set();
+
+/** A child was added to or removed from `parent`: tell whoever watches it. */
+function mutated(parent) {
+  for (const observer of observers) if (observer.sees(parent)) observer.schedule();
+}
+
+class MutationObserver {
+  constructor(callback) {
+    this.callback = callback;
+    this.target = null;
+    this.subtree = false;
+    this.pending = false;
+  }
+
+  observe(target, options = {}) {
+    this.target = target;
+    this.subtree = options.subtree === true;
+    observers.add(this);
+  }
+
+  disconnect() {
+    observers.delete(this);
+    this.pending = false;
+  }
+
+  sees(parent) {
+    return this.subtree ? this.target.contains(parent) : parent === this.target;
+  }
+
+  schedule() {
+    if (this.pending) return;
+    this.pending = true;
+    queueMicrotask(() => {
+      if (!this.pending) return;
+      this.pending = false;
+      // The records are not modelled: callers here only look at the document.
+      this.callback([], this);
+    });
+  }
+}
 
 class Node {
   constructor(nodeType) {
@@ -40,6 +88,7 @@ class Node {
     if (at === -1) this.childNodes.push(node);
     else this.childNodes.splice(at, 0, node);
     node.parentNode = this;
+    mutated(this);
     return node;
   }
 
@@ -48,6 +97,12 @@ class Node {
     if (at === -1) throw new Error('removeChild: not a child');
     this.childNodes.splice(at, 1);
     node.parentNode = null;
+    // As in a browser: the focus does not stay on something that has left
+    // the document, it falls to <body> without a blur event.
+    const document = this.nodeType === 9 ? this : this.ownerDocument;
+    const active = document?.activeElement;
+    if (active && active !== document.body && node.contains(active)) document.activeElement = document.body;
+    mutated(this);
     return node;
   }
 
@@ -139,15 +194,18 @@ class Element extends Node {
     this.ownerDocument = document;
     this.attrs = new Map();
     this.style = { cssText: '', setProperty(name, value) { this[name] = value; } };
-    // Layout does not exist here; every element is "visible" and 10x10.
-    this.offsetWidth = 10;
-    this.offsetHeight = 10;
-    this.clientWidth = 10;
-    this.clientHeight = 10;
-    this.scrollHeight = 10;
+    // Layout does not exist here: see the size properties below.
+    this.scrollLeft = 0;
+    this.scrollTop = 0;
     // Form controls carry their value as a property, as in a browser.
     if (VALUE_TAGS.has(localName)) this.value = '';
     if (localName === 'input') this.checked = false;
+  }
+
+  /** In the document? An element still being built, or one taken out, is not. */
+  get isConnected() {
+    for (let node = this; node; node = node.parentNode) if (node === this.ownerDocument) return true;
+    return false;
   }
 
   get id() {
@@ -189,6 +247,18 @@ class Element extends Node {
 
   hasAttribute(name) {
     return this.attrs.has(name);
+  }
+
+  toggleAttribute(name, force) {
+    const on = force === undefined ? !this.attrs.has(name) : !!force;
+    if (on) this.attrs.set(name, '');
+    else this.attrs.delete(name);
+    return on;
+  }
+
+  closest(selector) {
+    for (let node = this; node && node.nodeType === 1; node = node.parentNode) if (matchesSelector(node, selector)) return node;
+    return null;
   }
 
   get children() {
@@ -255,6 +325,23 @@ class Element extends Node {
     if (this.hasAttribute('disabled')) return;
     dispatch(this, 'click', { detail: 1 });
   }
+}
+
+// Sizes. There is no layout: an element in the document is "visible" and
+// 10x10, and one that is not (still being built, or removed) measures 0, as
+// in a browser. A test that needs other numbers assigns them: el.clientWidth
+// = 300, el.scrollWidth = 900.
+for (const name of ['offsetWidth', 'offsetHeight', 'clientWidth', 'clientHeight', 'scrollWidth', 'scrollHeight']) {
+  const slot = `_${name}`;
+  Object.defineProperty(Element.prototype, name, {
+    configurable: true,
+    get() {
+      return this[slot] ?? (this.isConnected ? 10 : 0);
+    },
+    set(value) {
+      this[slot] = value;
+    },
+  });
 }
 
 // Preact decides between "click" and "Click" by asking whether "onclick" is
@@ -386,12 +473,14 @@ export function installDom() {
     innerHeight: 800,
     isSecureContext: false,
     scrollTo() {},
+    getSelection: () => '',
   });
   const define = (name, value) => Object.defineProperty(globalThis, name, { value, configurable: true, writable: true });
   define('document', document);
   define('window', window);
   define('matchMedia', () => ({ matches: false, addEventListener() {}, removeEventListener() {} }));
   define('getComputedStyle', () => ({ lineHeight: '20px' }));
+  define('MutationObserver', MutationObserver);
   define('localStorage', memoryStorage());
   define('sessionStorage', memoryStorage());
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));

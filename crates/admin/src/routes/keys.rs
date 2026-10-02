@@ -4,7 +4,7 @@ use super::{JsonBody, PathParam};
 use crate::Shared;
 use crate::error::{ApiFailure, ApiResult, json_with_status, ok_json};
 use crate::state::blocking;
-use crate::views::{key_id, key_view};
+use crate::views::{clean_models, key_id, key_view};
 use axum::extract::State;
 use http::StatusCode;
 use rand::distr::{Alphanumeric, SampleString};
@@ -87,15 +87,6 @@ fn clean_name(name: &str) -> Result<String, ApiFailure> {
     Ok(name.to_string())
 }
 
-/// Model patterns as the configuration keeps them: trimmed, blanks dropped.
-fn clean_models(models: Vec<String>) -> Vec<String> {
-    models
-        .into_iter()
-        .map(|pattern| pattern.trim().to_string())
-        .filter(|pattern| !pattern.is_empty())
-        .collect()
-}
-
 /// 409 when another key (any but `except`) already goes by `name`. The
 /// usage statistics (`/usage/summary`, `/usage/timeseries`) and the request
 /// list label requests with the key's name, so names have to tell the keys
@@ -110,11 +101,63 @@ fn check_name_free(
         .enumerate()
         .any(|(index, key)| Some(index) != except && key.name.trim().eq_ignore_ascii_case(name));
     if taken {
-        return Err(ApiFailure::conflict(format!(
-            "a client key named `{name}` already exists"
-        )));
+        return Err(ApiFailure::conflict_on(
+            "name",
+            "is the name of another client key",
+            format!("a client key named `{name}` already exists"),
+        ));
     }
     Ok(())
+}
+
+/// A requests-per-minute limit as a request body gives it.
+///
+/// Read through a visitor of its own so that a value of the wrong kind is
+/// answered with the range a limit has ("a whole number from 1 to
+/// 4294967295") rather than the range of the integer type behind it. `0`
+/// is let through: the configuration's own rule refuses it, with a message
+/// that says how "no limit" is written.
+struct RateLimit(u32);
+
+impl<'de> Deserialize<'de> for RateLimit {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Limit;
+
+        impl serde::de::Visitor<'_> for Limit {
+            type Value = RateLimit;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a whole number from 1 to 4294967295")
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<RateLimit, E> {
+                u32::try_from(value)
+                    .map(RateLimit)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Unsigned(value), &self))
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<RateLimit, E> {
+                u32::try_from(value)
+                    .map(RateLimit)
+                    .map_err(|_| E::invalid_value(serde::de::Unexpected::Signed(value), &self))
+            }
+        }
+
+        deserializer.deserialize_u64(Limit)
+    }
+}
+
+/// An optional limit: absent or `null` is none.
+fn rate_limit<'de, D: Deserializer<'de>>(deserializer: D) -> Result<Option<u32>, D::Error> {
+    Ok(Option::<RateLimit>::deserialize(deserializer)?.map(|limit| limit.0))
+}
+
+/// A limit in a patch: absent is `None` (keep), `null` is `Some(None)`
+/// (remove the limit).
+fn rate_limit_patch<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<u32>>, D::Error> {
+    Ok(nullable::<D, RateLimit>(deserializer)?.map(|limit| limit.map(|limit| limit.0)))
 }
 
 #[derive(Deserialize)]
@@ -123,7 +166,7 @@ pub(crate) struct CreateKey {
     name: String,
     #[serde(default)]
     models: Option<Vec<String>>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "rate_limit")]
     rate_limit_rpm: Option<u32>,
     #[serde(default)]
     key: Option<String>,
@@ -153,12 +196,13 @@ pub(crate) async fn create(
         key,
         name,
         enabled: true,
-        models: clean_models(body.models.unwrap_or_default()),
+        models: clean_models(&body.models.unwrap_or_default()),
         rate_limit_rpm: body.rate_limit_rpm,
     };
     let created = entry.clone();
     state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
+            scope.set(format!("auth.keys[{}]", config.auth.keys.len()));
             check_name_free(&config.auth.keys, &entry.name, None)?;
             let resolved = resolve_secret(&entry.key).ok();
             let duplicate = config.auth.keys.iter().any(|existing| {
@@ -166,7 +210,11 @@ pub(crate) async fn create(
                     || (resolved.is_some() && resolve_secret(&existing.key).ok() == resolved)
             });
             if duplicate {
-                return Err(ApiFailure::conflict("this client key already exists"));
+                return Err(ApiFailure::conflict_on(
+                    "key",
+                    "is already a client key",
+                    "this client key already exists",
+                ));
             }
             config.auth.keys.push(entry);
             Ok(())
@@ -202,7 +250,7 @@ pub(crate) struct UpdateKey {
     #[serde(default)]
     models: Option<Vec<String>>,
     /// `null` removes the limit.
-    #[serde(default, deserialize_with = "nullable")]
+    #[serde(default, deserialize_with = "rate_limit_patch")]
     rate_limit_rpm: Option<Option<u32>>,
 }
 
@@ -215,11 +263,12 @@ pub(crate) async fn update(
 ) -> ApiResult {
     let name = body.name.as_deref().map(clean_name).transpose()?;
     let (_, updated) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
             let keys = &mut config.auth.keys;
             let Some(index) = keys.iter().position(|key| key_id(key) == id) else {
                 return Err(unknown_key(&id));
             };
+            scope.set(format!("auth.keys[{index}]"));
             if let Some(name) = name {
                 check_name_free(keys, &name, Some(index))?;
                 keys[index].name = name;
@@ -229,7 +278,7 @@ pub(crate) async fn update(
                 key.enabled = enabled;
             }
             if let Some(models) = body.models {
-                key.models = clean_models(models);
+                key.models = clean_models(&models);
             }
             if let Some(limit) = body.rate_limit_rpm {
                 key.rate_limit_rpm = limit;
@@ -244,7 +293,7 @@ pub(crate) async fn update(
 /// `DELETE /keys/{id}`.
 pub(crate) async fn remove(State(state): State<Shared>, PathParam(id): PathParam) -> ApiResult {
     state
-        .edit_config(move |config| {
+        .edit_config(move |config, _| {
             let keys = &mut config.auth.keys;
             let Some(index) = keys.iter().position(|key| key_id(key) == id) else {
                 return Err(unknown_key(&id));
@@ -294,7 +343,7 @@ mod tests {
         assert!(clean_name(&"x".repeat(MAX_NAME_CHARS + 1)).is_err());
         assert!(clean_name("line\nbreak").is_err());
         assert_eq!(
-            clean_models(vec![" gpt-* ".into(), "".into(), "claude-*".into()]),
+            clean_models(&[" gpt-* ", "", "claude-*", "gpt-*", "  "]),
             ["gpt-*", "claude-*"]
         );
     }
@@ -327,5 +376,45 @@ mod tests {
         let set: UpdateKey = serde_json::from_str(r#"{"rate_limit_rpm": 60}"#).unwrap();
         assert_eq!(set.rate_limit_rpm, Some(Some(60)));
         assert!(serde_json::from_str::<UpdateKey>(r#"{"key": "x"}"#).is_err());
+    }
+
+    #[test]
+    fn a_limit_is_read_with_its_own_range() {
+        let created =
+            |body: &str| serde_json::from_str::<CreateKey>(body).map(|key| key.rate_limit_rpm);
+        assert_eq!(created(r#"{"name": "a"}"#).unwrap(), None);
+        assert_eq!(
+            created(r#"{"name": "a", "rate_limit_rpm": null}"#).unwrap(),
+            None
+        );
+        assert_eq!(
+            created(r#"{"name": "a", "rate_limit_rpm": 4294967295}"#).unwrap(),
+            Some(u32::MAX)
+        );
+        // 0 is read; the configuration's rule refuses it with a message
+        // that says how "no limit" is written.
+        assert_eq!(
+            created(r#"{"name": "a", "rate_limit_rpm": 0}"#).unwrap(),
+            Some(0)
+        );
+        for wrong in ["-5", "4294967296", "1.5", "\"many\"", "true", "[60]"] {
+            let error = created(&format!(r#"{{"name": "a", "rate_limit_rpm": {wrong}}}"#))
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("expected a whole number from 1 to 4294967295"),
+                "{wrong}: {error}"
+            );
+        }
+        let patched = |body: &str| {
+            serde_json::from_str::<UpdateKey>(body)
+                .map(|key| key.rate_limit_rpm)
+                .map_err(|error| error.to_string())
+        };
+        assert!(
+            patched(r#"{"rate_limit_rpm": -1}"#)
+                .unwrap_err()
+                .contains("expected a whole number from 1 to 4294967295")
+        );
     }
 }

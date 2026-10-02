@@ -13,7 +13,7 @@
 //!
 //! Now: every edit is checked for such values before it reaches the store
 //! (`state::writable`) and refused with a 422 whose `issues` name each
-//! field by its place in the configuration, as for every other value the
+//! field by its place in the request body, as for every other value the
 //! configuration cannot hold; nothing changes. Values TOML *can* hold are
 //! written, however odd.
 
@@ -113,9 +113,9 @@ async fn the_refusal_is_a_422_that_names_every_field_by_its_place() {
     assert_eq!(
         paths,
         [
-            "payload.default[0].set.seed",
-            "payload.override[1].set.stop[1]",
-            "payload.override[1].set.reasoning.effort",
+            "default[0].set.seed",
+            "override[1].set.stop[1]",
+            "override[1].set.reasoning.effort",
         ],
         "{body}"
     );
@@ -123,7 +123,7 @@ async fn the_refusal_is_a_422_that_names_every_field_by_its_place() {
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .starts_with("the configuration is not valid: payload.default[0].set.seed: "),
+            .starts_with("the configuration is not valid: default[0].set.seed: "),
         "{body}"
     );
 
@@ -155,6 +155,74 @@ async fn the_refusal_is_a_422_that_names_every_field_by_its_place() {
 
     assert_eq!(app.file(), file, "a refused edit must not touch the file");
     assert_eq!(app.get_ok("/providers").await.as_array().unwrap().len(), 1);
+}
+
+/// What API.md says about whole numbers no 64-bit integer holds, checked
+/// against the running code: JSON has one number type, and a reader takes a
+/// whole number beyond 18446744073709551615 for a floating-point number.
+/// In a free-form value it is stored as one; a setting that takes a whole
+/// number refuses it for its shape. Neither is the 422 of an integer a TOML
+/// file cannot hold, which is for 9223372036854775808 to
+/// 18446744073709551615.
+#[tokio::test]
+async fn a_whole_number_beyond_64_bits_is_a_floating_point_number() {
+    let app = App::start().await;
+    let raw = |method: http::Method, path: &str, body: &'static str| {
+        support::read(
+            app.request(method, path)
+                .header("content-type", "application/json")
+                .body(body),
+        )
+    };
+
+    let (status, body) = raw(
+        http::Method::PUT,
+        "/payload",
+        r#"{"override": [{"models": ["x"], "set": {"seed": 99999999999999999999}}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["override"][0]["set"]["seed"], json!(1e20));
+    assert!(body["override"][0]["set"]["seed"].is_f64(), "{body}");
+    // The file holds a float, and reads back as the same.
+    let (status, body) = app.post("/reload", json!({})).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(
+        app.get_ok("/payload").await["override"][0]["set"]["seed"],
+        json!(1e20)
+    );
+
+    // One step below, the number is still an integer — one TOML cannot
+    // hold: the documented 422.
+    let (status, body) = raw(
+        http::Method::PUT,
+        "/payload",
+        r#"{"override": [{"models": ["x"], "set": {"seed": 18446744073709551615}}]}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["issues"][0]["path"],
+        json!("override[0].set.seed")
+    );
+
+    // A setting that is a whole number does not take a floating-point one.
+    let file = app.file();
+    let (status, body) = raw(
+        http::Method::PATCH,
+        "/settings",
+        r#"{"routing": {"max_wait_secs": 99999999999999999999}}"#,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(
+        body["error"]["issues"][0],
+        json!({
+            "path": "routing.max_wait_secs",
+            "message": "expected a whole number from 0 to 18446744073709551615, got a number"
+        })
+    );
+    assert_eq!(app.file(), file, "a refused edit must not touch the file");
 }
 
 #[tokio::test]

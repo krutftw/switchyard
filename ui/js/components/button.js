@@ -33,10 +33,15 @@ export function Spinner({ size = 'md', label, class: className }) {
  *           danger-quiet: the button that opens such a dialog
  * size      "md" (default) | "sm" | "lg"
  * icon      icon name shown before the label; iconRight after it
- * loading   shows a spinner, blocks clicks, keeps the button's width
+ * loading   shows a spinner, ignores clicks, keeps the button's width. The
+ *           button stays focusable (aria-disabled, not `disabled`): a
+ *           `disabled` button drops the keyboard focus on <body>, and the
+ *           user who pressed Enter on "Save" would be back at the top of the
+ *           page when the save is done.
+ * disabled  really disabled: not focusable, not clickable
  * href      renders a link that looks like a button
  * block     full width
- * Any other prop (type, onClick, disabled, aria-*, title, form) is passed on.
+ * Any other prop (type, onClick, aria-*, title, form) is passed on.
  */
 export function Button({
   variant = 'secondary',
@@ -50,6 +55,7 @@ export function Button({
   type = 'button',
   class: className,
   children,
+  onClick,
   ...rest
 }) {
   const iconSize = size === 'sm' ? 14 : 16;
@@ -69,10 +75,18 @@ export function Button({
     'data-loading': loading ? '' : undefined,
     'aria-busy': loading ? 'true' : undefined,
   };
+  // While loading, a click (a real one, Enter or Space, or the implicit
+  // submit of a form whose default button this is) does nothing.
+  const click = loading
+    ? (event) => {
+        event.preventDefault();
+        event.stopPropagation();
+      }
+    : onClick;
   if (href != null) {
-    return html`<a ...${shared} href=${disabled ? undefined : href} aria-disabled=${disabled ? 'true' : undefined} ...${rest}>${content}</a>`;
+    return html`<a ...${shared} href=${disabled ? undefined : href} aria-disabled=${disabled || loading ? 'true' : undefined} onClick=${click} ...${rest}>${content}</a>`;
   }
-  return html`<button ...${shared} type=${type} disabled=${disabled || loading} ...${rest}>${content}</button>`;
+  return html`<button ...${shared} type=${type} disabled=${disabled} aria-disabled=${loading && !disabled ? 'true' : undefined} onClick=${click} ...${rest}>${content}</button>`;
 }
 
 /**

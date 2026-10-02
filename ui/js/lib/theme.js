@@ -1,6 +1,8 @@
 // Theme: follows the operating system until the user picks one, then stays
-// on the pick (persisted in localStorage). The inline script in index.html
-// applies the same rule before first paint so there is no flash.
+// on the pick (persisted in localStorage). js/theme-boot.js, a blocking
+// script in the <head> of index.html, applies the same rule before first
+// paint so there is no flash; keep the key and the colours below in step
+// with it.
 //
 //   import { theme, setThemePref } from '../lib/theme.js';
 //   const { pref, resolved } = useStore(theme);   // pref: system | light | dark

@@ -237,6 +237,52 @@ async fn the_raw_editor_validates_writes_verbatim_and_applies() {
     );
 }
 
+/// The raw editor replaces everything, and an empty text is a valid
+/// configuration (all defaults) that has no admin secret: saving it would
+/// answer once and then lock the dashboard out. Such a save is refused and
+/// nothing changes.
+#[tokio::test]
+async fn a_raw_text_that_would_lock_the_dashboard_out_is_refused() {
+    let app = App::start().await;
+    let before = app.file();
+
+    for text in [
+        "",
+        "   \n",
+        "[server]\nport = 8317\n",
+        "[admin]\nsecret = \"\"\n",
+    ] {
+        let (status, body) = app.put("/config/raw", json!({"text": text})).await;
+        assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{text:?}: {body}");
+        assert_eq!(body["error"]["issues"][0]["path"], "admin.secret", "{body}");
+        assert_eq!(app.file(), before, "{text:?} must not be written");
+    }
+
+    // A reference to a variable that is not set is no secret either.
+    let (status, body) = app
+        .put(
+            "/config/raw",
+            json!({"text": "[admin]\nsecret = \"env:SWITCHYARD_TEST_NO_SUCH_VARIABLE\"\n"}),
+        )
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["issues"][0]["path"], "admin.secret", "{body}");
+
+    // Switching the interface off outright is refused the same way.
+    let (status, body) = app
+        .patch("/settings", json!({"admin": {"enabled": false}}))
+        .await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(
+        body["error"]["issues"][0]["path"], "admin.enabled",
+        "{body}"
+    );
+
+    // Nothing changed, and the interface still answers.
+    assert_eq!(app.file(), before);
+    assert_eq!(app.get("/status").await.0, StatusCode::OK);
+}
+
 // ---------------------------------------------------------------------------
 // PATCH /settings
 // ---------------------------------------------------------------------------

@@ -3,11 +3,11 @@
 use crate::clock::{Clock, Ms, SystemClock, unix_ms};
 use crate::error::PickError;
 use crate::registry::{CredentialEntry, CredentialTable, ProviderEntry, Registry, SecretResolver};
-use crate::state::{Affinity, CredState, Rotation, RotationKey, State};
+use crate::state::{Affinity, CredState, Rotation, RotationKey, State, scrub};
 use crate::types::{
-    CredentialId, CredentialSnapshot, CredentialStatus, CredentialView, Lease, ModelCooldown,
-    ModelEntry, ModelRoute, Outcome, PickRequest, ProviderSnapshot, Resolved, ResolvedTarget,
-    RouteRef,
+    CredentialId, CredentialSnapshot, CredentialStatus, CredentialView, DisabledBy, Lease,
+    ModelCooldown, ModelEntry, ModelRoute, Outcome, PickRequest, ProviderSnapshot, Resolved,
+    ResolvedTarget, RouteRef,
 };
 use parking_lot::{Mutex, RwLock};
 use std::collections::{HashMap, HashSet};
@@ -87,9 +87,10 @@ impl Scheduler {
 
     /// Replaces the registry with one built from `config`.
     ///
-    /// Runtime state (cooldowns, counters, latency, runtime disable) is kept
-    /// for every credential whose id is unchanged and dropped for credentials
-    /// that no longer exist. An id is a hash of provider name, kind, key and
+    /// Runtime state (cooldowns, counters, latency, runtime disable, the
+    /// mark of [`Scheduler::set_unusable`]) is kept for every credential
+    /// whose id is unchanged and dropped for credentials that no longer
+    /// exist. An id is a hash of provider name, kind, key and
     /// base URL, so editing models, weights, priorities, labels or proxies
     /// keeps the state while changing the key starts afresh.
     ///
@@ -168,31 +169,112 @@ impl Scheduler {
     ///
     /// The list only decides *which* models the provider serves when its
     /// config lists none; its metadata is laid over the catalog's either way.
+    ///
+    /// A list equal to the one already remembered changes nothing and costs
+    /// next to nothing: the model table is not derived again. To hand over
+    /// the lists of several providers, use
+    /// [`Scheduler::set_discovered_many`], which derives it once.
     pub fn set_discovered(&self, provider: &str, models: Vec<ModelInfo>) -> bool {
-        let _serial = self.rebuild.lock();
-        let old = self.registry();
-        if old.provider(provider).is_none() {
-            return false;
-        }
-        let mut lists = old.discovered.clone();
-        if models.is_empty() {
-            lists.remove(provider);
-        } else {
-            lists.insert(provider.to_string(), models);
-        }
-        let new = Registry::assemble(Arc::clone(&old.config), Arc::clone(&old.credentials), lists);
-        // Taken so a concurrent pick sees either the old or the new table,
-        // never a half-applied change.
-        let _state = self.state.lock();
-        *self.registry.write() = Arc::new(new);
-        true
+        self.set_discovered_many(HashMap::from([(provider.to_string(), models)])) == 1
     }
 
-    /// Problems found while building the registry that do not make the
-    /// configuration invalid: credentials with unresolvable secrets, alias
-    /// targets that match no model, alias cycles, shadowed names.
+    /// [`Scheduler::set_discovered`] for several providers at once: every
+    /// entry of `lists` (provider name → model list) replaces the list
+    /// remembered for that provider, an empty list forgets it, and names
+    /// that are not configured are skipped. The model table is derived once
+    /// for all of them, and not at all when nothing changed. Returns how
+    /// many of the names are configured providers.
+    pub fn set_discovered_many(&self, lists: HashMap<String, Vec<ModelInfo>>) -> usize {
+        let _serial = self.rebuild.lock();
+        let old = self.registry();
+        let mut known = 0;
+        let mut merged: Option<HashMap<String, Vec<ModelInfo>>> = None;
+        for (provider, models) in lists {
+            if old.provider(&provider).is_none() {
+                continue;
+            }
+            known += 1;
+            let remembered = old.discovered.get(&provider);
+            let unchanged = match remembered {
+                Some(list) => *list == models,
+                None => models.is_empty(),
+            };
+            if unchanged {
+                continue;
+            }
+            let merged = merged.get_or_insert_with(|| old.discovered.clone());
+            if models.is_empty() {
+                merged.remove(&provider);
+            } else {
+                merged.insert(provider, models);
+            }
+        }
+        if let Some(lists) = merged {
+            let new =
+                Registry::assemble(Arc::clone(&old.config), Arc::clone(&old.credentials), lists);
+            // Taken so a concurrent pick sees either the old or the new
+            // table, never a half-applied change.
+            let _state = self.state.lock();
+            *self.registry.write() = Arc::new(new);
+        }
+        known
+    }
+
+    /// How many models the list remembered for `provider` holds — the one
+    /// handed over with [`Scheduler::set_discovered`] or a rebuild and kept
+    /// since. 0 when none is remembered: nothing was listed yet, the list
+    /// was forgotten, or a rebuild dropped it because the provider's kind or
+    /// base URL changed or `discover` was switched off.
+    pub fn discovered_models(&self, provider: &str) -> usize {
+        self.registry().discovered.get(provider).map_or(0, Vec::len)
+    }
+
+    /// Problems that do not make the configuration invalid. Found while
+    /// building the registry: credentials with unresolvable secrets, alias
+    /// targets that match no model, alias cycles, shadowed names. And found
+    /// at runtime: credentials marked with [`Scheduler::set_unusable`], in
+    /// config order after the others, for as long as the mark stands.
     pub fn warnings(&self) -> Vec<String> {
-        self.registry().warnings.clone()
+        let state = self.state.lock();
+        let registry = self.registry();
+        let mut warnings = registry.warnings.clone();
+        // Most configurations have no such mark: skip the walk.
+        if state
+            .credentials
+            .values()
+            .all(|c| c.runtime_unusable.is_none())
+        {
+            return warnings;
+        }
+        for provider in &registry.providers {
+            // As for unresolvable secrets: nobody expects a switched-off
+            // credential to work.
+            if !provider.config.enabled {
+                continue;
+            }
+            for (position, &index) in provider.credentials.iter().enumerate() {
+                let Some(entry) = registry.credentials.entries.get(index) else {
+                    continue;
+                };
+                let Some(credential) = state.credentials.get(&entry.id) else {
+                    continue;
+                };
+                // A credential the configuration already made unusable was
+                // reported when the registry was built.
+                if entry.disabled || credential.runtime_disabled || entry.unusable.is_some() {
+                    continue;
+                }
+                if let Some(reason) = &credential.runtime_unusable {
+                    warnings.push(format!(
+                        "provider `{}`: credential {} ({}) is unusable: {reason}",
+                        provider.config.name,
+                        position + 1,
+                        entry.view.label
+                    ));
+                }
+            }
+        }
+        warnings
     }
 
     /// The configuration the registry was built from.
@@ -613,36 +695,54 @@ impl Scheduler {
     }
 
     /// The client-facing model table: every alias and every model name, with
-    /// the providers behind it and how many of their credentials could serve
-    /// it right now. Sorted by name. Includes names hidden from listings.
+    /// the providers behind it, the priority tier each competes in and how
+    /// many of their credentials could serve it right now. Sorted by name.
+    /// Includes names hidden from listings, and aliases without a routable
+    /// target (marked [`ModelEntry::ignored`]).
     pub fn models(&self) -> Vec<ModelEntry> {
         let now = self.now_ms();
         let state = self.state.lock();
         let registry = self.registry();
         let strategy = registry.config.routing.strategy;
 
-        let route_view = |route: &RouteRef| -> ModelRoute {
-            let credentials: Vec<&CredentialEntry> = registry
-                .provider(&route.provider)
-                .map(|p| {
-                    p.credentials
-                        .iter()
-                        .filter_map(|&i| registry.credentials.entries.get(i))
-                        .collect()
-                })
-                .unwrap_or_default();
-            let available = credentials
+        let route_view = |route: &RouteRef, target: Option<&str>| -> ModelRoute {
+            let provider = registry.provider(&route.provider);
+            let mut total = 0;
+            let mut available = 0;
+            // Highest priority among the credentials that are available
+            // now, that are selectable at all, and of any kind.
+            let mut tiers: [Option<i32>; 3] = [None; 3];
+            let raise = |tier: &mut Option<i32>, priority: i32| {
+                *tier = Some(tier.map_or(priority, |top| top.max(priority)));
+            };
+            for entry in provider
                 .iter()
-                .filter(|entry| {
-                    let st = state.credentials.get(&entry.id);
-                    selectable(entry, st, strategy)
-                        && st.is_none_or(|s| s.blocked(&route.upstream_model, now).is_none())
-                })
-                .count();
+                .flat_map(|p| p.credentials.iter())
+                .filter_map(|&i| registry.credentials.entries.get(i))
+            {
+                total += 1;
+                raise(&mut tiers[2], entry.priority);
+                let st = state.credentials.get(&entry.id);
+                if !selectable(entry, st, strategy) {
+                    continue;
+                }
+                raise(&mut tiers[1], entry.priority);
+                if st.is_none_or(|s| s.blocked(&route.upstream_model, now).is_none()) {
+                    available += 1;
+                    raise(&mut tiers[0], entry.priority);
+                }
+            }
             ModelRoute {
                 provider: route.provider.clone(),
                 upstream_model: route.upstream_model.clone(),
-                credentials_total: credentials.len(),
+                target: target.map(str::to_string),
+                priority: tiers
+                    .into_iter()
+                    .flatten()
+                    .next()
+                    .or_else(|| provider.map(|p| p.config.priority))
+                    .unwrap_or(0),
+                credentials_total: total,
                 credentials_available: available,
             }
         };
@@ -658,8 +758,13 @@ impl Scheduler {
                 name: model.name.clone(),
                 info: model.info.clone(),
                 hidden: model.hidden,
+                ignored: false,
                 alias_targets: None,
-                routes: model.routes.iter().map(route_view).collect(),
+                routes: model
+                    .routes
+                    .iter()
+                    .map(|route| route_view(route, None))
+                    .collect(),
             });
         }
         for alias in &registry.aliases {
@@ -669,14 +774,23 @@ impl Scheduler {
                 continue;
             }
             let mut routes: Vec<ModelRoute> = Vec::new();
+            // A configured target that is itself an alias may reach one
+            // model at two depths; its routes are listed once. Looked up in
+            // a set: comparing every route with every other one made this
+            // quadratic for a model that many providers serve.
+            let mut listed: HashSet<(usize, &str, &str)> = HashSet::new();
             for target in &alias.targets {
                 let Some(model) = registry.models().get(target.model) else {
                     continue;
                 };
+                let written = alias.raw_targets.get(target.origin).map(String::as_str);
                 for route in &model.routes {
-                    let view = route_view(route);
-                    if !routes.contains(&view) {
-                        routes.push(view);
+                    if listed.insert((
+                        target.origin,
+                        route.provider.as_str(),
+                        route.upstream_model.as_str(),
+                    )) {
+                        routes.push(route_view(route, written));
                     }
                 }
             }
@@ -684,6 +798,7 @@ impl Scheduler {
                 name: alias.name.clone(),
                 info: alias.info.clone(),
                 hidden: alias.hidden,
+                ignored: alias.targets.is_empty(),
                 alias_targets: Some(alias.raw_targets.clone()),
                 routes,
             });
@@ -702,6 +817,15 @@ impl Scheduler {
     /// sorted by name. `id` is the client-facing name.
     pub fn visible_models(&self) -> Vec<ModelInfo> {
         self.registry().visible_models()
+    }
+
+    /// How many client-facing names requests can be routed by: the entries
+    /// of [`Scheduler::models`] that are not [`ModelEntry::ignored`]. Names
+    /// hidden from listings count (they are routable), an alias without any
+    /// routable target does not. This is the number to show next to the
+    /// model table; [`Scheduler::visible_models`] is what clients are told.
+    pub fn models_routable(&self) -> usize {
+        self.registry().routable_names()
     }
 
     /// How long until a request for `model` could be served, when it cannot
@@ -768,6 +892,52 @@ impl Scheduler {
             .entry(id.to_string())
             .or_default()
             .runtime_disabled = disabled;
+        true
+    }
+
+    /// Marks a credential as unusable for a reason only the caller can
+    /// check — a service-account file that is missing or not valid, say —
+    /// or, with `None`, takes the mark off again.
+    ///
+    /// A marked credential is never selected (as if its secret could not be
+    /// resolved): [`Scheduler::pick`] and [`Scheduler::credentials`] skip
+    /// it, snapshots show it with `usable: false`, status `unusable` and
+    /// the reason, and [`Scheduler::warnings`] lists it. The reason is
+    /// shown to operators, so it is stored as one line of at most 200
+    /// characters with anything shaped like a key masked — but say what is
+    /// wrong, not what the secret is. An empty reason still marks the
+    /// credential.
+    ///
+    /// The mark is runtime state: it survives rebuilds while the
+    /// credential's id is unchanged and stays until this is called again.
+    /// A credential the configuration itself makes unusable keeps the
+    /// configuration's reason. Returns false when no such credential
+    /// exists.
+    pub fn set_unusable(&self, credential_id: &str, reason: Option<String>) -> bool {
+        let mut state = self.state.lock();
+        let registry = self.registry();
+        let Some(entry) = registry.credential(credential_id) else {
+            return false;
+        };
+        match reason {
+            Some(reason) => {
+                let reason = scrub(&reason, &entry.view.api_key);
+                state
+                    .credentials
+                    .entry(credential_id.to_string())
+                    .or_default()
+                    .runtime_unusable = Some(if reason.is_empty() {
+                    "marked as unusable".to_string()
+                } else {
+                    reason
+                });
+            }
+            None => {
+                if let Some(credential) = state.credentials.get_mut(credential_id) {
+                    credential.runtime_unusable = None;
+                }
+            }
+        }
         true
     }
 }
@@ -959,7 +1129,10 @@ fn tried_on_other_targets_only(
 
 /// Whether a credential may be selected at all, cooldowns aside.
 fn selectable(entry: &CredentialEntry, state: Option<&CredState>, strategy: Strategy) -> bool {
-    if entry.disabled || entry.unusable.is_some() || state.is_some_and(|s| s.runtime_disabled) {
+    if entry.disabled
+        || entry.unusable.is_some()
+        || state.is_some_and(|s| s.runtime_disabled || s.runtime_unusable.is_some())
+    {
         return false;
     }
     // Weight 0 removes a credential from weighted rotation altogether.
@@ -1048,6 +1221,23 @@ fn credential_snapshot(
 ) -> CredentialSnapshot {
     let runtime_disabled = state.is_some_and(|s| s.runtime_disabled);
     let disabled = entry.disabled || runtime_disabled;
+    // A provider that is switched off takes all of its credentials out of
+    // rotation, whatever their own switches say.
+    let disabled_by = if !provider.config.enabled {
+        Some(DisabledBy::Provider)
+    } else if entry.disabled {
+        Some(DisabledBy::Credential)
+    } else if runtime_disabled {
+        Some(DisabledBy::Runtime)
+    } else {
+        None
+    };
+    // The configuration's own reason comes first: it is the one that stays
+    // when the gateway's check is repeated.
+    let unusable_reason = entry
+        .unusable
+        .clone()
+        .or_else(|| state.and_then(|s| s.runtime_unusable.clone()));
 
     let mut model_cooldowns: Vec<ModelCooldown> = state
         .map(|s| {
@@ -1086,9 +1276,9 @@ fn credential_snapshot(
     };
     let cooling = whole.or_else(all_models);
 
-    let status = if disabled {
+    let status = if disabled_by.is_some() {
         CredentialStatus::Disabled
-    } else if entry.unusable.is_some() {
+    } else if unusable_reason.is_some() {
         CredentialStatus::Unusable
     } else if cooling.is_some() {
         CredentialStatus::Cooling
@@ -1101,8 +1291,9 @@ fn credential_snapshot(
         label: entry.view.label.clone(),
         masked_key: entry.masked_key.clone(),
         disabled,
-        usable: entry.unusable.is_none(),
-        unusable_reason: entry.unusable.clone(),
+        disabled_by,
+        usable: unusable_reason.is_none(),
+        unusable_reason,
         status,
         cooldown_until: cooling.map(|c| c.until),
         cooldown_reason: cooling.map(|c| c.reason),

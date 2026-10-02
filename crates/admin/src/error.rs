@@ -51,6 +51,18 @@ impl ApiFailure {
         }
     }
 
+    /// 400 naming several fields of the request body. The message leads
+    /// with `lead` and quotes the first issues, so it says what is wrong on
+    /// its own.
+    pub fn bad_fields(lead: &str, issues: Vec<ConfigIssue>) -> Self {
+        ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            message: summary(lead, &issues),
+            issues,
+            retry_after_secs: None,
+        }
+    }
+
     pub fn unauthorized(message: impl Into<String>) -> Self {
         ApiFailure::new(StatusCode::UNAUTHORIZED, message)
     }
@@ -65,6 +77,67 @@ impl ApiFailure {
 
     pub fn conflict(message: impl Into<String>) -> Self {
         ApiFailure::new(StatusCode::CONFLICT, message)
+    }
+
+    /// 409 for a value of the request body that is already taken: `message`
+    /// is the sentence, and the one issue names the field (`path`) so a
+    /// form can put `said` next to it without reading the sentence.
+    pub fn conflict_on(
+        path: impl Into<String>,
+        said: impl Into<String>,
+        message: impl Into<String>,
+    ) -> Self {
+        ApiFailure {
+            issues: vec![ConfigIssue {
+                path: path.into(),
+                message: said.into(),
+            }],
+            ..ApiFailure::conflict(message)
+        }
+    }
+
+    /// 409: the edit is fine, but the configuration file on disk holds
+    /// something that is not valid — a manual edit in progress — which
+    /// saving the edit would overwrite. `issues` are the file's, by their
+    /// place in the file.
+    pub fn disk_invalid(issues: Vec<ConfigIssue>) -> Self {
+        ApiFailure {
+            status: StatusCode::CONFLICT,
+            message: summary(
+                "the configuration file on disk is not valid, so the change was not saved \
+                 (the file was left as it is); fix or restore the file, or replace it as a \
+                 whole on the raw tab (PUT /config/raw). What is wrong with the file",
+                &issues,
+            ),
+            issues,
+            retry_after_secs: None,
+        }
+    }
+
+    /// Makes the issue paths of a 422 relative to the part of the
+    /// configuration a request is about: with `scope` `providers[3]`, the
+    /// path `providers[3].headers.X-Team` becomes `headers.X-Team`, the
+    /// field's place in the request body. Issues about anything else keep
+    /// their place in the whole configuration, and failures other than a
+    /// 422 (whose issues, if any, are already about the body, or about the
+    /// file) are returned as they are.
+    pub fn relative_to(mut self, scope: &str) -> Self {
+        if self.status != StatusCode::UNPROCESSABLE_ENTITY || scope.is_empty() {
+            return self;
+        }
+        for issue in &mut self.issues {
+            let Some(rest) = issue.path.strip_prefix(scope) else {
+                continue;
+            };
+            // `providers[3]` is no prefix of `providers[30]`.
+            if rest.is_empty() || rest.starts_with('[') {
+                issue.path = rest.to_string();
+            } else if let Some(rest) = rest.strip_prefix('.') {
+                issue.path = rest.to_string();
+            }
+        }
+        self.message = summary("the configuration is not valid", &self.issues);
+        self
     }
 
     /// 422: the request was understood but the configuration it would
@@ -111,7 +184,12 @@ fn summary(lead: &str, issues: &[ConfigIssue]) -> String {
     let mut text = lead.to_string();
     for (index, issue) in issues.iter().take(SHOWN).enumerate() {
         text.push_str(if index == 0 { ": " } else { "; " });
-        text.push_str(&issue.to_string());
+        // An issue about the request body as a whole has no path.
+        if issue.path.is_empty() {
+            text.push_str(&issue.message);
+        } else {
+            text.push_str(&issue.to_string());
+        }
     }
     if issues.len() > SHOWN {
         text.push_str(&format!(" (and {} more)", issues.len() - SHOWN));
@@ -154,6 +232,10 @@ impl From<ConfigStoreError> for ApiFailure {
             ConfigStoreError::Edit(message) => {
                 ApiFailure::internal(format!("the configuration could not be written: {message}"))
             }
+            // The edit is fine; the file on disk holds a broken manual edit
+            // that it would overwrite. The issues say what is wrong with
+            // the file (fields and rules, never values).
+            ConfigStoreError::DiskInvalid(issues) => ApiFailure::disk_invalid(issues),
         }
     }
 }
@@ -272,6 +354,94 @@ mod tests {
         assert_eq!(invalid.status, StatusCode::UNPROCESSABLE_ENTITY);
         let edit: ApiFailure = ConfigStoreError::Edit("boom".into()).into();
         assert_eq!(edit.status, StatusCode::INTERNAL_SERVER_ERROR);
+
+        // A broken file on disk: a conflict that says what to do about it
+        // and what is wrong with the file.
+        let disk: ApiFailure = ConfigStoreError::DiskInvalid(vec![
+            issue("line 3, column 9", "invalid number"),
+            issue(
+                "providers[1].base_url",
+                "must start with http:// or https://",
+            ),
+        ])
+        .into();
+        assert_eq!(disk.status, StatusCode::CONFLICT);
+        assert_eq!(disk.issues.len(), 2);
+        assert_eq!(disk.issues[0].path, "line 3, column 9");
+        for part in [
+            "on disk is not valid",
+            "was not saved",
+            "fix or restore the file",
+            "PUT /config/raw",
+            "line 3, column 9: invalid number",
+        ] {
+            assert!(disk.message.contains(part), "{part}: {}", disk.message);
+        }
+        // Those are the file's issues: they are never made relative to a
+        // request body.
+        assert_eq!(disk.clone().relative_to("providers[1]"), disk);
+    }
+
+    #[test]
+    fn a_taken_value_names_its_field() {
+        let failure = ApiFailure::conflict_on(
+            "name",
+            "is already used by another provider",
+            "a provider named `mock` already exists",
+        );
+        assert_eq!(
+            failure.body(),
+            json!({"error": {
+                "message": "a provider named `mock` already exists",
+                "issues": [{"path": "name", "message": "is already used by another provider"}],
+            }})
+        );
+        assert_eq!(failure.status, StatusCode::CONFLICT);
+    }
+
+    #[test]
+    fn issue_paths_become_relative_to_the_edited_part() {
+        let failure = ApiFailure::invalid_config(vec![
+            issue("providers[3].headers.X Team", "bad name"),
+            issue("providers[3].credentials[1].api_key", "empty reference"),
+            issue("providers[30].name", "duplicate"),
+            issue("server.port", "must be between 1 and 65535"),
+        ])
+        .relative_to("providers[3]");
+        let paths: Vec<&str> = failure.issues.iter().map(|i| i.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "headers.X Team",
+                "credentials[1].api_key",
+                "providers[30].name",
+                "server.port"
+            ]
+        );
+        assert_eq!(
+            failure.message,
+            "the configuration is not valid: headers.X Team: bad name; \
+             credentials[1].api_key: empty reference; providers[30].name: duplicate (and 1 more)"
+        );
+
+        // A list is the body: its entries are `[i]…`.
+        let aliases = ApiFailure::invalid_config(vec![
+            issue("aliases[0].targets[1]", "must not be empty"),
+            issue("aliases", "too many"),
+        ])
+        .relative_to("aliases");
+        assert_eq!(aliases.issues[0].path, "[0].targets[1]");
+        assert_eq!(aliases.issues[1].path, "");
+        assert_eq!(
+            aliases.message,
+            "the configuration is not valid: [0].targets[1]: must not be empty; too many"
+        );
+
+        // Only a 422 is about the configuration.
+        let bad = ApiFailure::bad_field("providers[3].name", "is required");
+        assert_eq!(bad.clone().relative_to("providers[3]"), bad);
+        let invalid = ApiFailure::invalid_config(vec![issue("a.b", "c")]);
+        assert_eq!(invalid.clone().relative_to(""), invalid);
     }
 
     #[test]

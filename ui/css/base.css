@@ -155,7 +155,9 @@ hr {
   color: var(--text);
 }
 
-/* Focus: one ring everywhere, only for keyboard focus. */
+/* Focus: one ring everywhere, only for keyboard focus. The ring follows the
+   element's own corners (an outline does, in every current browser), so no
+   radius is set here: one would reshape a focused card or pill. */
 :focus {
   outline: none;
 }
@@ -163,7 +165,16 @@ hr {
 :focus-visible {
   outline: 2px solid var(--focus-ring);
   outline-offset: 2px;
-  border-radius: var(--radius-sm);
+}
+
+/* type="search" brings its own clear button in WebKit and Blink. It is
+   hidden: Input draws one in the kit's style on every search field that
+   holds text (components/form.js, `clearable`), and there are never two. */
+input[type="search"]::-webkit-search-cancel-button,
+input[type="search"]::-webkit-search-decoration {
+  -webkit-appearance: none;
+  appearance: none;
+  display: none;
 }
 
 [hidden] {

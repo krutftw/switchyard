@@ -236,15 +236,30 @@ pub struct CredentialSnapshot {
     /// Masked key, the secret reference as written (`env:NAME`) when it
     /// could not be resolved, the service-account file name, or empty.
     pub masked_key: String,
-    /// Switched off in the config or at runtime.
+    /// The credential itself is switched off, in the config or at runtime.
+    /// (A credential of a provider that is switched off keeps `false` here
+    /// unless it is switched off too; its `status` is `disabled` and
+    /// `disabled_by` says `provider`.)
     pub disabled: bool,
+    /// What takes the credential out of rotation, present exactly when
+    /// `status` is `disabled`: `provider` (its provider is switched off),
+    /// `credential` (switched off in the config) or `runtime` (switched off
+    /// with [`crate::Scheduler::set_runtime_disabled`]). When several apply,
+    /// the first of that order is given.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disabled_by: Option<DisabledBy>,
     /// False when the credential cannot be used at all (see
     /// `unusable_reason`).
     pub usable: bool,
+    /// Why not: an unset environment variable or a missing key, found when
+    /// the configuration was read, or the reason the gateway gave with
+    /// [`crate::Scheduler::set_unusable`].
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unusable_reason: Option<String>,
     /// `ready`, `cooling`, `disabled` or `unusable`. `cooling` means the
     /// whole credential is resting, or every model of its provider is.
+    /// `disabled` covers the credentials of a switched-off provider, which
+    /// are therefore never `ready`.
     pub status: CredentialStatus,
     /// End of the cooldown that makes the credential `cooling`, unix ms.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -269,6 +284,38 @@ pub struct CredentialSnapshot {
     pub last_error: Option<LastError>,
     pub weight: u32,
     pub priority: i32,
+}
+
+impl CredentialSnapshot {
+    /// Whether the credential belongs to a provider that is switched off.
+    /// Such a credential is configured but not part of the gateway's
+    /// rotation: counts of credentials (and of ready ones) leave it out.
+    pub fn provider_disabled(&self) -> bool {
+        self.disabled_by == Some(DisabledBy::Provider)
+    }
+}
+
+/// What switched a credential off. See [`CredentialSnapshot::disabled_by`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DisabledBy {
+    /// The provider it belongs to is disabled (`enabled = false`).
+    Provider,
+    /// The credential is disabled in the configuration.
+    Credential,
+    /// The credential was disabled at runtime; the configuration still has
+    /// it enabled.
+    Runtime,
+}
+
+impl DisabledBy {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            DisabledBy::Provider => "provider",
+            DisabledBy::Credential => "credential",
+            DisabledBy::Runtime => "runtime",
+        }
+    }
 }
 
 /// Coarse credential state shown in the dashboard.
@@ -336,9 +383,16 @@ pub struct ModelEntry {
     pub info: ModelInfo,
     /// Hidden from listings by an alias with `hide_targets`; still routable.
     pub hidden: bool,
+    /// An alias none of whose targets is routable. The gateway ignores it:
+    /// the name is unknown to clients, absent from listings and not counted
+    /// as a model ([`crate::Scheduler::models_routable`]). It is in the
+    /// table only so that the mistake can be seen. Always false for models.
+    pub ignored: bool,
     /// For aliases: the targets as configured (`"gpt-5(high)"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias_targets: Option<Vec<String>>,
+    /// For aliases: the routes of every target, in target order (see
+    /// [`ModelRoute::target`]).
     pub routes: Vec<ModelRoute>,
 }
 
@@ -347,6 +401,21 @@ pub struct ModelEntry {
 pub struct ModelRoute {
     pub provider: String,
     pub upstream_model: String,
+    /// For the routes of an alias: the alias target the route belongs to,
+    /// as written in the configuration, with the reasoning suffix it pins
+    /// (`"gpt-5(high)"`). For a target that is itself an alias, the routes
+    /// of what it expands to carry that target. Absent for models.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub target: Option<String>,
+    /// The priority tier this route competes in: the highest effective
+    /// priority (the credential's own, else the provider's) among the
+    /// credentials that could serve the model right now; when none can,
+    /// among those that could be selected at all; when there is none of
+    /// those either, among all of the provider's credentials; and the
+    /// provider's priority when it has no credentials. Of the routes of one
+    /// model (or one alias target) that have a credential available, those
+    /// with the highest priority take the requests.
+    pub priority: i32,
     /// Credentials configured on the provider.
     pub credentials_total: usize,
     /// Of those, the ones that could serve this model right now: enabled,

@@ -62,7 +62,15 @@ async fn the_model_table_lists_routes_and_availability() {
         json!(["mock-echo(high)", "mock-lorem"])
     );
     assert_eq!(alias["hidden"], false);
-    assert_eq!(alias["routes"].as_array().unwrap().len(), 2);
+    assert_eq!(alias["ignored"], false);
+    // One route per configured target, each saying which target it is.
+    let targets: Vec<&str> = alias["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|route| route["target"].as_str().unwrap())
+        .collect();
+    assert_eq!(targets, ["mock-echo(high)", "mock-lorem"]);
     let echo = &models[1];
     assert_eq!(echo["info"]["id"], "mock-echo");
     assert!(echo.get("alias_targets").is_none());
@@ -71,10 +79,12 @@ async fn the_model_table_lists_routes_and_availability() {
         json!([{
             "provider": "mock",
             "upstream_model": "mock-echo",
+            "priority": 0,
             "credentials_total": 1,
             "credentials_available": 1,
         }])
     );
+    assert_eq!(echo["ignored"], false);
 }
 
 #[tokio::test]
@@ -193,11 +203,13 @@ async fn invalid_sections_are_refused_with_issues() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
         issue_paths(&body),
-        [
-            "aliases[0].targets",
-            "aliases[1].name",
-            "aliases[2].targets"
-        ]
+        // By their place in the request body, the list of aliases.
+        ["[0].targets[0]", "[1].name", "[2].targets"]
+    );
+    assert_eq!(
+        body["error"]["message"],
+        "the configuration is not valid: [0].targets[0]: an alias cannot target itself; \
+         [1].name: must not be empty; [2].targets: needs at least one target"
     );
     let (status, body) = app
         .put(
@@ -208,17 +220,13 @@ async fn invalid_sections_are_refused_with_issues() {
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
     assert_eq!(
         issue_paths(&body),
-        [
-            "payload.default[0].models",
-            "payload.default[0].set",
-            "payload.filter[0].remove"
-        ]
+        ["default[0].models", "default[0].set", "filter[0].remove"]
     );
     let (status, body) = app
         .put("/pricing", json!([{"model": "", "input": -1, "output": 2}]))
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(issue_paths(&body), ["pricing[0].model", "pricing[0]"]);
+    assert_eq!(issue_paths(&body), ["[0].model", "[0]"]);
 
     // 400: not the shape at all.
     let (status, body) = app.put("/aliases", json!({"name": "fast"})).await;

@@ -106,6 +106,8 @@ const QUOTA: &str = "quota-exceeded switches have no equivalent";
 const MULTIMEDIA: &str = "multimedia settings have no equivalent";
 const OTHER_FAMILIES: &str = "credentials of provider families Switchyard has no native support \
      for; an OpenAI-compatible endpoint can be added by hand as an openai-compat provider";
+const UPSTREAM_WEBSOCKET: &str = "relaying to an upstream's Responses WebSocket is not supported \
+     (clients can still connect over WebSocket; the upstream is reached over HTTP streaming)";
 const MODEL_OPTIONS: &str = "per-model options without an equivalent";
 const NO_EQUIVALENT: &str = "settings without an equivalent";
 const UNKNOWN: &str = "settings this importer does not know";
@@ -174,6 +176,9 @@ fn explain(path: &str) -> &'static str {
         ) {
             return OTHER_FAMILIES;
         }
+    }
+    if path.contains("[]") && last == "websockets" {
+        return UPSTREAM_WEBSOCKET;
     }
     if has("models")
         && matches!(
@@ -254,6 +259,11 @@ mod tests {
         assert_eq!(
             explain("api-keys.gemini[].keys[].request-retry"),
             PER_CREDENTIAL
+        );
+        assert_eq!(explain("codex-api-key[].websockets"), UPSTREAM_WEBSOCKET);
+        assert_eq!(
+            explain("api-keys.codex[].keys[].websockets"),
+            UPSTREAM_WEBSOCKET
         );
         assert_eq!(explain("api-keys.xai[].keys[].api-key"), OTHER_FAMILIES);
         assert_eq!(

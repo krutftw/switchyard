@@ -28,6 +28,17 @@ const FOCUSABLE = [
   '[contenteditable="true"]',
 ].join(',');
 
+/**
+ * True when focus can be put on `el` from script: a control, a link, or
+ * anything with a tabindex (including -1, which keeps it out of the tab
+ * order but lets focus() land on it).
+ */
+export function isFocusable(el) {
+  if (!el || el.nodeType !== 1 || typeof el.matches !== 'function') return false;
+  if (el.hasAttribute('inert')) return false;
+  return el.hasAttribute('tabindex') || el.matches(FOCUSABLE);
+}
+
 /** Visible, focusable descendants in tab order. */
 export function focusableWithin(root) {
   if (!root) return [];
@@ -51,22 +62,53 @@ export function isEditable(target) {
 // Overlay stack: Escape and outside clicks act on the topmost overlay only.
 // ---------------------------------------------------------------------------
 
-const overlayStack = [];
+const overlayStack = []; // { id, element(), dismissable() }, the topmost last
 
-export function pushOverlay(id) {
-  overlayStack.push(id);
+/**
+ * Put a modal layer on the stack. Returns the function that takes it off.
+ *
+ * @param {string} id
+ * @param {{ element?: () => Element | null, dismissable?: () => boolean }} [about]
+ *   element      the layer's root, so others can tell whether an event came
+ *                from inside it (useHotkey does)
+ *   dismissable  false while the layer may not be closed or covered (a save
+ *                in flight, a secret shown once)
+ */
+export function pushOverlay(id, { element, dismissable } = {}) {
+  const entry = { id, element: element ?? (() => null), dismissable: dismissable ?? (() => true) };
+  overlayStack.push(entry);
   return () => {
-    const i = overlayStack.lastIndexOf(id);
+    const i = overlayStack.lastIndexOf(entry);
     if (i !== -1) overlayStack.splice(i, 1);
   };
 }
 
 export function isTopOverlay(id) {
-  return overlayStack[overlayStack.length - 1] === id;
+  return overlayStack[overlayStack.length - 1]?.id === id;
 }
 
 export function overlayCount() {
   return overlayStack.length;
+}
+
+/**
+ * The topmost modal layer (drawer, modal, menu, palette) as
+ * { id, element, dismissable }, or null when none is open.
+ */
+export function topOverlay() {
+  const top = overlayStack[overlayStack.length - 1];
+  if (!top) return null;
+  return { id: top.id, element: top.element(), dismissable: top.dismissable() !== false };
+}
+
+/**
+ * True while any open layer is not dismissable, wherever it sits on the
+ * stack: a dialog that must be dealt with first stays in charge when a menu
+ * (a layer of its own, and always dismissable) is open inside it. Ask this,
+ * not topOverlay().dismissable, before opening something over the page.
+ */
+export function overlayLocked() {
+  return overlayStack.some((entry) => entry.dismissable() === false);
 }
 
 // Body scroll lock, reference counted so nested overlays behave.
@@ -151,6 +193,21 @@ export function placeFloating(anchor, size, { side = 'bottom', align = 'start', 
   else origin = `${used === 'right' ? 'left' : 'right'} ${Math.round(oy)}px`;
 
   return { top: Math.round(top), left: Math.round(left), side: used, origin };
+}
+
+/**
+ * True when a scroll event on `scrolled` moves `anchor` on screen: the
+ * document scrolled, or a box that `anchor` is inside did. For floating
+ * layers that close (or would have to be placed again) when their anchor
+ * moves: scrolling somewhere else on the page is none of their business.
+ *
+ * @param {EventTarget} scrolled  event.target of the scroll event
+ * @param {Element | null} anchor
+ */
+export function scrollMoves(scrolled, anchor) {
+  if (!anchor) return false;
+  if (scrolled === document || scrolled === document.documentElement || scrolled === document.body || scrolled === window) return true;
+  return typeof scrolled?.contains === 'function' && scrolled.contains(anchor);
 }
 
 // ---------------------------------------------------------------------------

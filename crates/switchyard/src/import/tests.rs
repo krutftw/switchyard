@@ -143,7 +143,6 @@ fn flat_layout_providers_are_merged_and_named() {
     assert_eq!(openai.wire_api, WireApi::Responses);
     assert_eq!(openai.base_url, "https://api.openai.com/v1");
     assert_eq!(openai.api_keys, ["sk-flat-codex-000000000000000001"]);
-    assert!(openai.websocket);
 
     let vertex = provider(config, "vertex");
     assert_eq!(vertex.kind, ProviderKind::Vertex);
@@ -262,6 +261,8 @@ fn flat_layout_report() {
         "(upstream errors are classified by the gateway): gemini-api-key[].request-scoped-errors",
         "per-credential retry and cooldown overrides",
         "a codex key without base-url",
+        "relaying to an upstream's Responses WebSocket is not supported",
+        "the upstream is reached over HTTP streaming): codex-api-key[].websockets",
         "gemini-api-key[2]: 1 of the headers copy their value from the client request",
         "settings this importer does not know: some-future-setting",
     ] {
@@ -269,6 +270,107 @@ fn flat_layout_report() {
     }
     let notes = imported.notes.join("\n");
     assert!(notes.contains("the model pool `big-pool`"), "{notes}");
+}
+
+/// The upstream Responses WebSocket relay does not exist here: a key that
+/// switches it on is imported like any other and the switch is reported,
+/// in both layouts. A switch that is off says nothing.
+#[test]
+fn upstream_websocket_switch_is_reported_not_imported() {
+    let flat = import(
+        "codex-api-key:\n  - api-key: sk-codex-ws-000000000001\n    base-url: https://api.openai.com/v1\n    websockets: true\n  - api-key: sk-codex-ws-000000000002\n    base-url: https://api.openai.com/v1\n    websockets: false\n",
+    );
+    // The switch no longer splits the keys into two providers.
+    assert_eq!(names(&flat.config), ["openai"]);
+    assert_eq!(
+        provider(&flat.config, "openai").api_keys,
+        ["sk-codex-ws-000000000001", "sk-codex-ws-000000000002"]
+    );
+    let report = flat.not_imported.join("\n");
+    assert!(
+        report.contains("Responses WebSocket is not supported")
+            && report.contains("codex-api-key[].websockets"),
+        "{report}"
+    );
+    assert!(!flat.text.contains("websocket ="), "{}", flat.text);
+
+    let nested = import(
+        "api-keys:\n  codex:\n    - base-url: https://api.openai.com/v1\n      keys:\n        - api-key: sk-codex-ws-000000000003\n          websockets: true\n",
+    );
+    let report = nested.not_imported.join("\n");
+    assert!(
+        report.contains("HTTP streaming): api-keys.codex[].keys[].websockets"),
+        "{report}"
+    );
+
+    let off = import(
+        "codex-api-key:\n  - api-key: sk-codex-ws-000000000004\n    base-url: https://api.openai.com/v1\n    websockets: false\n",
+    );
+    assert!(off.not_imported.is_empty(), "{:?}", off.not_imported);
+}
+
+/// What the configuration refuses is left out and said, never written into
+/// a file that would then not load.
+#[test]
+fn values_the_stricter_validation_refuses_are_left_out_and_reported() {
+    let imported = import(
+        "host: \"a..b\"\n\
+         api-keys: [\"env:\", plain-client-key-0001, \"${}\"]\n\
+         remote-management: {secret-key: \"env:\"}\n\
+         gemini-api-key:\n  - api-key: \"env:\"\n  - api-key: gm-plain-0000000001\n\
+         openai-compatibility:\n  - name: pools\n    base-url: https://pools.example/v1\n    api-key-entries:\n      - api-key: \"${ }\"\n      - api-key: sk-pools-0000000001\n    models:\n      - {name: up-a, alias: \"my pool\"}\n      - {name: up-b, alias: \"my pool\"}\n      - {name: up-c, alias: \"deep(high)\"}\n      - {name: up-d, alias: \"deep(high)\"}\n      - {name: up-e, alias: ok-pool}\n      - {name: up-f, alias: ok-pool}\n      - {name: up-g, thinking: {levels: [low, high], min: 5000, max: 100}}\n",
+    );
+    let config = &imported.config;
+    assert!(config.validate().is_empty());
+    assert_eq!(config.server.host, "127.0.0.1");
+    assert_eq!(client_keys(config), ["plain-client-key-0001"]);
+    assert_eq!(config.admin.secret, "");
+    assert_eq!(provider(config, "gemini").api_keys, ["gm-plain-0000000001"]);
+    let pools = provider(config, "pools");
+    assert_eq!(pools.api_keys, ["sk-pools-0000000001"]);
+    // Only the pool with a usable name became a virtual model; of the
+    // others the first model keeps the name.
+    assert_eq!(
+        config
+            .aliases
+            .iter()
+            .map(|a| a.name.as_str())
+            .collect::<Vec<_>>(),
+        ["ok-pool"]
+    );
+    let models: Vec<(&str, &str)> = pools
+        .models
+        .iter()
+        .map(|m| (m.id.as_str(), m.alias.as_str()))
+        .collect();
+    assert_eq!(
+        models,
+        [
+            ("up-a", "my pool"),
+            ("up-c", "deep(high)"),
+            ("up-e", ""),
+            ("up-f", ""),
+            ("up-g", "")
+        ]
+    );
+    let thinking = pools.models[4].thinking.as_ref().expect("levels kept");
+    assert_eq!(thinking.levels, [Effort::Low, Effort::High]);
+    assert_eq!((thinking.min, thinking.max), (0, 0));
+
+    let report = imported.not_imported.join("\n");
+    for needle in [
+        "host: not an address or a host name",
+        "2 of the client API keys: written as `env:` or `${}` with no name after it",
+        "the management secret-key: written as `env:` or `${}`",
+        "gemini-api-key[0]: the api-key is written as `env:` or `${}`",
+        "provider `pools`: 1 of the keys are written as `env:` or `${}`",
+        "the model pool `my pool` cannot become a virtual model",
+        "the model pool `deep(high)` cannot become a virtual model",
+        "1 of the models have a thinking range whose min is above its max",
+    ] {
+        assert!(report.contains(needle), "missing `{needle}` in:\n{report}");
+    }
+    assert_eq!(&validate_text(&imported.text).unwrap(), config);
 }
 
 #[test]
@@ -336,7 +438,6 @@ fn nested_layout() {
     let openai = provider(config, "openai");
     assert_eq!(openai.wire_api, WireApi::Responses);
     assert_eq!(openai.base_url, "https://codex.example.com/v1");
-    assert!(!openai.websocket);
 
     let groq = provider(config, "groq");
     assert_eq!(groq.kind, ProviderKind::OpenaiCompat);
@@ -1077,6 +1178,16 @@ const ODD_SCALARS: &[&str] = &[
     "{X-A: 010, \"Bad Header\": x}",
     "[{name: m, alias: 0042}, {name: 1.50}, {alias: x}, 7]",
     "{levels: [low, 3, none], min: 0x10, max: 1e3}",
+    // What the configuration's validation refuses.
+    "\"env:\"",
+    "\"${}\"",
+    "a..b",
+    "\"-x\"",
+    "\"x(high)\"",
+    "[\"env:\", \"${ }\", k]",
+    "{levels: [low], min: 1e3, max: 0x10}",
+    "[{name: a, alias: \"p q\"}, {name: b, alias: \"p q\"}, {name: c, alias: \"r(low)\"}, {name: d, alias: \"r(low)\"}, {name: e, thinking: {min: 9, max: 3}}]",
+    "[{api-key: \"env:\"}, {api-key: k2, weight: 3}]",
 ];
 
 /// A mapping of some of `fields`, each with a value from `value`.

@@ -2,14 +2,16 @@
 //! OpenAI-compatible providers.
 
 use super::values::{
-    boolean, clamp_i32, clamp_u32, clamp_u64, dedupe_models, integer, is_http_url,
-    normalize_prefix, sanitize_name, string_list, text, thinking, unique_name,
+    boolean, clamp_i32, clamp_u32, clamp_u64, dedupe_models, integer, is_empty_reference,
+    is_http_url, is_valid_alias_name, normalize_prefix, sanitize_name, string_list, text, thinking,
+    unique_name,
 };
-use super::{Importer, Layer};
+use super::{EMPTY_REFERENCE, Importer, Layer};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
 use switchyard_core::Config;
+use switchyard_core::ThinkingSupport;
 use switchyard_core::config::{
     AliasConfig, CredentialConfig, ModelConfig, ProviderConfig, ProviderKind, WireApi, parse_proxy,
 };
@@ -31,7 +33,7 @@ const MODEL_FIELDS: [&str; 5] = [
 /// inherits the shared fields from its group and the endpoint belongs to
 /// the group alone.
 struct EntrySource<'v> {
-    /// Key-only fields: `api-key`, `weight`, `websockets`.
+    /// Key-only fields: `api-key`, `weight`.
     own: Vec<Layer<'v>>,
     /// Shared fields, most specific first.
     shared: Vec<Layer<'v>>,
@@ -100,7 +102,6 @@ struct FlatEntry {
     headers: IndexMap<String, String>,
     models: Vec<ModelConfig>,
     exclude: Vec<String>,
-    websocket: bool,
 }
 
 impl<'a> Importer<'a> {
@@ -260,10 +261,9 @@ impl<'a> Importer<'a> {
             .trim_end_matches('/')
             .to_string();
         let weight = self.weight(&source.own, location);
-        let websocket = self
-            .field(&source.own, "websockets")
-            .and_then(boolean)
-            .unwrap_or(false);
+        // `websockets` (relay to the upstream's Responses WebSocket) is not
+        // read: Switchyard reaches upstreams over HTTP streaming only, so a
+        // key that switches it on is listed in the "not imported" report.
         let priority = self
             .field(&source.shared, "priority")
             .and_then(integer)
@@ -285,6 +285,11 @@ impl<'a> Importer<'a> {
         if api_key.is_empty() {
             self.not_imported
                 .push(format!("{location}: no api-key; skipped"));
+            return None;
+        }
+        if is_empty_reference(&api_key) {
+            self.not_imported
+                .push(format!("{location}: the api-key is {EMPTY_REFERENCE}"));
             return None;
         }
         if base_url.is_empty() {
@@ -311,7 +316,6 @@ impl<'a> Importer<'a> {
             headers,
             models: dedupe_models(models),
             exclude,
-            websocket: websocket && family == Family::Codex,
         })
     }
 
@@ -413,6 +417,7 @@ impl<'a> Importer<'a> {
         };
         let mut out = Vec::new();
         let mut nameless = 0usize;
+        let mut inverted = 0usize;
         for item in items {
             let Some(item) = item.as_object() else {
                 continue;
@@ -426,6 +431,16 @@ impl<'a> Importer<'a> {
                 }
                 continue;
             }
+            // A budget range that is upside down says nothing usable, and
+            // the configuration refuses it: the levels are kept, the range
+            // is not.
+            let mut support = get("thinking").and_then(thinking);
+            if let Some(range) = support.as_mut().filter(|t| t.max > 0 && t.min > t.max) {
+                range.min = 0;
+                range.max = 0;
+                inverted += 1;
+            }
+            let support = support.filter(|t| *t != ThinkingSupport::default());
             out.push(ModelConfig {
                 alias: if alias == id { String::new() } else { alias },
                 id,
@@ -435,8 +450,14 @@ impl<'a> Importer<'a> {
                     .filter(|length| *length > 0)
                     .map(clamp_u64),
                 max_output_tokens: None,
-                thinking: get("thinking").and_then(thinking),
+                thinking: support,
             });
+        }
+        if inverted > 0 {
+            self.not_imported.push(format!(
+                "{location}: {inverted} of the models have a thinking range whose min is above \
+                 its max; the range was left out"
+            ));
         }
         if nameless > 0 {
             self.not_imported.push(format!(
@@ -467,7 +488,7 @@ impl<'a> Importer<'a> {
             let mut headers: Vec<(&String, &String)> = entry.headers.iter().collect();
             headers.sort();
             // Same endpoint, prefix, headers and proxy, and the same
-            // provider-level policy (models, exclusions, transport).
+            // provider-level policy (models, exclusions).
             let key = serde_json::to_string(&(
                 effective_base,
                 &entry.prefix,
@@ -475,7 +496,6 @@ impl<'a> Importer<'a> {
                 &entry.proxy,
                 &entry.models,
                 &entry.exclude,
-                entry.websocket,
             ))
             .unwrap_or_default();
             if !groups.contains_key(&key) {
@@ -503,7 +523,6 @@ impl<'a> Importer<'a> {
             provider.exclude = first.exclude.clone();
             if family == Family::Codex {
                 provider.wire_api = WireApi::Responses;
-                provider.websocket = first.websocket;
             }
             let mut seen = HashSet::new();
             let mut duplicates = 0usize;
@@ -583,6 +602,7 @@ impl<'a> Importer<'a> {
         let mut credentials: Vec<CredentialConfig> = Vec::new();
         let mut seen = HashSet::new();
         let mut duplicates = 0usize;
+        let mut unnamed = 0usize;
         for list_key in ["keys", "api-key-entries"] {
             for field in ["api-key", "weight", "proxy-url"] {
                 self.consumed
@@ -609,6 +629,10 @@ impl<'a> Importer<'a> {
                 if api_key.is_empty() {
                     continue;
                 }
+                if is_empty_reference(&api_key) {
+                    unnamed += 1;
+                    continue;
+                }
                 if !seen.insert(api_key.clone()) {
                     duplicates += 1;
                     continue;
@@ -627,7 +651,9 @@ impl<'a> Importer<'a> {
         }
         if let Some(old) = self.field(layers, "api-keys") {
             for api_key in string_list(old) {
-                if seen.insert(api_key.clone()) {
+                if is_empty_reference(&api_key) {
+                    unnamed += 1;
+                } else if seen.insert(api_key.clone()) {
                     api_keys.push(api_key);
                 } else {
                     duplicates += 1;
@@ -662,6 +688,12 @@ impl<'a> Importer<'a> {
         provider.api_keys = api_keys;
         provider.credentials = credentials;
         provider.models = self.pool_models(models, &provider, config);
+        if unnamed > 0 {
+            self.not_imported.push(format!(
+                "provider `{}`: {unnamed} of the keys are {EMPTY_REFERENCE}",
+                provider.name
+            ));
+        }
         if duplicates > 0 {
             self.notes.push(format!(
                 "provider `{}`: keys listed more than once were imported once \
@@ -718,7 +750,17 @@ impl<'a> Importer<'a> {
             let self_targeting = members
                 .iter()
                 .any(|model| qualified(&model.id).eq_ignore_ascii_case(&pool_name));
-            if members.len() == 1 || self_targeting {
+            // Nor may its name hold a space or end in a reasoning suffix.
+            let nameable = is_valid_alias_name(&pool_name);
+            if members.len() > 1 && !self_targeting && !nameable {
+                self.not_imported.push(format!(
+                    "provider `{}`: the model pool `{pool_name}` cannot become a virtual model, \
+                     because its name has a space or ends in a reasoning suffix such as (high); \
+                     its first model keeps the name",
+                    provider.name
+                ));
+            }
+            if members.len() == 1 || self_targeting || !nameable {
                 // One model: the first entry of that name.
                 let mut members = members.into_iter();
                 if let Some(model) = members.next() {

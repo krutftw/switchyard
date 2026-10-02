@@ -417,7 +417,7 @@ async fn scenario() -> Recorder {
         AdminOptions {
             secret_override: None,
             allow_remote_override: false,
-            listen: None,
+            ..AdminOptions::default()
         },
     )
     .await;
@@ -617,6 +617,25 @@ async fn scenario() -> Recorder {
         Trim::NONE,
     )
     .await;
+    {
+        // A manual edit in progress: the file does not parse right now.
+        let good = r.app.file();
+        std::fs::write(
+            &r.app.config_path,
+            format!("{good}\n[[providers]]\nname = \n"),
+        )
+        .expect("the configuration file is writable");
+        r.call(
+            "edit_over_broken_file",
+            Method::PATCH,
+            "/settings",
+            Some(json!({"logging": {"level": "info"}})),
+            StatusCode::CONFLICT,
+            Trim::NONE,
+        )
+        .await;
+        std::fs::write(&r.app.config_path, good).expect("the configuration file is writable");
+    }
     r.call(
         "reload",
         Method::POST,
@@ -660,6 +679,15 @@ async fn scenario() -> Recorder {
         "/providers",
         Some(json!({"name": "Another One", "kind": "openai-compat"})),
         StatusCode::UNPROCESSABLE_ENTITY,
+        Trim::NONE,
+    )
+    .await;
+    r.call(
+        "provider_create_shape",
+        Method::POST,
+        "/providers",
+        Some(json!({"name": "third", "kind": "mock", "models": ["mock-echo"]})),
+        StatusCode::BAD_REQUEST,
         Trim::NONE,
     )
     .await;
@@ -877,6 +905,15 @@ async fn scenario() -> Recorder {
         Trim::NONE,
     )
     .await;
+    r.call(
+        "key_create_invalid",
+        Method::POST,
+        "/keys",
+        Some(json!({"name": "nightly", "rate_limit_rpm": 0})),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Trim::NONE,
+    )
+    .await;
     r.get("keys_list", "/keys", Trim::NONE).await;
     r.call(
         "key_patch",
@@ -967,6 +1004,42 @@ async fn scenario() -> Recorder {
             .app
             .get_ok("/usage/timeseries?range=1h&bucket=minute&group_by=model")
             .await;
+        // What the page says about how many points a range has.
+        let count = |series: &Value| series["points"].as_array().map_or(0, Vec::len);
+        assert_eq!(count(&series), 60);
+        for (query, expected) in [
+            ("range=24h", 24..=25),
+            ("range=7d", 168..=168),
+            ("range=30d", 30..=31),
+            ("range=24h&bucket=minute", 1440..=1440),
+            ("range=7d&bucket=day", 7..=8),
+        ] {
+            let series = r.app.get_ok(&format!("/usage/timeseries?{query}")).await;
+            assert!(
+                expected.contains(&count(&series)),
+                "{query}: {} points",
+                count(&series)
+            );
+        }
+        // Day buckets start at a UTC midnight.
+        let month = r.app.get_ok("/usage/timeseries?range=30d").await;
+        assert_eq!(month["bucket"], "day");
+        for point in month["points"].as_array().unwrap() {
+            assert_eq!(point["t"].as_i64().unwrap() % 86_400_000, 0, "{point}");
+        }
+        // The per-minute rates are those of the last 60 seconds whatever
+        // the range; the percentiles of an empty window are 0 with no
+        // samples.
+        let day = r.app.get_ok("/usage/summary?range=24h").await;
+        let longer = r.app.get_ok("/usage/summary?range=30d").await;
+        assert!(day["requests_per_minute"].as_u64().unwrap() > 0, "{day}");
+        assert_eq!(
+            longer["requests_per_minute"], day["requests_per_minute"],
+            "{longer}"
+        );
+        assert_eq!(longer["tokens_per_minute"], day["tokens_per_minute"]);
+        assert!(day["latency"]["samples"].as_u64().unwrap() > 0, "{day}");
+
         let mut shown = series.clone();
         let points = shown["points"].as_array_mut().unwrap();
         let keep = points.len().saturating_sub(2);
@@ -996,6 +1069,46 @@ async fn scenario() -> Recorder {
             .as_array()
             .is_some_and(|items| items.len() == 2)
     );
+    {
+        // What the page says about records and bodies.
+        // A mock model that answers has no upstream response to capture;
+        // one that fails on purpose leaves the error body it made up.
+        let served = page["items"][0]["id"].as_str().unwrap().to_string();
+        let detail = r.app.get_ok(&format!("/requests/{served}")).await;
+        assert!(detail["bodies"]["client_request"].is_string(), "{detail}");
+        assert!(detail["bodies"]["upstream_response"].is_null(), "{detail}");
+        let detail = r.app.get_ok(&format!("/requests/{failed_id}")).await;
+        assert!(
+            detail["bodies"]["upstream_response"].is_string(),
+            "{detail}"
+        );
+        // The model name as written, and as resolved.
+        assert_eq!(r.app.chat(CLIENT_KEY, "mock-echo(high)").await, 200);
+        assert_eq!(r.app.chat(CLIENT_KEY, "no-such-model(high)").await, 404);
+        r.app.gateway.telemetry().flush().await.unwrap();
+        let newest = r.app.get_ok("/requests?limit=2").await;
+        let unknown = &newest["items"][0];
+        assert_eq!(
+            unknown["requested_model"], "no-such-model(high)",
+            "{unknown}"
+        );
+        assert!(unknown["client_model"].is_null(), "{unknown}");
+        assert_eq!(unknown["error"]["kind"], "not_found");
+        let suffixed = &newest["items"][1];
+        assert_eq!(suffixed["requested_model"], "mock-echo(high)", "{suffixed}");
+        assert_eq!(suffixed["client_model"], "mock-echo", "{suffixed}");
+        assert_eq!(newest["capacity"], 2000);
+        // `q` also searches the error's kind (the word is in no message).
+        let by_kind = r.app.get_ok("/requests?q=not_found").await;
+        assert_eq!(by_kind["total"], 2, "{by_kind}");
+        assert!(
+            !unknown["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("not_found"),
+            "{unknown}"
+        );
+    }
     r.get("logs", "/logs?limit=3", Trim::NONE).await;
 
     // --- Live events ----------------------------------------------------------

@@ -19,6 +19,14 @@
 // Every other section (subscription tiers, OAuth-only channels, other
 // vendors) is ignored. Field names are normalised to Switchyard's `ModelInfo`
 // schema, duplicates are merged (first occurrence wins, `kinds` are unioned).
+//
+// One value of the source is overridden: `created` of a model whose id ends
+// in its release date (`-YYYYMMDD` or `-YYYY-MM-DD`). The source has several
+// of those a year early (claude-3-7-sonnet-20250219 as February 2024, and
+// likewise claude-opus-4-20250514, claude-sonnet-4-20250514 and
+// claude-opus-4-1-20250805). When `created` is more than 60 days away from
+// the date in the id, the date in the id (midnight UTC) is written instead;
+// see `createdFor`. The catalog's tests check the same rule.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -70,6 +78,30 @@ function servable(raw) {
   return !Array.isArray(methods) || methods.length === 0 || methods.includes("generateContent");
 }
 
+// Furthest `created` may be from the release date an id ends in.
+const DATE_TOLERANCE_SECS = 60 * 24 * 3600;
+
+// Unix seconds (midnight UTC) of the date a model id ends in, `-YYYYMMDD` or
+// `-YYYY-MM-DD`; undefined when the id does not end in a real date.
+function dateInId(id) {
+  const match = /-(\d{4})-?(\d{2})-?(\d{2})$/.exec(id);
+  if (!match) return undefined;
+  const [year, month, day] = match.slice(1).map(Number);
+  const millis = Date.UTC(year, month - 1, day);
+  const date = new Date(millis);
+  const real =
+    date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day;
+  return real ? millis / 1000 : undefined;
+}
+
+// `created` as the source has it, unless the id names a release date the
+// value is clearly at odds with: then the id's date wins (see the header).
+function createdFor(id, created) {
+  const dated = dateInId(id);
+  if (created === undefined || dated === undefined) return created;
+  return Math.abs(created - dated) > DATE_TOLERANCE_SECS ? dated : created;
+}
+
 function normalise(raw, family) {
   const id = String(raw.id ?? "").trim();
   if (!id) return undefined;
@@ -78,7 +110,7 @@ function normalise(raw, family) {
   if (display) entry.display_name = display;
   const owner = String(raw.owned_by ?? "").trim();
   entry.owned_by = owner || family;
-  const created = positiveInt(raw.created);
+  const created = createdFor(id, positiveInt(raw.created));
   if (created !== undefined) entry.created = created;
   const context = positiveInt(raw.context_length, raw.inputTokenLimit);
   if (context !== undefined) entry.context_window = context;

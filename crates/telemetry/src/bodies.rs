@@ -10,9 +10,9 @@
 use crate::record::{RequestRecord, request_id_time_ms};
 use crate::redact::{redact_body, redact_header_value};
 use crate::time::{DAY_MS, day_index, parse_day, utc_day};
-use parking_lot::RwLock;
+use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -119,18 +119,73 @@ struct Settings {
     max_body_bytes: usize,
 }
 
-#[derive(Debug)]
 struct Inner {
     /// `<data_dir>/requests`; `None` when the gateway has no data dir.
     dir: Option<PathBuf>,
     settings: RwLock<Settings>,
+    /// Bodies accepted for storing whose file is not written yet, by
+    /// request id, as they were handed in (not redacted yet). The record of
+    /// such a request already says `has_bodies`, so [`BodyStore::read`]
+    /// answers from here until the file exists.
+    held: Mutex<HashMap<String, Arc<CapturedBodies>>>,
+}
+
+impl std::fmt::Debug for Inner {
+    // The held bodies are raw: never printed.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BodyStore")
+            .field("dir", &self.dir)
+            .field("settings", &self.settings)
+            .field("held", &self.held.lock().len())
+            .finish()
+    }
+}
+
+/// Bodies on their way to disk (see [`BodyStore::hold`]). While this value
+/// lives, [`BodyStore::read`] serves them from memory; dropping it — after
+/// the file was written, or because the write never ran — ends that.
+pub(crate) struct HeldBodies {
+    store: BodyStore,
+    id: String,
+    bodies: Arc<CapturedBodies>,
+}
+
+impl HeldBodies {
+    /// Writes the held bodies to their file (blocking file I/O). Returns
+    /// whether a file was written.
+    pub(crate) fn write(self, started_at: i64, failed: bool) -> io::Result<bool> {
+        // `self` is dropped when this returns: the file is in place before
+        // the copy in memory goes away, so a reader never finds neither.
+        self.store
+            .write_file(&self.id, started_at, failed, &self.bodies)
+    }
+}
+
+impl Drop for HeldBodies {
+    fn drop(&mut self) {
+        let mut held = self.store.inner.held.lock();
+        // Only this capture's own entry: a later capture under the same id
+        // has replaced it and is released by its own guard.
+        if held
+            .get(&self.id)
+            .is_some_and(|current| Arc::ptr_eq(current, &self.bodies))
+        {
+            held.remove(&self.id);
+        }
+    }
 }
 
 /// Stores and retrieves captured bodies. Cloning is cheap; clones share the
 /// settings.
-#[derive(Clone, Debug)]
+#[derive(Clone)]
 pub struct BodyStore {
     inner: Arc<Inner>,
+}
+
+impl std::fmt::Debug for BodyStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.inner.fmt(f)
+    }
 }
 
 impl BodyStore {
@@ -147,6 +202,7 @@ impl BodyStore {
                     mode,
                     max_body_bytes: max_body_bytes.max(1024),
                 }),
+                held: Mutex::new(HashMap::new()),
             }),
         }
     }
@@ -205,25 +261,29 @@ impl BodyStore {
     /// Redacts and truncates bodies and re-checks the header maps, exactly
     /// as [`capture`](BodyStore::capture) does before writing.
     pub fn prepare(&self, bodies: CapturedBodies) -> CapturedBodies {
+        self.prepared(&bodies)
+    }
+
+    /// [`prepare`](BodyStore::prepare) from a reference.
+    fn prepared(&self, bodies: &CapturedBodies) -> CapturedBodies {
         let max = self.max_body_bytes();
-        let body = |text: Option<String>| text.map(|text| prepare_body(&text, max));
-        let headers = |map: BTreeMap<String, String>| -> BTreeMap<String, String> {
-            map.into_iter()
+        let body = |text: &Option<String>| text.as_deref().map(|text| prepare_body(text, max));
+        let headers = |map: &BTreeMap<String, String>| -> BTreeMap<String, String> {
+            map.iter()
                 .map(|(name, value)| {
                     // Already redacted values pass through unchanged; a raw
                     // secret that slipped in is caught here.
-                    let value = redact_header_value(&name, &value);
-                    (name, value)
+                    (name.clone(), redact_header_value(name, value))
                 })
                 .collect()
         };
         CapturedBodies {
-            client_request: body(bodies.client_request),
-            upstream_request: body(bodies.upstream_request),
-            upstream_response: body(bodies.upstream_response),
-            client_response: body(bodies.client_response),
-            client_headers: headers(bodies.client_headers),
-            upstream_headers: headers(bodies.upstream_headers),
+            client_request: body(&bodies.client_request),
+            upstream_request: body(&bodies.upstream_request),
+            upstream_response: body(&bodies.upstream_response),
+            client_response: body(&bodies.client_response),
+            client_headers: headers(&bodies.client_headers),
+            upstream_headers: headers(&bodies.upstream_headers),
         }
     }
 
@@ -250,6 +310,37 @@ impl BodyStore {
         failed: bool,
         bodies: CapturedBodies,
     ) -> io::Result<bool> {
+        self.write_file(id, started_at, failed, &bodies)
+    }
+
+    /// Takes bodies that are about to be written by another thread and
+    /// makes them readable at once: until the returned guard is dropped,
+    /// [`read`](BodyStore::read) answers for `id` from memory (redacted and
+    /// truncated like the file will be). The caller writes the file with
+    /// [`HeldBodies::write`].
+    ///
+    /// This is what lets a record say `has_bodies` the moment it is
+    /// published although the file is still being written.
+    pub(crate) fn hold(&self, id: &str, bodies: CapturedBodies) -> HeldBodies {
+        let bodies = Arc::new(bodies);
+        self.inner
+            .held
+            .lock()
+            .insert(id.to_string(), Arc::clone(&bodies));
+        HeldBodies {
+            store: self.clone(),
+            id: id.to_string(),
+            bodies,
+        }
+    }
+
+    fn write_file(
+        &self,
+        id: &str,
+        started_at: i64,
+        failed: bool,
+        bodies: &CapturedBodies,
+    ) -> io::Result<bool> {
         let Some(dir) = self.dir() else {
             return Ok(false);
         };
@@ -257,7 +348,7 @@ impl BodyStore {
             return Ok(false);
         }
         let path = Self::path_for(dir, started_at, id);
-        let text = serde_json::to_vec(&self.prepare(bodies)).map_err(io::Error::other)?;
+        let text = serde_json::to_vec(&self.prepared(bodies)).map_err(io::Error::other)?;
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -283,10 +374,22 @@ impl BodyStore {
     ///
     /// A UUIDv7 id says which day to look in; for any other id the day
     /// directories are searched newest first.
+    ///
+    /// Bodies whose file is still being written (see
+    /// [`crate::Telemetry::capture_bodies`]) are answered from memory, in
+    /// the form the file will have: a request whose record says
+    /// `has_bodies` can be read from the moment the record exists.
     pub fn read(&self, id: &str) -> Option<CapturedBodies> {
         let dir = self.dir()?;
         if !is_safe_id(id) {
             return None;
+        }
+        // Looked up before the directory: the write puts the file in place
+        // first and lets go of the copy in memory afterwards, so whichever
+        // is found is complete.
+        let held = self.inner.held.lock().get(id).cloned();
+        if let Some(bodies) = held {
+            return Some(self.prepared(&bodies));
         }
         let name = format!("{id}.json");
         if let Some(minted_at) = request_id_time_ms(id) {
@@ -866,6 +969,60 @@ mod tests {
         // The capture that was in progress completes.
         store.capture_at("late", now, true, bodies()).unwrap();
         assert!(store.read("late").is_some());
+    }
+
+    /// Bodies handed to a background write are readable — redacted — from
+    /// the moment they are held until the file takes over.
+    #[test]
+    fn held_bodies_are_readable_until_the_file_is_written() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = store(tmp.path(), RequestLogMode::All);
+        let raw = CapturedBodies {
+            client_request: Some(format!(r#"{{"api_key":"{KEY}","model":"sonnet"}}"#)),
+            upstream_headers: BTreeMap::from([("x-api-key".to_string(), KEY.to_string())]),
+            ..bodies()
+        };
+        let expected = store.prepare(raw.clone());
+        assert!(!serde_json::to_string(&expected).unwrap().contains(KEY));
+
+        // Held, no file yet: served from memory, in the form of the file.
+        let held = store.hold("r1", raw.clone());
+        assert!(all_files(tmp.path()).is_empty());
+        assert_eq!(store.read("r1"), Some(expected.clone()));
+        assert_eq!(store.read("other"), None);
+        // The raw copy is never printed.
+        let printed = format!("{store:?}");
+        assert!(
+            printed.contains("held: 1") && !printed.contains(KEY),
+            "{printed}"
+        );
+
+        // Written: the file takes over and the copy in memory is let go.
+        assert!(held.write(T0, false).unwrap());
+        assert_eq!(all_files(tmp.path()), ["2026-10-02/r1.json"]);
+        assert!(store.inner.held.lock().is_empty());
+        assert_eq!(store.read("r1"), Some(expected.clone()));
+
+        // A write that never runs (the runtime discarded the task) holds
+        // nothing back.
+        drop(store.hold("r2", raw.clone()));
+        assert!(store.inner.held.lock().is_empty());
+        assert_eq!(store.read("r2"), None);
+
+        // Two captures under one id: the later one is served, and the
+        // earlier guard going away does not take it along.
+        let first = store.hold("r3", bodies());
+        let second = store.hold("r3", raw.clone());
+        drop(first);
+        assert_eq!(store.read("r3"), Some(expected));
+        drop(second);
+        assert_eq!(store.read("r3"), None);
+
+        // A write the mode refuses stores nothing and leaves nothing behind.
+        store.configure(RequestLogMode::Errors, DEFAULT_MAX_BODY_BYTES);
+        assert!(!store.hold("r4", raw).write(T0, false).unwrap());
+        assert_eq!(store.read("r4"), None);
+        assert!(store.inner.held.lock().is_empty());
     }
 
     #[test]

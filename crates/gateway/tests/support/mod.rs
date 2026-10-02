@@ -226,12 +226,31 @@ impl Harness {
     /// Edits the configuration file through the store and waits until the
     /// gateway has applied the result.
     pub async fn reconfigure(&self, text: &str) {
-        let mut events = self.gateway.telemetry().subscribe();
+        let events = self.gateway.telemetry().subscribe();
         self.gateway
             .config_store()
             .replace_text(&text.replace("{base}", &self.fake.base()))
             .await
             .expect("the new configuration must be valid");
+        Self::applied(events).await;
+    }
+
+    /// Has the gateway read its configuration file again, changed or not,
+    /// and waits until it has applied it: everything that is checked when a
+    /// configuration is applied (service-account files, say) is checked
+    /// again.
+    pub async fn reload(&self) {
+        let events = self.gateway.telemetry().subscribe();
+        self.gateway
+            .config_store()
+            .reload_from_disk()
+            .await
+            .expect("the configuration file must be valid");
+        Self::applied(events).await;
+    }
+
+    /// Waits for the gateway to announce an applied configuration.
+    async fn applied(mut events: tokio::sync::broadcast::Receiver<switchyard_telemetry::Event>) {
         let applied = async {
             loop {
                 match events.recv().await {

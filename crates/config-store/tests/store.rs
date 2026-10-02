@@ -326,71 +326,111 @@ async fn update_adopts_an_edit_made_on_disk_first() {
     ));
 }
 
-/// A manual edit left the file unparsable (the store rejected it and kept the
-/// previous configuration). An edit through the store must not make things
-/// worse by rewriting the file from scratch: it goes into the last good text,
-/// comments and all.
+/// A manual edit left the file unparsable, semantically invalid or not even
+/// text. An edit through the store must not overwrite it from the last valid
+/// configuration — that would silently discard what the operator was typing:
+/// it is refused, naming what is wrong with the file, and nothing changes.
 #[tokio::test]
-async fn update_over_a_broken_file_restores_the_last_good_text() {
-    let f = fixture(BASE);
-    std::fs::write(&f.path, "[server\nthis is not toml").unwrap();
-    let applied = f
-        .store
-        .update(|c| {
-            c.server.port = 9100;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(applied.server.port, 9100);
-    assert_eq!(applied.providers[0].name, "mock");
-    let text = std::fs::read_to_string(&f.path).unwrap();
-    assert_eq!(text, BASE.replace("port = 9000", "port = 9100"));
-    assert!(!text.contains(REWRITE_HEADER));
-    assert_eq!(*ConfigStore::load(&f.path).unwrap().current(), *applied);
+async fn update_refuses_to_overwrite_a_broken_file() {
+    let semantically_invalid = BASE
+        .replace("port = 9000", "port = 0 # zero is not a port")
+        .replace("# Team gateway", "# Team gateway (edited by hand)");
+    let cases: [(&[u8], &str); 3] = [
+        (b"[server\nthis is not toml", "line 1, column 8"),
+        (semantically_invalid.as_bytes(), "server.port"),
+        (
+            b"[server]\nport = 9000\nhost = \"\xff\xfe\"\n[broken",
+            "config",
+        ),
+    ];
+    for (broken, issue_path) in cases {
+        let f = fixture(BASE);
+        let mut events = f.store.events();
+        std::fs::write(&f.path, broken).unwrap();
+        let err = f
+            .store
+            .update(|c| {
+                c.server.port = 9100;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        match &err {
+            ConfigStoreError::DiskInvalid(issues) => {
+                assert_eq!(issues[0].path, issue_path, "{err}");
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "the configuration file on disk is not valid and was not overwritten; fix or \
+                 restore the file, or replace it through the raw editor: "
+            ),
+            "{message}"
+        );
+        // Neither the file nor the live configuration changed, and nothing
+        // was announced.
+        assert_eq!(std::fs::read(&f.path).unwrap(), broken);
+        assert_eq!(f.store.current().server.port, 9000);
+        assert!(events.try_recv().is_err());
 
-    // The base is always the *latest* applied text, whoever applied it.
+        // An edit that changes nothing writes nothing: not refused.
+        f.store.update(|_| Ok(())).await.unwrap();
+        // An edit that is itself invalid is told so first.
+        let err = f
+            .store
+            .update(|c| {
+                c.server.port = 0;
+                Ok(())
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(err, ConfigStoreError::Invalid(_)), "{err}");
+        assert_eq!(std::fs::read(&f.path).unwrap(), broken);
+
+        // Replacing the whole file is explicit, and the way out.
+        let replaced = "# replaced\n[server]\nport = 9200\n";
+        f.store.replace_text(replaced).await.unwrap();
+        assert_eq!(std::fs::read_to_string(&f.path).unwrap(), replaced);
+        assert_eq!(f.store.current().server.port, 9200);
+        // …after which edits go through again.
+        f.store
+            .update(|c| {
+                c.server.port = 9300;
+                Ok(())
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&f.path).unwrap(),
+            "# replaced\n[server]\nport = 9300\n"
+        );
+    }
+}
+
+/// An empty file holds nothing to lose: the edit goes into the latest
+/// applied text, whoever applied it, comments and all.
+#[tokio::test]
+async fn update_over_an_empty_file_restores_the_last_good_text() {
+    let f = fixture(BASE);
     f.store
         .replace_text("# second version\n[server]\nport = 9200 # custom\n")
         .await
         .unwrap();
     std::fs::write(&f.path, "").unwrap();
-    f.store
+    let applied = f
+        .store
         .update(|c| {
             c.server.port = 9300;
             Ok(())
         })
         .await
         .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&f.path).unwrap(),
-        "# second version\n[server]\nport = 9300 # custom\n"
-    );
-}
-
-/// A file that parses but breaks a semantic rule is edited as it is: the
-/// text (and any comment added by hand) stays, the values go back to the
-/// live ones.
-#[tokio::test]
-async fn update_over_a_semantically_invalid_file_keeps_its_text() {
-    let f = fixture(BASE);
-    let invalid = BASE
-        .replace("port = 9000", "port = 0 # zero is not a port")
-        .replace("# Team gateway", "# Team gateway (edited by hand)");
-    std::fs::write(&f.path, &invalid).unwrap();
-    f.store
-        .update(|c| {
-            c.server.host = "0.0.0.0".into();
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(
-        std::fs::read_to_string(&f.path).unwrap(),
-        invalid
-            .replace("port = 0 #", "port = 9000 #")
-            .replace("host = \"127.0.0.1\"", "host = \"0.0.0.0\"")
-    );
+    let text = std::fs::read_to_string(&f.path).unwrap();
+    assert_eq!(text, "# second version\n[server]\nport = 9300 # custom\n");
+    assert!(!text.contains(REWRITE_HEADER));
+    assert_eq!(*ConfigStore::load(&f.path).unwrap().current(), *applied);
 }
 
 #[tokio::test]
@@ -926,26 +966,97 @@ async fn a_change_made_before_the_watcher_started_is_picked_up() {
     assert_eq!(f.store.current().server.port, 9450);
 }
 
+/// Regression: after the watcher refused the file, putting back the content
+/// of the configuration in effect produced no event at all (the content was
+/// already live), so a dashboard showed "file refused" for ever. The
+/// recovery is announced, exactly once.
 #[tokio::test]
-async fn update_over_a_file_that_is_not_utf8_restores_the_last_good_text() {
+async fn watcher_announces_a_refused_file_that_is_put_back() {
     let f = fixture(BASE);
-    std::fs::write(
-        &f.path,
-        b"[server]\nport = 9000\nhost = \"\xff\xfe\"\n[broken",
-    )
-    .unwrap();
-    let applied = f
-        .store
-        .update(|c| {
-            c.server.port = 9100;
-            Ok(())
-        })
-        .await
-        .unwrap();
-    assert_eq!(applied.providers[0].name, "mock");
-    let text = std::fs::read_to_string(&f.path).unwrap();
-    assert_eq!(text, BASE.replace("port = 9000", "port = 9100"));
-    assert_eq!(*ConfigStore::load(&f.path).unwrap().current(), *applied);
+    let mut events = f.store.events();
+    let mut updates = f.store.subscribe();
+    updates.borrow_and_update();
+    f.store
+        .spawn_watcher_with(&tokio::runtime::Handle::current(), fast());
+
+    write(&f.path, "[server]\nport = \n");
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Rejected {
+            source: Source::File,
+            ..
+        }
+    ));
+    assert!(!updates.has_changed().unwrap());
+
+    // Exactly the live content again.
+    write(&f.path, BASE);
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Applied {
+            source: Source::File,
+            ..
+        }
+    ));
+    // Subscribers are told too, as for a manual reload.
+    updates.changed().await.unwrap();
+    assert_eq!(updates.borrow_and_update().server.port, 9000);
+    // Once: further looks at the same file say nothing. (That a later
+    // rejection and recovery are announced again, and that saving the live
+    // content without a rejection before it is no news, is tested next to
+    // the store and in `watcher_applies_an_external_edit`.)
+    assert_quiet(&mut events).await;
+    assert!(!updates.has_changed().unwrap());
+}
+
+/// The same recovery through a manual reload: one event for the reload, and
+/// none from the watcher that looks at the file afterwards. And a rejection
+/// that a manual reload reported is taken back by the watcher.
+#[tokio::test]
+async fn reload_from_disk_and_the_watcher_announce_one_recovery_between_them() {
+    let applied_from_file = |event| {
+        matches!(
+            event,
+            ConfigEvent::Applied {
+                source: Source::File,
+                ..
+            }
+        )
+    };
+
+    // Rejected by a manual reload (no watcher yet), put back, reloaded.
+    let f = fixture(BASE);
+    let mut events = f.store.events();
+    write(&f.path, "[server]\nport = 0\n");
+    assert!(f.store.reload_from_disk().await.is_err());
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Rejected { .. }
+    ));
+    write(&f.path, BASE);
+    f.store.reload_from_disk().await.unwrap();
+    assert!(applied_from_file(next_event(&mut events).await));
+    // The watcher starts and looks at the file: nothing left to announce.
+    f.store
+        .spawn_watcher_with(&tokio::runtime::Handle::current(), fast());
+    assert_quiet(&mut events).await;
+
+    // Rejected by a manual reload, put back, noticed by the watcher (which
+    // looks at the file when it starts).
+    let f = fixture(BASE);
+    let mut events = f.store.events();
+    write(&f.path, "[server]\nport = 0\n");
+    assert!(f.store.reload_from_disk().await.is_err());
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Rejected { .. }
+    ));
+    write(&f.path, BASE);
+    f.store
+        .spawn_watcher_with(&tokio::runtime::Handle::current(), fast());
+    assert!(applied_from_file(next_event(&mut events).await));
+    assert_quiet(&mut events).await;
+    assert_eq!(f.store.current().server.port, 9000);
 }
 
 #[tokio::test]
@@ -971,16 +1082,6 @@ async fn polling_alone_follows_the_file() {
     ));
     assert_eq!(f.store.current().server.port, 9950);
 
-    write(&f.path, "[server]\nport = 0\n");
-    assert!(matches!(
-        next_event(&mut events).await,
-        ConfigEvent::Rejected {
-            source: Source::File,
-            ..
-        }
-    ));
-    assert_eq!(f.store.current().server.port, 9950);
-
     // Its own writes are not re-applied either.
     f.store
         .update(|c| {
@@ -996,6 +1097,31 @@ async fn polling_alone_follows_the_file() {
             ..
         }
     ));
+    assert_quiet(&mut events).await;
+
+    write(&f.path, "[server]\nport = 0\n");
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Rejected {
+            source: Source::File,
+            ..
+        }
+    ));
+    assert_eq!(f.store.current().server.port, 9951);
+    // The refused file is the operator's to fix: an edit does not replace it.
+    let err = f
+        .store
+        .update(|c| {
+            c.server.port = 9952;
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+    assert!(matches!(err, ConfigStoreError::DiskInvalid(_)), "{err}");
+    assert_eq!(
+        std::fs::read_to_string(&f.path).unwrap(),
+        "[server]\nport = 0\n"
+    );
     assert_quiet(&mut events).await;
 }
 

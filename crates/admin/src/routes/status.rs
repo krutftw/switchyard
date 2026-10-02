@@ -23,8 +23,13 @@ pub(crate) async fn status(
     let telemetry = gateway.telemetry();
     let now = now_unix_ms();
 
+    // What is in service: the credentials of a provider that is switched
+    // off are not, and neither is an alias without a routable target.
     let snapshot = scheduler.snapshot();
-    let credentials = snapshot.iter().flat_map(|p| p.credentials.iter());
+    let credentials = snapshot
+        .iter()
+        .flat_map(|p| p.credentials.iter())
+        .filter(|c| !c.provider_disabled());
     let credentials_total = credentials.clone().count();
     let credentials_ready = credentials
         .filter(|c| c.status == CredentialStatus::Ready)
@@ -41,13 +46,14 @@ pub(crate) async fn status(
         "config_path": store.path().display().to_string(),
         "data_dir": telemetry.data_dir().map(|dir| dir.display().to_string()),
         "listen": state.options.listen.map(|addr| addr.to_string()),
+        "tls": state.options.tls,
         "restart_required": store.restart_required(),
         "warnings": scheduler.warnings(),
         "counts": {
             "providers": config.providers.len(),
             "credentials": credentials_total,
             "credentials_ready": credentials_ready,
-            "models": scheduler.visible_models().len(),
+            "models": scheduler.models_routable(),
             "client_keys": config.auth.keys.len(),
         },
         "live": live,

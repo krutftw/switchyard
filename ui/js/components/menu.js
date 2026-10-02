@@ -14,7 +14,7 @@
 //         trigger=${(props) => html`<${Button} iconRight="chevron-down" ...${props}>Range<//>`} />`
 
 import { html, useEffect, useLayoutEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { cx, placeFloating } from '../lib/dom.js';
+import { cx, placeFloating, scrollMoves } from '../lib/dom.js';
 import { useModalLayer, useOutsidePointer, usePresence, useUid } from '../lib/hooks.js';
 import { IconButton } from './button.js';
 import { Icon } from './icons.js';
@@ -70,10 +70,12 @@ export function Menu({ items, trigger, label = 'More actions', icon = 'more', si
 
   useEffect(() => {
     if (!open) return undefined;
-    // A menu is anchored to something that scrolls away: close rather than chase it.
+    // A menu is anchored to something that scrolls away: close rather than
+    // chase it. Only scrolling that moves the anchor counts (the page, or a
+    // box the anchor is inside). A list elsewhere on the page that scrolls
+    // by itself, a log tail pinned to its end, must not shut every menu.
     const onScroll = (event) => {
-      if (menu.current && menu.current.contains(event.target)) return;
-      close();
+      if (scrollMoves(event.target, anchor.current)) close();
     };
     window.addEventListener('scroll', onScroll, true);
     window.addEventListener('resize', close);

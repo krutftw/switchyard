@@ -240,18 +240,28 @@ port = 9000
 
 #[test]
 fn keys_that_need_quoting_are_quoted() {
-    let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { \"X Y\" = \"1\" }\n";
+    // Header names are HTTP tokens, some of which a bare TOML key cannot
+    // hold; the fields a payload rule sets may be named anything.
+    let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { \"X~Y\" = \"1\" }\n\n\
+                [[payload.override]]\nmodels = [\"*\"]\nset = { \"X Y\" = \"1\" }\n";
     let out = edit(text, |c| {
         let headers = &mut c.providers[0].headers;
         headers.insert("dotted.name".into(), "a \"quoted\" value".into());
-        headers.insert("ключ".into(), "значение".into());
         headers.insert("plain-name_1".into(), "back\\slash".into());
+        let set = &mut c.payload.overrides[0].set;
+        set.insert("dotted.name".into(), "a \"quoted\" value".into());
+        set.insert("ключ".into(), "значение".into());
+        set.insert("plain-name_1".into(), "back\\slash".into());
     });
     let config = validate_text(&out).unwrap();
     let headers = &config.providers[0].headers;
     assert_eq!(headers["dotted.name"], "a \"quoted\" value");
-    assert_eq!(headers["ключ"], "значение");
     assert_eq!(headers["plain-name_1"], "back\\slash");
+    let set = &config.payload.overrides[0].set;
+    assert_eq!(set["dotted.name"], "a \"quoted\" value");
+    assert_eq!(set["ключ"], "значение");
+    assert_eq!(set["plain-name_1"], "back\\slash");
+    assert!(out.contains("\"X~Y\" = \"1\", \"dotted.name\" = "), "{out}");
     assert!(out.contains("\"X Y\" = \"1\", \"dotted.name\" = "), "{out}");
     assert!(out.contains("plain-name_1 = "), "{out}");
 }
@@ -397,29 +407,44 @@ fn awkward_strings_round_trip() {
         "\"\"\"",
         "trailing newline\n",
     ];
-    let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { First = 'literal' }\n\n[[aliases]]\nname = \"a\"\ntargets = ['one']\n";
+    // Payload rules take any text (header values and alias targets do not:
+    // no control characters, no padding), so they carry the awkward values;
+    // a header gets the ones it may hold.
+    let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { First = 'literal' }\n\n\
+                [[payload.default]]\nmodels = ['*']\nset = { First = 'literal' }\n\n\
+                [[payload.filter]]\nmodels = ['*']\nremove = ['one']\n";
     for value in awkward {
+        let as_header = !value.trim().is_empty() && !value.chars().any(char::is_control);
         // As a new key of an inline table, as a changed value of a literal
         // string, as a value of a block table, and as an array element.
         let out = edit(text, |c| {
             let p = &mut c.providers[0];
-            p.headers.insert("X-New".into(), value.into());
-            p.headers.insert("First".into(), value.into());
+            if as_header {
+                p.headers.insert("X-New".into(), value.into());
+                p.headers.insert("First".into(), value.into());
+            }
             p.prefix = format!("x{}", value.len());
             p.credentials
                 .push(switchyard_core::config::CredentialConfig {
                     label: value.into(),
                     ..Default::default()
                 });
-            c.aliases[0].targets[0] = format!("{value}!");
-            c.aliases[0].targets.push(format!("{value}?"));
+            let set = &mut c.payload.default[0].set;
+            set.insert("X-New".into(), value.into());
+            set.insert("First".into(), value.into());
+            c.payload.filter[0].remove[0] = format!("{value}!");
+            c.payload.filter[0].remove.push(format!("{value}?"));
         });
         let config = validate_text(&out).unwrap();
-        assert_eq!(config.providers[0].headers["X-New"], value, "{out}");
-        assert_eq!(config.providers[0].headers["First"], value, "{out}");
+        if as_header {
+            assert_eq!(config.providers[0].headers["X-New"], value, "{out}");
+            assert_eq!(config.providers[0].headers["First"], value, "{out}");
+        }
+        assert_eq!(config.payload.default[0].set["X-New"], value, "{out}");
+        assert_eq!(config.payload.default[0].set["First"], value, "{out}");
         assert_eq!(config.providers[0].credentials[0].label, value, "{out}");
         assert_eq!(
-            config.aliases[0].targets,
+            config.payload.filter[0].remove,
             vec![format!("{value}!"), format!("{value}?")]
         );
     }
@@ -427,10 +452,13 @@ fn awkward_strings_round_trip() {
 
 #[test]
 fn line_breaks_inside_values_survive_windows_line_endings() {
-    let text = "# note\r\n[[providers]]\r\nname = \"p\"\r\nkind = \"mock\"\r\n";
+    // (A header value may not hold a line break; what a payload rule sets
+    // may.)
+    let text = "# note\r\n[[payload.default]]\r\nmodels = [\"*\"]\r\nset = { a = 1 }\r\n\r\n\
+                [[providers]]\r\nname = \"p\"\r\nkind = \"mock\"\r\n";
     let out = edit(text, |c| {
-        c.providers[0]
-            .headers
+        c.payload.default[0]
+            .set
             .insert("X-Multi".into(), "one\ntwo".into());
         c.providers[0]
             .credentials
@@ -441,12 +469,13 @@ fn line_breaks_inside_values_survive_windows_line_endings() {
     });
     assert_eq!(
         out,
-        "# note\r\n[[providers]]\r\nname = \"p\"\r\nkind = \"mock\"\r\n\
-         headers = { X-Multi = \"one\\ntwo\" }\r\n\r\n\
+        "# note\r\n[[payload.default]]\r\nmodels = [\"*\"]\r\n\
+         set = { a = 1, X-Multi = \"one\\ntwo\" }\r\n\r\n\
+         [[providers]]\r\nname = \"p\"\r\nkind = \"mock\"\r\n\r\n\
          [[providers.credentials]]\r\nlabel = \"first\\nsecond\\r\\nthird\"\r\n"
     );
     let config = validate_text(&out).unwrap();
-    assert_eq!(config.providers[0].headers["X-Multi"], "one\ntwo");
+    assert_eq!(config.payload.default[0].set["X-Multi"], "one\ntwo");
     assert_eq!(
         config.providers[0].credentials[0].label,
         "first\nsecond\r\nthird"

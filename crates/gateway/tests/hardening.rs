@@ -37,7 +37,6 @@ kind = "openai"
 wire_api = "chat"
 base_url = "{base}/v1"
 api_keys = ["key-a"]
-websocket = true
 [[providers.models]]
 id = "up-chat"
 alias = "m"
@@ -53,7 +52,6 @@ kind = "openai"
 wire_api = "chat"
 base_url = "{base}/v1"
 api_keys = ["key-a", "key-b"]
-websocket = true
 [[providers.models]]
 id = "up-chat"
 alias = "m"

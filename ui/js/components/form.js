@@ -7,6 +7,10 @@
 //   hint      one line of help under the control
 //   error     message shown under the control in the stop colour; also marks
 //             the control invalid. Usually issues.at('path') (see useIssues).
+//   warning   message shown under the control in the caution colour: the
+//             value is allowed and will be saved, but the user should know
+//             something about it ("Keys this short are easy to guess").
+//             Takes the hint's place while it shows; an error takes both.
 //   optional  adds "optional" after the label
 //
 // and reports changes the same way: onChange(value), with the new value
@@ -17,6 +21,7 @@
 
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
+import { sentence } from '../lib/format.js';
 import { useUid } from '../lib/hooks.js';
 import { CopyButton, IconButton } from './button.js';
 import { Icon } from './icons.js';
@@ -34,7 +39,7 @@ import { Notice } from './surface.js';
  *     <${Segmented} ... />
  *   <//>`
  */
-export function Field({ label, hint, error, optional = false, htmlFor, id, class: className, children }) {
+export function Field({ label, hint, error, warning, optional = false, htmlFor, id, class: className, children }) {
   const base = id || htmlFor;
   return html`
     <div class=${cx('field', className)}>
@@ -48,22 +53,26 @@ export function Field({ label, hint, error, optional = false, htmlFor, id, class
         ? html`<div class="field-error" id=${base ? `${base}-error` : undefined}>
             <${Icon} name="alert-circle" size=${14} /><span>${error}</span>
           </div>`
-        : hint != null && html`<div class="field-hint" id=${base ? `${base}-hint` : undefined}>${hint}</div>`}
+        : warning
+          ? html`<div class="field-warning" id=${base ? `${base}-warning` : undefined}>
+              <${Icon} name="alert" size=${14} /><span>${warning}</span>
+            </div>`
+          : hint != null && html`<div class="field-hint" id=${base ? `${base}-hint` : undefined}>${hint}</div>`}
     </div>
   `;
 }
 
 /** aria wiring shared by the controls. */
-function describe(id, { hint, error }) {
+function describe(id, { hint, error, warning }) {
   return {
     'aria-invalid': error ? 'true' : undefined,
-    'aria-describedby': error ? `${id}-error` : hint != null ? `${id}-hint` : undefined,
+    'aria-describedby': error ? `${id}-error` : warning ? `${id}-warning` : hint != null ? `${id}-hint` : undefined,
   };
 }
 
-function wrap(control, id, { label, hint, error, optional, class: className }) {
-  if (label == null && hint == null && !error) return control;
-  return html`<${Field} label=${label} hint=${hint} error=${error} optional=${optional} htmlFor=${id} class=${label != null ? className : undefined}>${control}<//>`;
+function wrap(control, id, { label, hint, error, warning, optional, class: className }) {
+  if (label == null && hint == null && !error && !warning) return control;
+  return html`<${Field} label=${label} hint=${hint} error=${error} warning=${warning} optional=${optional} htmlFor=${id} class=${label != null ? className : undefined}>${control}<//>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -78,6 +87,16 @@ function wrap(control, id, { label, hint, error, optional, class: className }) {
  * icon         icon name shown inside, before the text
  * suffix       short text after the value ("ms", "/v1")
  * actions      buttons inside the field, at the end
+ * clearable    a clear button (an x) at the end while the field holds text.
+ *              The browser's own one on type="search" is hidden (base.css),
+ *              so this is on by default for a search field that brings no
+ *              `actions` of its own, and off otherwise. Pass true to have
+ *              it next to your actions, false to leave it out. Clearing
+ *              calls onChange(''), then onClear, and puts the focus back in
+ *              the field.
+ * onClear      called after the clear button emptied the field, for a
+ *              search that is applied on Enter and must be applied now
+ * clearLabel   accessible name and tooltip of that button (default "Clear")
  * mono         monospace, for identifiers, URLs, model names
  * size         "md" | "sm" | "lg"
  * autoFocus    take focus when the surrounding modal or drawer opens
@@ -85,11 +104,14 @@ function wrap(control, id, { label, hint, error, optional, class: className }) {
  * inputRef     ref to the <input>
  * Other props (placeholder, disabled, readOnly, name, autocomplete,
  * maxLength, inputmode) go to the <input>.
+ *
+ * With neither `value` nor `onChange` the field keeps its own text.
  */
 export function Input({
   label,
   hint,
   error,
+  warning,
   optional,
   id: idProp,
   class: className,
@@ -99,6 +121,9 @@ export function Input({
   icon,
   suffix,
   actions,
+  clearable,
+  onClear,
+  clearLabel = 'Clear',
   mono = false,
   size = 'md',
   autoFocus = false,
@@ -109,12 +134,29 @@ export function Input({
 }) {
   const uid = useUid('in');
   const id = idProp || uid;
+  // A field nobody controls remembers what was typed into it, so it too
+  // knows when there is something to clear.
+  const uncontrolled = value === undefined && onChange === undefined;
+  const [own, setOwn] = useState('');
+  const text = uncontrolled ? own : String(value ?? '');
+  const change = (next, event) => {
+    if (uncontrolled) setOwn(next);
+    else onChange?.(next, event);
+  };
+  const showClear = (clearable ?? (type === 'search' && actions === undefined)) && text !== '' && !disabled && !rest.readOnly;
+  const clear = (event) => {
+    const field = event.currentTarget.closest('.input')?.querySelector('input');
+    change('', event);
+    onClear?.(event);
+    field?.focus();
+  };
   const control = html`
     <div
       class=${cx('input', label == null && className)}
       data-size=${size === 'md' ? undefined : size}
       data-mono=${mono ? '' : undefined}
       data-invalid=${error ? '' : undefined}
+      data-warning=${warning && !error ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
     >
       ${icon && html`<${Icon} name=${icon} />`}
@@ -123,26 +165,38 @@ export function Input({
         id=${id}
         class="input-el"
         type=${type}
-        value=${value ?? ''}
+        value=${text}
         disabled=${disabled}
         spellcheck=${false}
         autocapitalize="off"
         autocorrect="off"
         data-autofocus=${autoFocus ? '' : undefined}
-        onInput=${(event) => onChange?.(event.target.value, event)}
+        onInput=${(event) => change(event.target.value, event)}
         onKeyDown=${onEnter
           ? (event) => {
               if (event.key === 'Enter' && !event.isComposing) onEnter(event);
             }
           : undefined}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       />
       ${suffix != null && html`<span class="input-affix">${suffix}</span>`}
-      ${actions && html`<span class="input-actions">${actions}</span>`}
+      ${(actions || showClear) &&
+      html`<span class="input-actions">
+        ${showClear &&
+        html`<${IconButton}
+          icon="x"
+          label=${clearLabel}
+          size="sm"
+          class="input-clear"
+          onMouseDown=${(event) => event.preventDefault() /* the field keeps the focus */}
+          onClick=${clear}
+        />`}
+        ${actions}
+      </span>`}
     </div>
   `;
-  return wrap(control, id, { label, hint, error, optional, class: className });
+  return wrap(control, id, { label, hint, error, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -160,6 +214,7 @@ export function Textarea({
   label,
   hint,
   error,
+  warning,
   optional,
   id: idProp,
   class: className,
@@ -191,6 +246,7 @@ export function Textarea({
       data-textarea=""
       data-mono=${mono ? '' : undefined}
       data-invalid=${error ? '' : undefined}
+      data-warning=${warning && !error ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
     >
       <textarea
@@ -203,12 +259,12 @@ export function Textarea({
         spellcheck=${false}
         data-autofocus=${autoFocus ? '' : undefined}
         onInput=${(event) => onChange?.(event.target.value, event)}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       ></textarea>
     </div>
   `;
-  return wrap(control, id, { label, hint, error, optional, class: className });
+  return wrap(control, id, { label, hint, error, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -226,6 +282,7 @@ export function Select({
   label,
   hint,
   error,
+  warning,
   optional,
   id: idProp,
   class: className,
@@ -246,6 +303,7 @@ export function Select({
       data-select=""
       data-size=${size === 'md' ? undefined : size}
       data-invalid=${error ? '' : undefined}
+      data-warning=${warning && !error ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
     >
       <select
@@ -254,7 +312,7 @@ export function Select({
         value=${value ?? ''}
         disabled=${disabled}
         onChange=${(event) => onChange?.(event.target.value, event)}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       >
         ${placeholder != null && html`<option value="">${placeholder}</option>`}
@@ -263,7 +321,7 @@ export function Select({
       <${Icon} name="chevron-down" size=${14} />
     </div>
   `;
-  return wrap(control, id, { label, hint, error, optional, class: className });
+  return wrap(control, id, { label, hint, error, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -274,7 +332,7 @@ export function Select({
  * An on/off setting that takes effect as a state ("Capture request bodies").
  * checked, onChange(checked), label, hint, error, disabled.
  */
-export function Switch({ label, hint, error, id: idProp, class: className, checked = false, onChange, disabled = false, ...rest }) {
+export function Switch({ label, hint, error, warning, id: idProp, class: className, checked = false, onChange, disabled = false, ...rest }) {
   const uid = useUid('sw');
   const id = idProp || uid;
   return html`
@@ -287,16 +345,18 @@ export function Switch({ label, hint, error, id: idProp, class: className, check
         aria-checked=${checked ? 'true' : 'false'}
         disabled=${disabled}
         onClick=${() => onChange?.(!checked)}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       ></button>
-      ${(label != null || hint != null || error) &&
+      ${(label != null || hint != null || error || warning) &&
       html`
         <div class="field-inline-text">
           ${label != null && html`<label class="choice-label" for=${id}>${label}</label>`}
           ${error
             ? html`<div class="field-error" id=${`${id}-error`}><${Icon} name="alert-circle" size=${14} /><span>${error}</span></div>`
-            : hint != null && html`<div class="field-hint" id=${`${id}-hint`}>${hint}</div>`}
+            : warning
+              ? html`<div class="field-warning" id=${`${id}-warning`}><${Icon} name="alert" size=${14} /><span>${warning}</span></div>`
+              : hint != null && html`<div class="field-hint" id=${`${id}-hint`}>${hint}</div>`}
         </div>
       `}
     </div>
@@ -307,7 +367,7 @@ export function Switch({ label, hint, error, id: idProp, class: className, check
  * A tick box, for choosing items or agreeing to one thing in a form.
  * checked, onChange(checked), indeterminate, label, hint, error, disabled.
  */
-export function Checkbox({ label, hint, error, id: idProp, class: className, checked = false, indeterminate = false, onChange, disabled = false, ...rest }) {
+export function Checkbox({ label, hint, error, warning, id: idProp, class: className, checked = false, indeterminate = false, onChange, disabled = false, ...rest }) {
   const uid = useUid('cb');
   const id = idProp || uid;
   const ref = useRef(null);
@@ -324,16 +384,18 @@ export function Checkbox({ label, hint, error, id: idProp, class: className, che
         checked=${checked}
         disabled=${disabled}
         onChange=${(event) => onChange?.(event.target.checked, event)}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       />
-      ${(label != null || hint != null || error) &&
+      ${(label != null || hint != null || error || warning) &&
       html`
         <div class="field-inline-text">
           ${label != null && html`<label class="choice-label" for=${id}>${label}</label>`}
           ${error
             ? html`<div class="field-error" id=${`${id}-error`}><${Icon} name="alert-circle" size=${14} /><span>${error}</span></div>`
-            : hint != null && html`<div class="field-hint" id=${`${id}-hint`}>${hint}</div>`}
+            : warning
+              ? html`<div class="field-warning" id=${`${id}-warning`}><${Icon} name="alert" size=${14} /><span>${warning}</span></div>`
+              : hint != null && html`<div class="field-hint" id=${`${id}-hint`}>${hint}</div>`}
         </div>
       `}
     </div>
@@ -394,6 +456,7 @@ export function NumberInput({
   label,
   hint,
   error,
+  warning,
   optional,
   id: idProp,
   class: className,
@@ -476,6 +539,7 @@ export function NumberInput({
       data-size=${size === 'md' ? undefined : size}
       data-mono=""
       data-invalid=${error || problem ? '' : undefined}
+      data-warning=${warning && !error && !problem ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
     >
       <input
@@ -520,7 +584,7 @@ export function NumberInput({
             stepBy(-1);
           }
         }}
-        ...${describe(id, { hint, error: error || problem })}
+        ...${describe(id, { hint, error: error || problem, warning })}
         ...${rest}
       />
       ${unit != null && html`<span class="input-affix">${unit}</span>`}
@@ -534,7 +598,7 @@ export function NumberInput({
       </span>
     </div>
   `;
-  return wrap(control, id, { label, hint, error: error || problem, optional, class: className });
+  return wrap(control, id, { label, hint, error: error || problem, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -554,7 +618,7 @@ export function NumberInput({
  * separated by commas, spaces or new lines adds every entry. Backspace in an
  * empty field removes the last tag. Duplicates are ignored.
  */
-export function TagInput({ label, hint, error, optional, id: idProp, class: className, value = [], onChange, validate, placeholder, disabled = false, ...rest }) {
+export function TagInput({ label, hint, error, warning, optional, id: idProp, class: className, value = [], onChange, validate, placeholder, disabled = false, ...rest }) {
   const uid = useUid('tags');
   const id = idProp || uid;
   const [draft, setDraft] = useState('');
@@ -586,6 +650,7 @@ export function TagInput({ label, hint, error, optional, id: idProp, class: clas
     <div
       class=${cx('input', 'tags', label == null && className)}
       data-invalid=${error ? '' : undefined}
+      data-warning=${warning && !error ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
       onClick=${(event) => {
         if (event.target === event.currentTarget) input.current?.focus();
@@ -619,6 +684,11 @@ export function TagInput({ label, hint, error, optional, id: idProp, class: clas
           if (/[,\n]/.test(text) || /\S\s/.test(text)) {
             add(text);
             setDraft('');
+            // Clear the field itself as well. When every pasted entry is
+            // already in the list nothing changes: the draft was '' and
+            // stays '', the value is the same array, so nothing renders
+            // again and the pasted text would be left standing in the field.
+            event.target.value = '';
           } else {
             setDraft(text);
           }
@@ -644,12 +714,12 @@ export function TagInput({ label, hint, error, optional, id: idProp, class: clas
             setDraft('');
           }
         }}
-        ...${describe(id, { hint, error })}
+        ...${describe(id, { hint, error, warning })}
         ...${rest}
       />
     </div>
   `;
-  return wrap(control, id, { label, hint, error, optional, class: className });
+  return wrap(control, id, { label, hint, error, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -679,6 +749,7 @@ export function SecretInput({
   label,
   hint,
   error,
+  warning,
   optional,
   id: idProp,
   class: className,
@@ -746,6 +817,7 @@ export function SecretInput({
       data-size=${size === 'md' ? undefined : size}
       data-mono=""
       data-invalid=${error || revealError ? '' : undefined}
+      data-warning=${warning && !error && !revealError ? '' : undefined}
       data-disabled=${disabled ? '' : undefined}
     >
       <input
@@ -764,7 +836,7 @@ export function SecretInput({
         data-bwignore=${managerOff ? '' : undefined}
         data-autofocus=${autoFocus ? '' : undefined}
         onInput=${(event) => onChange?.(event.target.value, event)}
-        ...${describe(id, { hint, error: error || revealError })}
+        ...${describe(id, { hint, error: error || revealError, warning })}
         ...${rest}
       />
       <span class="input-actions">
@@ -781,7 +853,7 @@ export function SecretInput({
       </span>
     </div>
   `;
-  return wrap(control, id, { label, hint, error: error || revealError, optional, class: className });
+  return wrap(control, id, { label, hint, error: error || revealError, warning, optional, class: className });
 }
 
 // ---------------------------------------------------------------------------
@@ -888,6 +960,11 @@ export function useIssues(error) {
  * error   ApiError from useAsync
  * issues  the object from useIssues(error); optional
  * title   overrides the heading (default "Could not save")
+ *
+ * The gateway's message is printed as a sentence (lib/format.js, sentence):
+ * capital first word, closing full stop. "Check the highlighted field."
+ * follows it, and would otherwise run straight on from a message that has
+ * no full stop of its own.
  */
 export function FormError({ error, issues, title = 'Could not save', class: className }) {
   if (!error || error.aborted) return null;
@@ -895,7 +972,7 @@ export function FormError({ error, issues, title = 'Could not save', class: clas
   const fieldCount = (error.issues?.length ?? 0) - rest.length;
   return html`
     <${Notice} tone="stop" title=${title} class=${className}>
-      <span>${error.message}</span>
+      <span>${sentence(error.message)}</span>
       ${fieldCount > 0 && html`<span> Check the highlighted ${fieldCount === 1 ? 'field' : 'fields'}.</span>`}
       ${rest.length > 0 &&
       html`<ul class="issue-list">

@@ -329,9 +329,15 @@ Watches the file (notify, debounced ~300 ms) and applies valid changes live;
 an invalid file is rejected with the issues logged and the old config kept.
 Admin edits go through `update(|&mut Config|)`: validate → write the file
 **preserving comments and formatting** (toml_edit: merge the new value tree
-into the existing document, touching only what changed) → apply. Applying a
-config rebuilds the scheduler (keeping credential state), re-runs model
-discovery in the background, and updates log level, rate limits, etc.
+into the existing document, touching only what changed) → apply. An edit is
+refused while the file on disk holds an invalid manual edit (it would be
+overwritten); replacing the whole text is the way out. Applying a config
+rebuilds the scheduler once (keeping credential state), checks Vertex
+service-account files (a missing or invalid one makes its credential
+unusable), re-runs model discovery in the background — only for the
+providers the change concerns; the state of each provider's discovery is
+kept — and updates log level, rate limits, etc. Applied and refused
+configurations are announced on the event bus in the order they happened.
 Listener address, TLS and data dir need a restart (reported as such).
 
 ### Pipeline (one client request)

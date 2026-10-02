@@ -2,7 +2,7 @@
 //!
 //! Server → client, JSON text frames `{"type": …, "data": …}`:
 //!
-//! * `hello` — once, first: `{version, topics, server_time}`;
+//! * `hello` — once, first: `{version, topics, server_time, started_at}`;
 //! * every event of the telemetry bus as `Event::to_frame` renders it:
 //!   `request.started`, `request.finished`, `log`, `credential`,
 //!   `config.reloaded`;
@@ -227,10 +227,14 @@ async fn serve(state: &AdminState, mut socket: WebSocket, context: AuthContext) 
     let mut events = gateway.telemetry().subscribe();
     let mut subscription = Subscription::default();
 
+    // `started_at` tells a reconnecting client whether it is talking to the
+    // process it knew: after a restart, log sequence numbers and the totals
+    // since start begin again.
     let hello = json!({
         "version": Gateway::version(),
         "topics": all_topics(),
         "server_time": now_unix_ms(),
+        "started_at": gateway.telemetry().gauges().started_at(),
     });
     if !send(&mut socket, frame(HELLO, hello)).await {
         return;

@@ -19,14 +19,22 @@ pub enum ConfigStoreError {
     /// A typed edit was refused by its own closure, or its result cannot be
     /// written as TOML.
     Edit(String),
+    /// An edit ([`ConfigStore::update`](crate::ConfigStore::update)) was
+    /// refused because the file on disk holds content that is not the live
+    /// configuration and is not valid — a manual edit in progress, or one
+    /// that was rejected. Writing the edit would overwrite that content from
+    /// the last valid configuration. The issues are those of the file on
+    /// disk, not of the edit; nothing was written.
+    DiskInvalid(Vec<ConfigIssue>),
 }
 
 impl ConfigStoreError {
-    /// The validation issues behind this error; empty unless it is
-    /// [`ConfigStoreError::Invalid`].
+    /// The validation issues behind this error: of the configuration that
+    /// was refused ([`ConfigStoreError::Invalid`]) or of the file on disk
+    /// ([`ConfigStoreError::DiskInvalid`]); empty otherwise.
     pub fn issues(&self) -> &[ConfigIssue] {
         match self {
-            ConfigStoreError::Invalid(issues) => issues,
+            ConfigStoreError::Invalid(issues) | ConfigStoreError::DiskInvalid(issues) => issues,
             _ => &[],
         }
     }
@@ -54,6 +62,17 @@ impl fmt::Display for ConfigStoreError {
                 Ok(())
             }
             ConfigStoreError::Edit(message) => f.write_str(message),
+            ConfigStoreError::DiskInvalid(issues) => {
+                f.write_str(
+                    "the configuration file on disk is not valid and was not overwritten; \
+                     fix or restore the file, or replace it through the raw editor",
+                )?;
+                for (i, issue) in issues.iter().enumerate() {
+                    f.write_str(if i == 0 { ": " } else { "; " })?;
+                    write!(f, "{issue}")?;
+                }
+                Ok(())
+            }
         }
     }
 }
@@ -89,6 +108,21 @@ mod tests {
              providers[0].name: must not be empty"
         );
         assert_eq!(err.issues().len(), 2);
+    }
+
+    #[test]
+    fn disk_invalid_says_what_to_do_and_lists_the_files_issues() {
+        let err = ConfigStoreError::DiskInvalid(vec![ConfigIssue {
+            path: "line 2, column 8".into(),
+            message: "invalid TOML".into(),
+        }]);
+        assert_eq!(
+            err.to_string(),
+            "the configuration file on disk is not valid and was not overwritten; fix or \
+             restore the file, or replace it through the raw editor: line 2, column 8: \
+             invalid TOML"
+        );
+        assert_eq!(err.issues().len(), 1);
     }
 
     #[test]

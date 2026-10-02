@@ -284,6 +284,92 @@ mod tests {
         }
     }
 
+    /// Unix seconds (midnight UTC) of the release date a model id ends in,
+    /// `-YYYYMMDD` or `-YYYY-MM-DD`.
+    fn date_in_id(id: &str) -> Option<i64> {
+        let bytes = id.as_bytes();
+        let at = |back: usize| bytes.len().checked_sub(back).map(|i| bytes[i]);
+        let dashed = at(11) == Some(b'-') && at(6) == Some(b'-') && at(3) == Some(b'-');
+        let tail = if dashed {
+            &bytes[bytes.len() - 10..]
+        } else if at(9) == Some(b'-') {
+            &bytes[bytes.len() - 8..]
+        } else {
+            return None;
+        };
+        let digits: String = tail
+            .iter()
+            .filter(|b| **b != b'-')
+            .map(|b| char::from(*b))
+            .collect();
+        if digits.len() != 8 || !digits.bytes().all(|b| b.is_ascii_digit()) {
+            return None;
+        }
+        let (year, month, day): (i64, i64, i64) = (
+            digits[..4].parse().ok()?,
+            digits[4..6].parse().ok()?,
+            digits[6..].parse().ok()?,
+        );
+        if !(2000..2100).contains(&year) || !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+            return None;
+        }
+        // Days since 1970-01-01 of a civil date (proleptic Gregorian).
+        let y = if month <= 2 { year - 1 } else { year };
+        let era = y.div_euclid(400);
+        let year_of_era = y.rem_euclid(400);
+        let day_of_year = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+        let day_of_era = year_of_era * 365 + year_of_era / 4 - year_of_era / 100 + day_of_year;
+        Some((era * 146_097 + day_of_era - 719_468) * 86_400)
+    }
+
+    /// Regression: `claude-3-7-sonnet-20250219` (and three more) carried a
+    /// `created` a year before the date in their own id.
+    #[test]
+    fn created_agrees_with_the_date_in_a_dated_id() {
+        assert_eq!(
+            date_in_id("claude-3-7-sonnet-20250219"),
+            Some(1_739_923_200)
+        );
+        assert_eq!(date_in_id("gpt-5-2025-08-07"), Some(1_754_524_800));
+        assert_eq!(date_in_id("claude-haiku-4-5-20251001"), Some(1_759_276_800));
+        for undated in [
+            "gpt-5.5",
+            "gemini-2.5-flash-001",
+            "gpt-4-0613",
+            "x-99999999",
+        ] {
+            assert_eq!(date_in_id(undated), None, "{undated}");
+        }
+
+        const TOLERANCE_SECS: i64 = 60 * 24 * 3600;
+        let mut dated = 0;
+        for entry in catalog().entries() {
+            let Some(released) = date_in_id(&entry.info.id) else {
+                continue;
+            };
+            dated += 1;
+            let created = entry
+                .info
+                .created
+                .unwrap_or_else(|| panic!("{} has no `created`", entry.info.id));
+            assert!(
+                (created - released).abs() <= TOLERANCE_SECS,
+                "{}: created {created} is {} days from the date in the id",
+                entry.info.id,
+                (created - released) / 86_400
+            );
+        }
+        // The check is not vacuous.
+        assert!(dated >= 8, "{dated} dated ids");
+        assert_eq!(
+            catalog()
+                .lookup("claude-3-7-sonnet-20250219")
+                .unwrap()
+                .created,
+            Some(1_739_923_200)
+        );
+    }
+
     #[test]
     fn catalog_contains_only_the_three_api_families() {
         let c = catalog();

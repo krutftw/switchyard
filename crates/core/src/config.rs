@@ -536,10 +536,6 @@ pub struct ProviderConfig {
     /// for servers that reject `stream_options`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stream_usage: Option<bool>,
-    /// `openai` only: when a client connects over WebSocket, relay to the
-    /// upstream's Responses WebSocket endpoint instead of HTTP streaming.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub websocket: bool,
     /// `vertex` only: Google Cloud project id. Defaults to the service
     /// account's project.
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -569,7 +565,6 @@ impl ProviderConfig {
             wire_api: WireApi::Auto,
             legacy_max_tokens: None,
             stream_usage: None,
-            websocket: false,
             project: String::new(),
             location: String::new(),
         }
@@ -915,6 +910,26 @@ impl Config {
         }
         if self.server.host.trim().is_empty() {
             issue("server.host".into(), "must not be empty");
+        } else if !is_valid_host(self.server.host.trim()) {
+            issue(
+                "server.host".into(),
+                "must be an IP address or a host name, such as 127.0.0.1, 0.0.0.0, :: or localhost",
+            );
+        }
+        if self.server.data_dir.trim().is_empty() {
+            issue("server.data_dir".into(), "must not be empty");
+        }
+        if is_empty_reference(&self.admin.secret) {
+            issue(
+                "admin.secret".into(),
+                "names no environment variable after `env:`",
+            );
+        }
+        if self.routing.cooldown.rate_limit_max_secs < self.routing.cooldown.rate_limit_base_secs {
+            issue(
+                "routing.cooldown.rate_limit_max_secs".into(),
+                "must not be smaller than rate_limit_base_secs",
+            );
         }
         if self.server.body_limit_mb == 0 {
             issue("server.body_limit_mb".into(), "must be at least 1");
@@ -951,8 +966,19 @@ impl Config {
             let k = key.key.trim();
             if k.is_empty() {
                 issue(format!("auth.keys[{i}].key"), "must not be empty");
+            } else if is_empty_reference(k) {
+                issue(
+                    format!("auth.keys[{i}].key"),
+                    "names no environment variable after `env:`",
+                );
             } else if !seen_keys.insert(k.to_string()) {
                 issue(format!("auth.keys[{i}].key"), "duplicate key");
+            }
+            if key.rate_limit_rpm == Some(0) {
+                issue(
+                    format!("auth.keys[{i}].rate_limit_rpm"),
+                    "must be at least 1; leave it out for no limit",
+                );
             }
         }
 
@@ -998,10 +1024,30 @@ impl Config {
                     issue(label, msg);
                 }
             }
+            for (name, value) in &p.headers {
+                if !is_valid_header_name(name.trim()) {
+                    issue(
+                        format!("{path}.headers.{name}"),
+                        "is not a valid header name: use letters, digits and `-`, without spaces",
+                    );
+                } else if value.trim().is_empty() {
+                    issue(format!("{path}.headers.{name}"), "needs a value");
+                } else if value.chars().any(|c| c.is_control()) {
+                    issue(
+                        format!("{path}.headers.{name}"),
+                        "must not contain control characters or line breaks",
+                    );
+                }
+            }
             let mut seen_secrets = HashSet::new();
             for (j, k) in p.api_keys.iter().enumerate() {
                 let k = k.trim();
-                if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
+                if is_empty_reference(k) {
+                    issue(
+                        format!("{path}.api_keys[{j}]"),
+                        "names no environment variable after `env:`",
+                    );
+                } else if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
                     issue(
                         format!("{path}.api_keys[{j}]"),
                         "the same key is listed twice",
@@ -1010,7 +1056,12 @@ impl Config {
             }
             for (j, c) in p.credentials.iter().enumerate() {
                 let k = c.api_key.trim();
-                if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
+                if is_empty_reference(k) {
+                    issue(
+                        format!("{path}.credentials[{j}].api_key"),
+                        "names no environment variable after `env:`",
+                    );
+                } else if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
                     issue(
                         format!("{path}.credentials[{j}].api_key"),
                         "the same key is listed twice",
@@ -1052,6 +1103,15 @@ impl Config {
                         "duplicate client-facing model name within this provider",
                     );
                 }
+                if let Some(t) = &m.thinking
+                    && t.max > 0
+                    && t.min > t.max
+                {
+                    issue(
+                        format!("{path}.models[{j}].thinking"),
+                        "`min` must not be larger than `max`",
+                    );
+                }
             }
         }
 
@@ -1064,20 +1124,42 @@ impl Config {
             let name = a.name.trim();
             if name.is_empty() {
                 issue(format!("aliases[{i}].name"), "must not be empty");
+            } else if name != a.name {
+                issue(
+                    format!("aliases[{i}].name"),
+                    "must not start or end with a space",
+                );
+            } else if name.chars().any(char::is_whitespace) {
+                issue(
+                    format!("aliases[{i}].name"),
+                    "must not contain spaces: clients send it as a model name",
+                );
+            } else if crate::reasoning::parse_model_suffix(name).depth.is_some() {
+                issue(
+                    format!("aliases[{i}].name"),
+                    "must not end with a reasoning suffix such as `(high)`: clients add that themselves",
+                );
             } else if !seen_aliases.insert(name.to_ascii_lowercase()) {
                 issue(format!("aliases[{i}].name"), "duplicate alias");
             }
-            if a.targets.iter().all(|t| t.trim().is_empty()) {
+            if a.targets.is_empty() {
                 issue(format!("aliases[{i}].targets"), "needs at least one target");
             }
-            if a.targets
-                .iter()
-                .any(|t| t.trim().eq_ignore_ascii_case(name))
-            {
-                issue(
-                    format!("aliases[{i}].targets"),
-                    "an alias cannot target itself",
-                );
+            for (j, t) in a.targets.iter().enumerate() {
+                let target = t.trim();
+                if target.is_empty() {
+                    issue(format!("aliases[{i}].targets[{j}]"), "must not be empty");
+                } else if target != t {
+                    issue(
+                        format!("aliases[{i}].targets[{j}]"),
+                        "must not start or end with a space",
+                    );
+                } else if !name.is_empty() && target.eq_ignore_ascii_case(name) {
+                    issue(
+                        format!("aliases[{i}].targets[{j}]"),
+                        "an alias cannot target itself",
+                    );
+                }
             }
         }
 
@@ -1107,8 +1189,12 @@ impl Config {
             if p.model.trim().is_empty() {
                 issue(format!("pricing[{i}].model"), "must not be empty");
             }
-            if p.input < 0.0 || p.output < 0.0 {
-                issue(format!("pricing[{i}]"), "prices must not be negative");
+            let prices = [Some(p.input), Some(p.output), p.cache_read, p.cache_write];
+            if prices.iter().flatten().any(|v| !v.is_finite() || *v < 0.0) {
+                issue(
+                    format!("pricing[{i}]"),
+                    "prices must be numbers of 0 or more",
+                );
             }
         }
 
@@ -1162,6 +1248,67 @@ pub fn parse_proxy(value: &str) -> Result<ProxySetting, &'static str> {
 
 fn validate_proxy(value: &str) -> Result<(), &'static str> {
     parse_proxy(value).map(|_| ())
+}
+
+/// Whether `host` can be bound: an IP address (v4 or v6, optionally in
+/// brackets) or a DNS host name.
+fn is_valid_host(host: &str) -> bool {
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    if bare.parse::<std::net::IpAddr>().is_ok() {
+        return true;
+    }
+    if host.is_empty() || host.len() > 253 {
+        return false;
+    }
+    host.split('.').all(|label| {
+        !label.is_empty()
+            && label.len() <= 63
+            && !label.starts_with('-')
+            && !label.ends_with('-')
+            && label
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    })
+}
+
+/// Whether `name` is a valid HTTP header field name (an RFC 9110 token).
+fn is_valid_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || matches!(
+                    c,
+                    '!' | '#'
+                        | '$'
+                        | '%'
+                        | '&'
+                        | '\''
+                        | '*'
+                        | '+'
+                        | '-'
+                        | '.'
+                        | '^'
+                        | '_'
+                        | '`'
+                        | '|'
+                        | '~'
+                )
+        })
+}
+
+/// A secret reference (`env:` / `${}`) that names no variable.
+fn is_empty_reference(value: &str) -> bool {
+    let v = value.trim();
+    match v.strip_prefix("env:") {
+        Some(name) => name.trim().is_empty(),
+        None => v
+            .strip_prefix("${")
+            .and_then(|r| r.strip_suffix('}'))
+            .is_some_and(|name| name.trim().is_empty()),
+    }
 }
 
 /// Resolves a secret value: `env:NAME` and `${NAME}` read the environment
@@ -1394,7 +1541,159 @@ targets = ["loop"]
         assert!(paths.contains(&"providers[1].prefix"));
         assert!(paths.contains(&"providers[1].proxy"));
         assert!(paths.contains(&"providers[1].credentials[0]"));
-        assert!(paths.contains(&"aliases[0].targets"));
+        assert!(paths.contains(&"aliases[0].targets[0]"));
+    }
+
+    fn issue_paths(text: &str) -> Vec<String> {
+        match Config::from_toml(text) {
+            Ok(_) => Vec::new(),
+            Err(ConfigError::Invalid(issues)) => issues.into_iter().map(|i| i.path).collect(),
+            Err(other) => panic!("unexpected parse error: {other}"),
+        }
+    }
+
+    #[test]
+    fn server_and_routing_values_are_checked() {
+        for good in [
+            "127.0.0.1",
+            "0.0.0.0",
+            "::",
+            "::1",
+            "[::1]",
+            "localhost",
+            "gw.internal",
+        ] {
+            assert!(
+                issue_paths(&format!("[server]\nhost = \"{good}\"\n")).is_empty(),
+                "{good} should be accepted"
+            );
+        }
+        for bad in ["not a host", "http://x", "a..b", "-x", "host:8317", ""] {
+            assert_eq!(
+                issue_paths(&format!("[server]\nhost = \"{bad}\"\n")),
+                vec!["server.host".to_string()],
+                "{bad:?} should be refused"
+            );
+        }
+        assert_eq!(
+            issue_paths("[server]\ndata_dir = \" \"\n"),
+            vec!["server.data_dir".to_string()]
+        );
+        assert_eq!(
+            issue_paths(
+                "[routing.cooldown]\nrate_limit_base_secs = 100\nrate_limit_max_secs = 10\n"
+            ),
+            vec!["routing.cooldown.rate_limit_max_secs".to_string()]
+        );
+    }
+
+    #[test]
+    fn secret_references_need_a_variable_name() {
+        assert_eq!(
+            issue_paths("[admin]\nsecret = \"env:\"\n"),
+            vec!["admin.secret".to_string()]
+        );
+        assert_eq!(
+            issue_paths("[[auth.keys]]\nkey = \"${ }\"\n"),
+            vec!["auth.keys[0].key".to_string()]
+        );
+        let text = "[[providers]]\nname = \"a\"\nkind = \"anthropic\"\napi_keys = [\"env:\"]\n\n[[providers.credentials]]\napi_key = \"${}\"\n";
+        assert_eq!(
+            issue_paths(text),
+            vec![
+                "providers[0].api_keys[0]".to_string(),
+                "providers[0].credentials[0].api_key".to_string()
+            ]
+        );
+        assert!(issue_paths("[admin]\nsecret = \"env:REAL_NAME\"\n").is_empty());
+    }
+
+    #[test]
+    fn client_key_rate_limit_of_zero_is_refused() {
+        assert_eq!(
+            issue_paths("[[auth.keys]]\nkey = \"sy-x\"\nrate_limit_rpm = 0\n"),
+            vec!["auth.keys[0].rate_limit_rpm".to_string()]
+        );
+        assert!(issue_paths("[[auth.keys]]\nkey = \"sy-x\"\nrate_limit_rpm = 1\n").is_empty());
+    }
+
+    #[test]
+    fn provider_headers_and_thinking_ranges_are_checked() {
+        let base = "[[providers]]\nname = \"a\"\nkind = \"mock\"\n";
+        assert_eq!(
+            issue_paths(&format!("{base}headers = {{ \"bad header\" = \"x\" }}\n")),
+            vec!["providers[0].headers.bad header".to_string()]
+        );
+        assert_eq!(
+            issue_paths(&format!("{base}headers = {{ \"X-Empty\" = \" \" }}\n")),
+            vec!["providers[0].headers.X-Empty".to_string()]
+        );
+        assert_eq!(
+            issue_paths(&format!(
+                "{base}headers = {{ \"X-Split\" = \"a\\r\\nb\" }}\n"
+            )),
+            vec!["providers[0].headers.X-Split".to_string()]
+        );
+        assert!(
+            issue_paths(&format!("{base}headers = {{ \"X-Title\" = \"my app\" }}\n")).is_empty()
+        );
+        assert_eq!(
+            issue_paths(&format!(
+                "{base}\n[[providers.models]]\nid = \"m\"\nthinking = {{ min = 5000, max = 100 }}\n"
+            )),
+            vec!["providers[0].models[0].thinking".to_string()]
+        );
+    }
+
+    #[test]
+    fn alias_names_and_targets_are_checked() {
+        let alias = |name: &str, targets: &str| {
+            issue_paths(&format!(
+                "[[aliases]]\nname = \"{name}\"\ntargets = {targets}\n"
+            ))
+        };
+        assert!(alias("smart", "[\"a\", \"b(high)\"]").is_empty());
+        assert_eq!(
+            alias(" padded", "[\"a\"]"),
+            vec!["aliases[0].name".to_string()]
+        );
+        assert_eq!(
+            alias("has space", "[\"a\"]"),
+            vec!["aliases[0].name".to_string()]
+        );
+        assert_eq!(
+            alias("fast(high)", "[\"a\"]"),
+            vec!["aliases[0].name".to_string()]
+        );
+        // A parenthesised part that is not a reasoning suffix is just a name.
+        assert!(alias("fast(v2)", "[\"a\"]").is_empty());
+        assert_eq!(alias("x", "[]"), vec!["aliases[0].targets".to_string()]);
+        assert_eq!(
+            alias("x", "[\"a\", \"\", \" b \", \"X\"]"),
+            vec![
+                "aliases[0].targets[1]".to_string(),
+                "aliases[0].targets[2]".to_string(),
+                "aliases[0].targets[3]".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn prices_must_be_finite_and_not_negative() {
+        let price = |body: &str| issue_paths(&format!("[[pricing]]\nmodel = \"m\"\n{body}"));
+        assert!(price("input = 1.0\noutput = 2.0\ncache_read = 0.0\n").is_empty());
+        assert_eq!(
+            price("input = nan\noutput = 1.0\n"),
+            vec!["pricing[0]".to_string()]
+        );
+        assert_eq!(
+            price("input = 1.0\noutput = inf\n"),
+            vec!["pricing[0]".to_string()]
+        );
+        assert_eq!(
+            price("input = 1.0\noutput = 1.0\ncache_write = -0.5\n"),
+            vec!["pricing[0]".to_string()]
+        );
     }
 
     #[test]

@@ -12,6 +12,7 @@ pub(crate) mod status;
 pub(crate) mod usage;
 
 use crate::error::ApiFailure;
+use crate::shape;
 use axum::extract::{FromRequest, FromRequestParts, Path, Query, Request};
 use bytes::Bytes;
 use http::StatusCode;
@@ -51,9 +52,7 @@ pub(crate) fn parse_json<T: DeserializeOwned>(bytes: &[u8]) -> Result<T, ApiFail
     }
     let mut deserializer = serde_json::Deserializer::from_slice(bytes);
     let value = serde_path_to_error::deserialize(&mut deserializer).map_err(schema_error)?;
-    deserializer.end().map_err(|error| {
-        ApiFailure::bad_request(format!("the request body is not valid JSON: {error}"))
-    })?;
+    deserializer.end().map_err(|error| not_json(&error))?;
     Ok(value)
 }
 
@@ -65,29 +64,41 @@ pub(crate) fn from_json_value<T: DeserializeOwned>(
 ) -> Result<T, ConfigIssue> {
     serde_path_to_error::deserialize(value).map_err(|error| {
         let path = error.path().to_string();
-        let path = match (root.is_empty(), path.as_str()) {
-            (_, "." | "") => root.to_string(),
-            (true, _) => path,
-            (false, _) => format!("{root}.{path}"),
+        let mut issue = shape::describe(&path, &error.into_inner().to_string());
+        issue.path = match (root.is_empty(), issue.path.is_empty()) {
+            (_, true) => root.to_string(),
+            (true, false) => issue.path,
+            (false, false) => format!("{root}.{}", issue.path),
         };
-        ConfigIssue {
-            path,
-            message: error.into_inner().to_string(),
-        }
+        issue
     })
+}
+
+/// The 400 for a body that is not JSON at all.
+fn not_json(error: &serde_json::Error) -> ApiFailure {
+    ApiFailure::bad_request(format!(
+        "the request body is not valid JSON: {}",
+        shape::syntax(error)
+    ))
+}
+
+/// The 400 for a body of the wrong shape: the field when one can be named,
+/// and what is expected of it (see [`shape::describe`]).
+pub(crate) fn shape_failure(issue: ConfigIssue) -> ApiFailure {
+    if issue.path.is_empty() {
+        ApiFailure::bad_request(format!("invalid request body: {}", issue.message))
+    } else {
+        ApiFailure::bad_field(issue.path, issue.message)
+    }
 }
 
 fn schema_error(error: serde_path_to_error::Error<serde_json::Error>) -> ApiFailure {
     let path = error.path().to_string();
     let inner = error.into_inner();
     if inner.is_syntax() || inner.is_eof() {
-        return ApiFailure::bad_request(format!("the request body is not valid JSON: {inner}"));
+        return not_json(&inner);
     }
-    if path == "." || path.is_empty() {
-        ApiFailure::bad_request(format!("invalid request body: {inner}"))
-    } else {
-        ApiFailure::bad_field(path, inner.to_string())
-    }
+    shape_failure(shape::describe(&path, &inner.to_string()))
 }
 
 /// A JSON request body. The `Content-Type` header is not required: the
@@ -139,7 +150,18 @@ where
     async fn from_request_parts(parts: &mut Parts, _state: &S) -> Result<Self, Self::Rejection> {
         Query::<T>::try_from_uri(&parts.uri)
             .map(|Query(value)| Params(value))
-            .map_err(|error| ApiFailure::bad_request(format!("invalid query string: {error}")))
+            .map_err(|error| {
+                // The rejection wraps the same kind of serde message a body
+                // error has; its own lead-in says nothing an operator needs.
+                let text = error.body_text();
+                let said = text
+                    .strip_prefix("Failed to deserialize query string: ")
+                    .unwrap_or(&text);
+                ApiFailure::bad_request(format!(
+                    "invalid query string: {}",
+                    shape::describe("", said).message
+                ))
+            })
     }
 }
 
@@ -219,33 +241,63 @@ mod tests {
             trailing.message
         );
 
+        // No parser position in the serde style, no Rust type name.
+        for failure in [&syntax, &trailing] {
+            assert!(
+                !failure.message.contains(" at line "),
+                "{}",
+                failure.message
+            );
+            assert!(
+                failure.message.contains("line 1, column "),
+                "{}",
+                failure.message
+            );
+        }
+
         let wrong = parse_json::<Sample>(br#"{"name":"a","nested":{"count":"x"}}"#).unwrap_err();
         assert_eq!(wrong.status, StatusCode::BAD_REQUEST);
         assert_eq!(wrong.issues.len(), 1);
         assert_eq!(wrong.issues[0].path, "nested.count");
+        assert_eq!(
+            wrong.message,
+            "invalid request: nested.count: expected a whole number from 0 to 255, got a string"
+        );
 
         let missing = parse_json::<Sample>(br#"{}"#).unwrap_err();
-        assert!(
-            missing.message.contains("missing field `name`"),
-            "{}",
-            missing.message
-        );
+        assert_eq!(missing.message, "invalid request: name: is required");
+        assert_eq!(missing.issues[0].path, "name");
 
         let unknown = parse_json::<Sample>(br#"{"name":"a","extra":1}"#).unwrap_err();
-        assert!(
-            unknown.message.contains("unknown field `extra`"),
-            "{}",
-            unknown.message
+        assert_eq!(
+            unknown.message,
+            "invalid request: extra: unknown field `extra`"
         );
+        assert_eq!(unknown.issues[0].path, "extra");
+
+        // The body as a whole has no field to name.
+        let whole = parse_json::<Sample>(br#""just text""#).unwrap_err();
+        assert_eq!(
+            whole.message,
+            "invalid request body: expected an object, got a string"
+        );
+        assert!(whole.issues.is_empty());
     }
 
     #[test]
     fn value_conversion_prefixes_the_section() {
         let issue = from_json_value::<Nested>(json!({"count": -1}), "routing").unwrap_err();
         assert_eq!(issue.path, "routing.count");
+        assert_eq!(issue.message, "must be a whole number from 0 to 255");
         let issue = from_json_value::<Nested>(json!("fast"), "routing").unwrap_err();
         assert_eq!(issue.path, "routing");
+        assert_eq!(issue.message, "expected an object, got a string");
         let issue = from_json_value::<Nested>(json!({"count": 999}), "").unwrap_err();
         assert_eq!(issue.path, "count");
+        let issue = from_json_value::<Nested>(json!({"cuont": 1}), "routing").unwrap_err();
+        assert_eq!(
+            (issue.path.as_str(), issue.message.as_str()),
+            ("routing.cuont", "unknown field `cuont`")
+        );
     }
 }

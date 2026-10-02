@@ -1,17 +1,18 @@
 //! The [`Gateway`] handle: construction, accessors, background work.
 
 use crate::auth::{ClientIdentity, KeyTable};
+use crate::ops::Discoveries;
 use crate::reply::{Served, error_reply};
 use crate::summary::SummaryRefusals;
 use crate::types::{
-    ClientRequest, FullReply, GatewayOptions, PresentedCredentials, ProviderTest, RawRequest,
-    Reply, StartError, WsOpenRequest,
+    ClientRequest, DiscoveryState, FullReply, GatewayOptions, PresentedCredentials, ProviderTest,
+    RawRequest, Reply, StartError, WsOpenRequest,
 };
 use crate::ws::UpstreamWsSession;
 use arc_swap::ArcSwap;
 use parking_lot::Mutex;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
 use std::time::{Duration, SystemTime};
@@ -57,10 +58,17 @@ pub(crate) struct Inner {
     /// Parsed service-account key files, by resolved path. Cleared when the
     /// configuration changes, so an edited file is read again.
     pub(crate) service_accounts: Mutex<HashMap<PathBuf, Arc<ServiceAccount>>>,
+    /// The credentials (by id) that the check of the service-account files
+    /// has marked unusable in the scheduler, so that a mark can be taken
+    /// off once its credential names no file any more. The lock is held
+    /// for the length of a check, which makes checks run one at a time.
+    file_marks: tokio::sync::Mutex<HashSet<String>>,
     /// Providers (and single models of providers) whose upstream refused
     /// to generate reasoning summaries, under the configuration in effect.
     /// Started afresh when the configuration changes.
     pub(crate) summary_refusals: SummaryRefusals,
+    /// Where the discovery of each provider's model list stands.
+    pub(crate) discoveries: Discoveries,
     log_level_hook: Mutex<Option<LogLevelHook>>,
     started_at: SystemTime,
     shutdown: CancellationToken,
@@ -123,9 +131,6 @@ impl Gateway {
         telemetry.spawn_background(&handle);
 
         let scheduler = Arc::new(Scheduler::new(&config, &resolve_secret));
-        for warning in scheduler.warnings() {
-            tracing::warn!("configuration: {warning}");
-        }
         let upstream =
             UpstreamClient::new().map_err(|error| StartError::Upstream(error.info.message))?;
         let reasoning = ReasoningStore::new(REASONING_STORE_ENTRIES, REASONING_STORE_TTL)
@@ -148,13 +153,24 @@ impl Gateway {
             reasoning,
             keys: ArcSwap::from_pointee(keys),
             service_accounts: Mutex::new(HashMap::new()),
+            file_marks: tokio::sync::Mutex::new(HashSet::new()),
             summary_refusals: SummaryRefusals::new(Arc::clone(&config)),
+            discoveries: Discoveries::default(),
             log_level_hook: Mutex::new(None),
             started_at: SystemTime::now(),
             shutdown: CancellationToken::new(),
             tasks: Mutex::new(Vec::new()),
         });
-        inner.register_mock_models(&config);
+        // All mock providers in one go: the model table is derived once.
+        inner
+            .scheduler
+            .set_discovered_many(mock_model_lists(&config));
+        inner.check_service_accounts(&config).await;
+        // Once everything that decides them is in place: the mock models
+        // (an alias may target one) and the state of the key files.
+        for warning in inner.scheduler.warnings() {
+            tracing::warn!("configuration: {warning}");
+        }
 
         let follower = handle.spawn(follow_config(
             Arc::downgrade(&inner),
@@ -163,7 +179,7 @@ impl Gateway {
             inner.shutdown.clone(),
         ));
         inner.tasks.lock().push(follower);
-        inner.spawn_discovery(config);
+        inner.spawn_discovery(None, config);
 
         Ok(Gateway { inner })
     }
@@ -343,9 +359,31 @@ impl Gateway {
     }
 
     /// Asks `provider`'s upstream for its model list now, feeds it to the
-    /// scheduler and returns it.
+    /// scheduler and returns it. The outcome also becomes the provider's
+    /// [discovery state](Gateway::discovery_states), unless that is `off`.
     pub async fn discover(&self, provider: &str) -> Result<Vec<ModelInfo>, ApiError> {
         self.inner.discover(provider).await
+    }
+
+    /// Where the discovery of each provider's model list stands, by
+    /// provider name. Every provider of the configuration in effect has an
+    /// entry.
+    ///
+    /// Discovery runs in the background at start and, after a configuration
+    /// change, only for the providers whose discovery-relevant settings
+    /// changed: a new provider, another `kind`, `base_url`, `api_keys`,
+    /// `credentials`, `proxy` (the provider's or `upstream.proxy`),
+    /// `headers`, `project` or `location`, and a provider that wants
+    /// discovery now and did not before (enabled, `discover` switched on,
+    /// its `models` list emptied). A configuration applied without any
+    /// change — a manual reload — asks every provider that wants discovery
+    /// again.
+    ///
+    /// Until a listing has answered, the state is `pending`; a listing that
+    /// fails keeps the list of the last success in use and says why it
+    /// failed, with credentials removed.
+    pub fn discovery_states(&self) -> HashMap<String, DiscoveryState> {
+        self.inner.discoveries.states()
     }
 
     /// Renders any error in a protocol's envelope: status, body and the
@@ -430,22 +468,94 @@ impl Inner {
         }
     }
 
-    /// Gives every mock provider its built-in model list.
-    fn register_mock_models(&self, config: &Config) {
-        for provider in &config.providers {
-            if provider.kind == ProviderKind::Mock && provider.enabled {
-                self.scheduler.set_discovered(&provider.name, mock_models());
-            }
+    /// Marks every credential whose service-account file is missing or is
+    /// not a usable key file as unusable, with the reason, and takes the
+    /// mark off those whose file is fine (again) — and off those that no
+    /// longer name a file at all.
+    ///
+    /// Without this such a credential looks ready until the first request
+    /// fails on it. The reason names the file and what is wrong with it,
+    /// never anything the file holds. The check runs when a configuration
+    /// is applied, and before the two things an operator does to see
+    /// whether a provider works — a provider test and a model listing on
+    /// request — so a file repaired afterwards is noticed by the next
+    /// configuration change, reload, test or listing.
+    ///
+    /// The scheduler keeps a mark for as long as the credential's id stays
+    /// the same, and the id of a credential with an API key comes from the
+    /// key, not from the file. So the marks this check has set are
+    /// remembered here, and one whose credential has stopped naming a file
+    /// is taken off; left alone it would keep the credential out of use,
+    /// for a file it no longer refers to, until the gateway is restarted.
+    pub(crate) async fn check_service_accounts(&self, config: &Config) {
+        // One check at a time, each from start to end: a check that began
+        // under an earlier configuration must not put a mark back after
+        // the check of the configuration that replaced it took it off.
+        // (The check that follows a rebuild always runs after any that
+        // began before it.)
+        let mut marked = self.file_marks.lock().await;
+        let any_file = config.providers.iter().any(|provider| {
+            provider
+                .credentials
+                .iter()
+                .any(|credential| !credential.service_account_file.trim().is_empty())
+        });
+        // The usual case, and with hundreds of providers the cheap one: no
+        // credential names a file and no mark stands.
+        if !any_file && marked.is_empty() {
+            return;
         }
+        // Every credential, the unusable ones included: the snapshot lists
+        // them all, the scheduler's selection would leave marked ones out.
+        let ids: Vec<String> = self
+            .scheduler
+            .snapshot()
+            .into_iter()
+            .flat_map(|provider| provider.credentials)
+            .map(|credential| credential.id)
+            .collect();
+        let mut standing = HashSet::new();
+        for id in ids {
+            let Some(view) = self.scheduler.credential(&id) else {
+                continue;
+            };
+            let file = view.service_account_file.trim();
+            let reason = if file.is_empty() {
+                if !marked.contains(&id) {
+                    continue;
+                }
+                None
+            } else {
+                match self.service_account(file).await {
+                    Ok(_) => None,
+                    Err(error) => Some(error.info.message),
+                }
+            };
+            if reason.is_some() {
+                standing.insert(id.clone());
+            }
+            // Logged by whoever applies the configuration, with the
+            // scheduler's other warnings.
+            self.scheduler.set_unusable(&id, reason);
+        }
+        // Marks of credentials that are gone went with their state.
+        *marked = standing;
     }
 
     /// Applies a configuration the store published.
-    fn apply_config(self: &Arc<Self>, config: Arc<Config>) {
-        // Discovered model lists are kept by the scheduler for providers
-        // whose endpoint did not change.
+    async fn apply_config(self: &Arc<Self>, config: Arc<Config>) {
+        let replaced = self.scheduler.config();
+        // One rebuild for everything: the mock providers' built-in lists go
+        // in with the configuration (handing them over one provider at a
+        // time derived the model table once per mock provider), and
+        // discovered lists are kept by the scheduler for providers whose
+        // endpoint did not change.
         self.scheduler
-            .rebuild(&config, &resolve_secret, HashMap::new());
-        self.register_mock_models(&config);
+            .rebuild(&config, &resolve_secret, mock_model_lists(&config));
+        // A service-account file may have been replaced along with the
+        // configuration that names it.
+        self.service_accounts.lock().clear();
+        self.check_service_accounts(&config).await;
         for warning in self.scheduler.warnings() {
             tracing::warn!("configuration: {warning}");
         }
@@ -458,13 +568,10 @@ impl Inner {
         )));
 
         self.telemetry.reconfigure(&config.usage, &config.logging);
-        // A service-account file may have been replaced along with the
-        // configuration that names it.
-        self.service_accounts.lock().clear();
-        // So may a key have been: another organisation may well be allowed
-        // the reasoning summaries the previous one was refused. Requests
-        // still running under an earlier configuration add nothing to what
-        // is known from here on.
+        // A key may have been replaced: another organisation may well be
+        // allowed the reasoning summaries the previous one was refused.
+        // Requests still running under an earlier configuration add nothing
+        // to what is known from here on.
         self.summary_refusals.reset(Arc::clone(&config));
 
         let hook = self.log_level_hook.lock().clone();
@@ -472,17 +579,23 @@ impl Inner {
             hook(config.logging.level.trim());
         }
 
-        self.telemetry.publish(Event::ConfigReloaded {
-            at: now_unix_ms(),
-            ok: true,
-            message: "configuration applied".to_string(),
-        });
+        self.config_applied();
         tracing::info!(
             providers = config.providers.len(),
             client_keys = config.auth.keys.len(),
             "configuration applied"
         );
-        self.spawn_discovery(config);
+        self.spawn_discovery(Some(&replaced), config);
+    }
+
+    /// Tells the live dashboard that the configuration in effect is the
+    /// one the store took last: `config.reloaded` with `ok: true`.
+    fn config_applied(&self) {
+        self.telemetry.publish(Event::ConfigReloaded {
+            at: now_unix_ms(),
+            ok: true,
+            message: "configuration applied".to_string(),
+        });
     }
 
     /// Tells the live dashboard that a configuration was refused (an edit
@@ -507,9 +620,17 @@ impl Inner {
         });
     }
 
-    /// Runs model discovery for `config` in the background.
-    fn spawn_discovery(self: &Arc<Self>, config: Arc<Config>) {
-        if !config.providers.iter().any(wants_discovery) {
+    /// Runs model discovery in the background for the providers of
+    /// `config` that need it: at start (`previous` is `None`) all that want
+    /// discovery, after a configuration change those whose
+    /// discovery-relevant settings changed (see
+    /// [`Gateway::discovery_states`]). The other providers keep their
+    /// lists, and their upstreams are left alone.
+    fn spawn_discovery(self: &Arc<Self>, previous: Option<&Config>, config: Arc<Config>) {
+        let runs = self.discoveries.plan(previous, &config, |provider| {
+            self.scheduler.discovered_models(provider)
+        });
+        if runs.is_empty() {
             return;
         }
         let inner = Arc::clone(self);
@@ -517,10 +638,21 @@ impl Inner {
         tokio::spawn(async move {
             tokio::select! {
                 _ = shutdown.cancelled() => {}
-                _ = inner.discover_all(&config) => {}
+                _ = inner.discover_all(&config, &runs) => {}
             }
         });
     }
+}
+
+/// The built-in model list of every enabled mock provider, by provider
+/// name: what the scheduler is told the mock "upstreams" serve.
+fn mock_model_lists(config: &Config) -> HashMap<String, Vec<ModelInfo>> {
+    config
+        .providers
+        .iter()
+        .filter(|provider| provider.kind == ProviderKind::Mock && provider.enabled)
+        .map(|provider| (provider.name.clone(), mock_models()))
+        .collect()
 }
 
 /// Whether the upstream of `provider` is asked for its model list: enabled,
@@ -534,6 +666,22 @@ pub(crate) fn wants_discovery(provider: &ProviderConfig) -> bool {
 
 /// Applies every configuration the store publishes, and announces every
 /// one it refuses, until the gateway is shut down or dropped.
+///
+/// What is announced (`config.reloaded` with `ok: true` or `ok: false`)
+/// goes out in the order the store decided things, so that the last
+/// announcement is true of the file as it is: a dashboard that was told
+/// "refused" is told "applied" afterwards when the file was put right, and
+/// never the other way round.
+///
+/// The store says what it did on two channels. The verdicts — applied or
+/// refused — come in order on one; the configuration itself is the latest
+/// value of the other, which the store sets *before* it sends the verdict
+/// for it. Two things waiting on two channels have no order between them,
+/// so this task takes its order from the verdicts alone: they are looked at
+/// first, and an `Applied` among them is the moment to apply whatever
+/// configuration is waiting. The configuration channel on its own only
+/// serves the moment between the store setting the value and sending the
+/// verdict, when no verdict is waiting and nothing can be overtaken.
 async fn follow_config(
     inner: Weak<Inner>,
     mut changes: tokio::sync::watch::Receiver<Arc<Config>>,
@@ -541,33 +689,57 @@ async fn follow_config(
     shutdown: CancellationToken,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+    // A refusal was announced and nothing has been announced as applied
+    // since.
+    let mut refused = false;
     loop {
-        tokio::select! {
+        // Whether a configuration is waiting to be applied, and whether the
+        // store said in so many words that it applied one.
+        let (waiting, applied) = tokio::select! {
+            biased;
             _ = shutdown.cancelled() => break,
-            changed = changes.changed() => {
-                if changed.is_err() {
-                    // The store is gone, and the gateway with it.
-                    break;
-                }
-                let config = changes.borrow_and_update().clone();
-                let Some(inner) = inner.upgrade() else {
-                    break;
-                };
-                inner.apply_config(config);
-            }
             verdict = verdicts.recv() => match verdict {
                 Ok(ConfigEvent::Rejected { issues, .. }) => {
                     let Some(inner) = inner.upgrade() else {
                         break;
                     };
                     inner.config_rejected(&issues);
+                    refused = true;
+                    continue;
                 }
-                // Applied configurations arrive through `changes`; a
-                // verdict missed because this task fell behind is not worth
-                // more than the next one.
-                Ok(ConfigEvent::Applied { .. }) | Err(RecvError::Lagged(_)) => {}
+                Ok(ConfigEvent::Applied { .. }) => {
+                    (changes.has_changed().unwrap_or(false), true)
+                }
+                // This task fell far behind and the oldest verdicts are
+                // gone. A configuration applied among them is still waiting
+                // on the other channel, and comes before every verdict that
+                // is left.
+                Err(RecvError::Lagged(_)) => (changes.has_changed().unwrap_or(false), false),
                 Err(RecvError::Closed) => break,
+            },
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    // The store is gone, and the gateway with it.
+                    break;
+                }
+                (true, false)
             }
+        };
+        let Some(inner) = inner.upgrade() else {
+            break;
+        };
+        if waiting {
+            let config = changes.borrow_and_update().clone();
+            inner.apply_config(config).await;
+            refused = false;
+        } else if applied && refused {
+            // The configuration this verdict is about was applied already,
+            // on an earlier verdict that found it waiting — and a refusal
+            // has been announced since. The verdict still says that the
+            // store took the file after refusing it, and that has to be
+            // the last word.
+            inner.config_applied();
+            refused = false;
         }
     }
 }

@@ -11,6 +11,9 @@
 //! same mistake was saved again later, the watcher stayed silent: no event,
 //! no log line, and the dashboard showed nothing while the file on disk was
 //! not in use.
+//!
+//! Since then the return to the live content is itself announced (one
+//! `ConfigEvent::Applied` from the file), which these tests pin as well.
 
 use std::time::Duration;
 use switchyard_config_store::{ConfigEvent, ConfigStore, Source, WatchOptions};
@@ -60,9 +63,15 @@ async fn rejected_again_after_the_file_was_good(native: bool) {
     }
 
     // The edit is undone. The file is byte-identical to the live
-    // configuration again, so nothing is published. Give the watcher ample
-    // time (many debounce and poll periods) to look at the file.
+    // configuration again: nothing changes, but the end of the rejection is
+    // announced, once, so that whoever showed "file refused" can stop. Then
+    // give the watcher ample time (many debounce and poll periods) to look
+    // at the file again: nothing more is published.
     save(&path, GOOD);
+    match next_event(&mut events).await {
+        Some(ConfigEvent::Applied { source, .. }) => assert_eq!(source, Source::File),
+        other => panic!("expected the recovery to be announced, got {other:?}"),
+    }
     let quiet = tokio::time::timeout(Duration::from_millis(500), events.recv()).await;
     assert!(quiet.is_err(), "unexpected event: {quiet:?}");
     assert_eq!(store.current().server.port, 9000);

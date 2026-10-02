@@ -5,9 +5,10 @@
 import { html, useEffect } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
 import { DASH, formatDelta, formatNumber } from '../lib/format.js';
+import { useUid } from '../lib/hooks.js';
 import { Button, CopyButton, IconButton } from './button.js';
 import { Icon } from './icons.js';
-import { StatusLamp } from './status.js';
+import { StatusLamp, toneWord } from './status.js';
 
 // ---------------------------------------------------------------------------
 // Page
@@ -57,18 +58,25 @@ export function Page({ title, description, actions, class: className, children }
  * footer       content of the footer row
  * flush        no body padding: for tables, code and lists that run edge to edge
  *
+ * The section is named by its title for assistive technology (the heading
+ * has an id and the section is aria-labelledby it), so a titled panel is a
+ * region a screen reader can list and jump to. Pass aria-label (or your own
+ * aria-labelledby) to name it differently, or to name a panel with no title.
+ *
  * Do not nest panels. Inside a panel, separate things with a hairline
  * (<hr>) or with space.
  */
 export function Panel({ title, description, actions, footer, flush = false, class: className, children, ...rest }) {
   const hasHead = title != null || actions != null;
+  const titleId = useUid('panel-title');
+  const named = rest['aria-label'] != null || rest['aria-labelledby'] != null;
   return html`
-    <section class=${cx('panel', className)} data-flush=${flush ? '' : undefined} ...${rest}>
+    <section class=${cx('panel', className)} data-flush=${flush ? '' : undefined} aria-labelledby=${title != null && !named ? titleId : undefined} ...${rest}>
       ${hasHead &&
       html`
         <header class="panel-head">
           <div class="panel-head-text">
-            ${title != null && html`<h2 class="panel-title">${title}</h2>`}
+            ${title != null && html`<h2 class="panel-title" id=${titleId}>${title}</h2>`}
             ${description != null && html`<p class="panel-desc">${description}</p>`}
           </div>
           ${actions != null && html`<div class="panel-actions">${actions}</div>`}
@@ -131,9 +139,16 @@ export function Notice({ tone = 'neutral', title, icon, action, class: className
  * hint        quiet text in the footer when there is no delta
  * trend       slot on the right, normally a Sparkline
  * lamp        a lamp tone shown before the label, for stats that are states
+ * lampLabel   what the lamp says, in words ("Degraded", "Above 5%"): its
+ *             accessible name and its tooltip. Without it the lamp is named
+ *             after its tone in a plain word (toneWord: "Warning",
+ *             "Critical"), so the judgement is never carried by colour
+ *             alone. Pass false only when the value or the hint next to it
+ *             already says the same thing in words: the lamp is then
+ *             decoration, hidden from assistive technology.
  * loading     skeleton in place of the value
  */
-export function Stat({ label, value, unit, delta, goodWhen = 'up', deltaLabel, hint, trend, lamp, loading = false, class: className }) {
+export function Stat({ label, value, unit, delta, goodWhen = 'up', deltaLabel, hint, trend, lamp, lampLabel, loading = false, class: className }) {
   let deltaText = null;
   let deltaTone = 'flat';
   let deltaIcon = null;
@@ -148,7 +163,9 @@ export function Stat({ label, value, unit, delta, goodWhen = 'up', deltaLabel, h
   }
   return html`
     <div class=${cx('stat', className)}>
-      <div class="stat-label">${lamp && html`<${StatusLamp} tone=${lamp} title=${lamp} />`}${label}</div>
+      <div class="stat-label">
+        ${lamp && (lampLabel === false ? html`<span class="lamp" data-tone=${lamp} aria-hidden="true"></span>` : html`<${StatusLamp} tone=${lamp} title=${lampLabel || toneWord(lamp)} />`)}${label}
+      </div>
       <div class="stat-main">
         ${loading
           ? html`<${Skeleton} width="96px" height="30px" />`
@@ -169,10 +186,13 @@ export function Stat({ label, value, unit, delta, goodWhen = 'up', deltaLabel, h
 
 /**
  * Stats belong together on one instrument panel, divided by hairlines.
- * html`<${StatGroup}><${Stat} ... /><${Stat} ... /><//>`
+ * html`<${StatGroup} label="Traffic"><${Stat} ... /><${Stat} ... /><//>`
+ *
+ * label   accessible name of the group
+ * Other props (data-*, aria-*, id) go to the group's element.
  */
-export function StatGroup({ class: className, children, label }) {
-  return html`<div class=${cx('stat-group', className)} role="group" aria-label=${label}>${children}</div>`;
+export function StatGroup({ class: className, children, label, ...rest }) {
+  return html`<div class=${cx('stat-group', className)} role="group" aria-label=${label} ...${rest}>${children}</div>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -354,7 +374,9 @@ export function LoadMore({ hasMore, loading = false, onLoad, shown, noun = 'rows
  *     description: a.error,
  *   }))} />`
  *
- * Each item: { tone, title, badges?, time?, description?, key? }.
+ * Each item: { tone, toneLabel?, title, badges?, time?, description?, key? }.
+ * `toneLabel` is what the lamp says in words ("Failed", "Retried"): its
+ * accessible name and tooltip. Default: toneWord(tone).
  */
 export function Timeline({ items, class: className }) {
   return html`
@@ -362,7 +384,7 @@ export function Timeline({ items, class: className }) {
       ${items.map(
         (item, i) => html`
           <li class="timeline-item" key=${item.key ?? i}>
-            <span class="timeline-node"><${StatusLamp} tone=${item.tone || 'off'} title=${item.tone || 'off'} /></span>
+            <span class="timeline-node"><${StatusLamp} tone=${item.tone || 'off'} title=${item.toneLabel || toneWord(item.tone)} /></span>
             <div class="timeline-main">
               <div class="timeline-top">
                 <div class="timeline-title">${item.title}${item.badges}</div>

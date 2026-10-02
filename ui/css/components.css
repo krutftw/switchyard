@@ -558,6 +558,22 @@
   color: var(--accent-ink);
 }
 
+/* Phones: beside the text an action leaves it a column a few words wide. The
+   action goes under the text instead, in line with it (past the icon). */
+@media (max-width: 720px) {
+  .notice {
+    flex-wrap: wrap;
+  }
+
+  .notice-body {
+    flex-basis: calc(100% - 16px - var(--space-3));
+  }
+
+  .notice-body + * {
+    margin-left: calc(16px + var(--space-3));
+  }
+}
+
 /* ======================================================================== */
 /* Stat, StatGroup                                                          */
 /* ======================================================================== */
@@ -669,6 +685,21 @@
   overflow-y: auto;
 }
 
+/* A table that fits its box and scrolls with the page (Table sets the
+   attribute after measuring). `overflow-x: auto` would make the box a
+   scroll container, and the sticky header would stick to it instead of to
+   the page: so the box only clips (it still rounds the corners inside a
+   flush panel) and the header sticks under the top bar.
+
+   --sticky-top is where sticky things stop, measured from the top of
+   whatever scrolls: the top bar's height on a page, 0 inside a drawer or a
+   modal (set on .overlay-body below). A page with a sticky bar of its own
+   above its tables adds the bar's height on the element that holds them. */
+.table-wrap[data-page-sticky] {
+  overflow: clip;
+  --table-sticky-top: var(--sticky-top, var(--topbar-h));
+}
+
 .table {
   width: 100%;
   font-size: var(--text-sm);
@@ -724,11 +755,23 @@
 
 .table[data-sticky] th {
   position: sticky;
-  top: 0;
-  z-index: var(--z-sticky);
+  /* 0 inside a box that scrolls by itself; see .table-wrap[data-page-sticky]. */
+  top: var(--table-sticky-top, 0px);
+  /* One below --z-sticky: a page's own sticky bar (a toolbar, a section
+     strip) at the same place covers the header instead of fighting it. Such
+     a page moves the headers below its bar with --sticky-top. */
+  z-index: calc(var(--z-sticky) - 1);
   /* A border on a sticky cell scrolls away; a shadow stays. */
   border-bottom: 0;
   box-shadow: inset 0 -1px 0 var(--rule);
+}
+
+/* A row, or a control in one, that takes the keyboard focus above the fold
+   (Shift+Tab up a long list) is scrolled to the very top of the window by
+   the browser: under the top bar and the header that sticks below it. The
+   margin stops it short of both (34px is the header's height). */
+.table-wrap[data-page-sticky] tbody :is(tr, a, button, input, select, textarea, [tabindex]) {
+  scroll-margin-top: calc(var(--table-sticky-top) + 34px + var(--space-2));
 }
 
 .table [data-align="right"] {
@@ -825,9 +868,13 @@
   display: none;
 }
 
-/* Rows that arrive live flash once so the eye catches them. */
-.table tbody tr[data-fresh] {
-  animation: row-fresh 1200ms ease-out 1;
+/* Rows that arrive live flash once so the eye catches them. Not under
+   reduced motion: a flash is movement in all but name, and a list that
+   updates often would flicker. */
+@media (prefers-reduced-motion: no-preference) {
+  .table tbody tr[data-fresh] {
+    animation: row-fresh 1200ms ease-out 1;
+  }
 }
 
 @keyframes row-fresh {
@@ -845,7 +892,14 @@
     overflow-x: visible;
   }
 
-  .table-wrap[data-collapse] .table-sortbar {
+  .table-wrap[data-collapse][data-page-sticky] {
+    overflow: visible;
+  }
+
+  /* :where() keeps this at the weight of one class, so a page hides the
+     menu with `.my-table .table-sortbar { display: none }` (or the Table
+     prop sortMenu=${false}, which leaves it out altogether). */
+  :where(.table-wrap[data-collapse]) .table-sortbar {
     display: flex;
     align-items: center;
     gap: var(--space-2);
@@ -937,6 +991,25 @@
 
 .tabs::-webkit-scrollbar {
   display: none;
+}
+
+/* The strip scrolls sideways with its scrollbar hidden, so an edge with tabs
+   beyond it fades out: the sign that there is more. Tabs sets the two
+   attributes as the strip scrolls. */
+.tabs[data-more-start],
+.tabs[data-more-end] {
+  --tabs-fade-start: 0px;
+  --tabs-fade-end: 0px;
+  -webkit-mask-image: linear-gradient(to right, transparent, #000 var(--tabs-fade-start), #000 calc(100% - var(--tabs-fade-end)), transparent);
+  mask-image: linear-gradient(to right, transparent, #000 var(--tabs-fade-start), #000 calc(100% - var(--tabs-fade-end)), transparent);
+}
+
+.tabs[data-more-start] {
+  --tabs-fade-start: 28px;
+}
+
+.tabs[data-more-end] {
+  --tabs-fade-end: 28px;
 }
 
 .tab {
@@ -1086,6 +1159,27 @@
   margin-top: 1px;
 }
 
+/* A caution about a value that is allowed: the same line, in the caution ink. */
+.field-warning {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1h);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--caution-ink);
+}
+
+.field-warning .icon {
+  margin-top: 1px;
+}
+
+/* A segmented control labelled by a Field keeps its own width: the field is
+   a column, and a stretched control would show an empty track after its
+   last option. */
+.field > .seg {
+  align-self: flex-start;
+}
+
 .field[data-inline] {
   flex-direction: row;
   align-items: flex-start;
@@ -1137,6 +1231,14 @@
 
 .input[data-invalid]:focus-within {
   box-shadow: 0 0 0 1px var(--lamp-stop);
+}
+
+.input[data-warning] {
+  border-color: var(--lamp-caution);
+}
+
+.input[data-warning]:focus-within {
+  box-shadow: 0 0 0 1px var(--lamp-caution);
 }
 
 .input[data-disabled] {
@@ -1202,8 +1304,13 @@
   flex: none;
 }
 
+/* Buttons inside the field are a step smaller than the field. Only icon
+   buttons are square: a labelled one ("Reveal") keeps the width of its text. */
 .input-actions .btn {
   height: calc(var(--control-h-md) - 8px);
+}
+
+.input-actions .icon-btn {
   width: calc(var(--control-h-md) - 8px);
 }
 
@@ -1343,10 +1450,6 @@ select.input-el option {
   opacity: 0.5;
 }
 
-.switch:focus-visible {
-  border-radius: var(--radius-full);
-}
-
 .check {
   position: relative;
   flex: none;
@@ -1393,10 +1496,6 @@ select.input-el option {
 .check:disabled {
   opacity: 0.5;
   cursor: not-allowed;
-}
-
-.check:focus-visible {
-  border-radius: 3px;
 }
 
 .choice-label {
@@ -1601,6 +1700,21 @@ select.input-el option {
   overflow-y: auto;
   overscroll-behavior: contain;
   padding: var(--space-1) var(--space-5) var(--space-5);
+  /* This is what scrolls here: sticky table headers stop at its top. */
+  --sticky-top: 0px;
+}
+
+/* What is drawn "in the surface colour" inside a raised layer (the bed
+   between a TrackDiagram's rails, the ring around a chart's dots) has to
+   match the layer, not the page's panels. */
+.modal,
+.drawer {
+  --surface-bg: var(--bg-raised);
+}
+
+/* A panel inside one of them is a panel again. */
+.panel {
+  --surface-bg: var(--bg-surface);
 }
 
 .overlay-foot {
@@ -1846,10 +1960,16 @@ select.input-el option {
 /* Toasts                                                                   */
 /* ======================================================================== */
 
+/* --toast-lift raises the stack by that much: a page with a sticky bar of
+   its own in the bottom corner (Save and Discard) sets it so a toast does
+   not land on the bar's buttons. The toasts live in <body>, outside the
+   page, so set it there or on :root:
+     body:has(.my-savebar) { --toast-lift: 64px; }
+   or document.documentElement.style.setProperty('--toast-lift', '64px'). */
 .toasts {
   position: fixed;
   right: var(--space-4);
-  bottom: var(--space-4);
+  bottom: calc(var(--space-4) + var(--toast-lift, 0px));
   z-index: var(--z-toast);
   display: flex;
   flex-direction: column;
@@ -1942,7 +2062,7 @@ select.input-el option {
   .toasts {
     left: var(--space-3);
     right: var(--space-3);
-    bottom: calc(var(--bottombar-h) + env(safe-area-inset-bottom) + var(--space-3));
+    bottom: calc(var(--bottombar-h) + env(safe-area-inset-bottom) + var(--space-3) + var(--toast-lift, 0px));
     width: auto;
   }
 }
@@ -2348,6 +2468,15 @@ select.input-el option {
   align-items: center;
   gap: var(--space-1h);
   white-space: nowrap;
+  /* A long series name is cut, not pushed out of the chart. */
+  min-width: 0;
+  max-width: 100%;
+}
+
+.chart-legend-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* Legend keys mirror the mark: a stroke for lines, a block for bars. */
@@ -2412,7 +2541,7 @@ select.input-el option {
 }
 
 .chart-dot {
-  stroke: var(--bg-surface);
+  stroke: var(--surface-bg, var(--bg-surface));
   stroke-width: 2;
 }
 
@@ -2476,6 +2605,10 @@ select.input-el option {
   border-top: var(--hairline) solid var(--rule);
 }
 
+.chart-tip-none .chart-tip-label {
+  color: var(--text-3);
+}
+
 .chart-table-wrap {
   max-height: 280px;
   overflow: auto;
@@ -2517,7 +2650,7 @@ select.input-el option {
 
 .spark-dot {
   fill: var(--accent);
-  stroke: var(--bg-surface);
+  stroke: var(--surface-bg, var(--bg-surface));
   stroke-width: 2;
 }
 
@@ -2827,9 +2960,12 @@ button.track-node {
   transition: stroke var(--dur-fast) ease, opacity var(--dur-fast) ease;
 }
 
+/* The bed is the colour of what the diagram sits on: a panel by default,
+   the raised colour inside a drawer or a modal (they set --surface-bg). On
+   any other background, set --surface-bg on the diagram's container. */
 .track-bed {
   fill: none;
-  stroke: var(--bg-surface);
+  stroke: var(--surface-bg, var(--bg-surface));
   stroke-width: 2.5;
 }
 

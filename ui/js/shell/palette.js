@@ -40,13 +40,29 @@ export function CommandPalette({ open, onClose, commands }) {
   const [query, setQuery] = useState('');
   const [active, setActive] = useState(0);
 
-  useModalLayer(box, open, { onClose });
+  const pending = useRef(null);
+  // Closing without choosing runs nothing.
+  const dismiss = () => {
+    pending.current = null;
+    onClose();
+  };
 
+  useModalLayer(box, open, { onClose: dismiss });
+
+  // The chosen command runs once the palette has closed. This effect is
+  // declared after useModalLayer on purpose: effect clean-ups run before
+  // effects, so by now the layer is off the stack and focus is back where it
+  // was. A command that moves focus (opens a dialog, jumps to a section)
+  // keeps it; run any earlier and the focus restore would take it away.
   useEffect(() => {
     if (open) {
       setQuery('');
       setActive(0);
+      return;
     }
+    const command = pending.current;
+    pending.current = null;
+    command?.run();
   }, [open]);
 
   const results = useMemo(() => {
@@ -69,10 +85,9 @@ export function CommandPalette({ open, onClose, commands }) {
   if (!open) return null;
 
   const run = (command) => {
+    // Picked up by the effect above when the palette has closed.
+    pending.current = command;
     onClose();
-    // After the palette has closed and focus has returned, so a command that
-    // opens a dialog does not fight the palette for focus.
-    setTimeout(() => command.run(), 0);
   };
 
   const onKeyDown = (event) => {
@@ -103,7 +118,7 @@ export function CommandPalette({ open, onClose, commands }) {
       <div
         class="palette-pos"
         onPointerDown=${(event) => {
-          if (event.target === event.currentTarget) onClose();
+          if (event.target === event.currentTarget) dismiss();
         }}
       >
         <div ref=${box} class="palette" role="dialog" aria-modal="true" aria-label="Command palette" onKeyDown=${onKeyDown}>

@@ -1,8 +1,8 @@
 // Shared hooks. Data hooks first, then small utilities.
 
-import { useCallback, useEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
 import { api } from './api.js';
-import { focusableWithin, isEditable, isTopOverlay, lockScroll, nextId, pushOverlay } from './dom.js';
+import { focusableWithin, isEditable, isFocusable, isTopOverlay, lockScroll, nextId, pushOverlay, topOverlay } from './dom.js';
 import { createStore, useStore } from './store.js';
 
 // ---------------------------------------------------------------------------
@@ -167,15 +167,23 @@ export function createLoader({ fetch, onStart, onData, onError }) {
  * (signal) => Promise, or null to stay idle.
  *
  * Options:
- *   pollMs   refetch on this interval while the tab is visible (0 = never)
- *   deps     extra dependencies for the function form
- *   enabled  set false to pause loading and polling
+ *   pollMs        refetch on this interval while the tab is visible (0 = never)
+ *   deps          extra dependencies for the function form
+ *   enabled       set false to pause loading and polling
+ *   keepPrevious  when the key changes, keep showing the previous key's data
+ *                 (flagged with `isPrevious`) until the new key's has
+ *                 arrived, instead of going back to `loading`. For a range
+ *                 or group switch above a chart: the old plot stays, dimmed,
+ *                 and nothing collapses into skeletons.
  *
  * Returns:
  *   data        last good value (kept while refetching and after an error)
  *   error       ApiError from the latest attempt, else null
  *   loading     true until the first load settles
  *   refreshing  a refetch is in flight while `data` is still on screen
+ *   isPrevious  `data` belongs to the key before this one (only with
+ *               keepPrevious; it stays true if the new key's load fails,
+ *               with the failure in `error`)
  *   updatedAt   epoch ms of the last good load
  *   refresh()   refetch now; resolves when the data is as new as the call.
  *               Safe to call as often as you like (from every live frame,
@@ -190,19 +198,36 @@ export function createLoader({ fetch, onStart, onData, onError }) {
  * 30 s) or reject on your own timeout. A request that never settles holds
  * back every later poll.
  *
- * A changed key resets `data` and aborts the request in flight. Polling
- * never aborts: a tick that finds a request still on its way is skipped, so
- * a gateway slower than `pollMs` still gets to answer. A response that lands
- * after the key changed or the component unmounted is dropped.
+ * A changed key resets `data` (unless keepPrevious) and aborts the request in
+ * flight. The reset is visible from the very render that has the new key:
+ * the hook never hands out one key's data as another's, so an effect that
+ * depends on [key, data] can trust the pair. Polling never aborts: a tick
+ * that finds a request still on its way is skipped, so a gateway slower than
+ * `pollMs` still gets to answer. A response that lands after the key changed
+ * or the component unmounted is dropped.
  */
-export function useResource(source, { pollMs = 0, deps = [], enabled = true } = {}) {
+export function useResource(source, { pollMs = 0, deps = [], enabled = true, keepPrevious = false } = {}) {
   const isFn = typeof source === 'function';
   const key = isFn || source == null ? null : JSON.stringify(source);
+  const idle = source == null;
   const sourceRef = useRef(source);
   sourceRef.current = source;
 
-  const [state, setState] = useState({ data: undefined, error: null, loading: source != null && enabled, refreshing: false, updatedAt: null });
+  // Which source this render is for, as a number that changes whenever the
+  // key or the deps do. State remembers the number it was loaded for.
+  const identity = useRef(null);
+  const parts = [key, idle, ...deps];
+  if (identity.current === null) identity.current = { parts, id: 1 };
+  else if (parts.length !== identity.current.parts.length || parts.some((part, i) => !Object.is(part, identity.current.parts[i]))) {
+    identity.current = { parts, id: identity.current.id + 1 };
+  }
+  const id = identity.current.id;
+
+  const [state, setState] = useState({ data: undefined, error: null, loading: !idle && enabled, refreshing: false, updatedAt: null, isPrevious: false, of: id });
   const hasData = useRef(false);
+  const loadingFor = useRef(id);
+  const shown = useRef(state);
+  shown.current = state;
 
   const loader = useMemo(
     () =>
@@ -218,7 +243,7 @@ export function useResource(source, { pollMs = 0, deps = [], enabled = true } = 
         },
         onData(data) {
           hasData.current = true;
-          setState({ data, error: null, loading: false, refreshing: false, updatedAt: Date.now() });
+          setState({ data, error: null, loading: false, refreshing: false, updatedAt: Date.now(), isPrevious: false, of: loadingFor.current });
         },
         onError(error) {
           setState((s) => ({ ...s, error, loading: false, refreshing: false }));
@@ -233,12 +258,21 @@ export function useResource(source, { pollMs = 0, deps = [], enabled = true } = 
       setState((s) => (s.loading || s.refreshing ? { ...s, loading: false, refreshing: false } : s));
       return undefined;
     }
-    hasData.current = false;
-    setState({ data: undefined, error: null, loading: true, refreshing: false, updatedAt: null });
+    // keepPrevious carries the data on screen over to the new key. Turning
+    // `enabled` back on with the same key starts afresh, as it always has.
+    const before = shown.current;
+    const previous = keepPrevious && before.data !== undefined && (before.of !== id || before.isPrevious);
+    loadingFor.current = id;
+    hasData.current = previous;
+    setState((s) =>
+      previous
+        ? { ...s, error: null, loading: false, refreshing: true, isPrevious: true, of: id }
+        : { data: undefined, error: null, loading: true, refreshing: false, updatedAt: null, isPrevious: false, of: id },
+    );
     loader.restart();
     return () => loader.cancel();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, enabled, loader, ...deps]);
+  }, [key, idle, enabled, loader, ...deps]);
 
   // Poll while visible; refetch at once when the tab comes back.
   useEffect(() => {
@@ -264,7 +298,7 @@ export function useResource(source, { pollMs = 0, deps = [], enabled = true } = 
       document.removeEventListener('visibilitychange', onVisibility);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [key, enabled, pollMs, loader, ...deps]);
+  }, [key, idle, enabled, pollMs, loader, ...deps]);
 
   // refresh() works while `enabled` is false, so the effect above may not be
   // the one that started the request in flight at unmount.
@@ -283,7 +317,27 @@ export function useResource(source, { pollMs = 0, deps = [], enabled = true } = 
     [loader],
   );
 
-  return { ...state, refresh, mutate };
+  // The effect that resets and reloads runs after this render. Until it has,
+  // `state` still holds the answer for the previous source: say what the
+  // effect is about to say instead of passing that answer off as this one's.
+  let view = state;
+  if (enabled && !idle && state.of !== id) {
+    view =
+      keepPrevious && state.data !== undefined
+        ? { ...state, error: null, loading: false, refreshing: true, isPrevious: true }
+        : { data: undefined, error: null, loading: true, refreshing: false, updatedAt: null, isPrevious: false };
+  }
+
+  return {
+    data: view.data,
+    error: view.error,
+    loading: view.loading,
+    refreshing: view.refreshing,
+    isPrevious: view.isPrevious,
+    updatedAt: view.updatedAt,
+    refresh,
+    mutate,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -309,6 +363,12 @@ let clockTimer = null;
 /**
  * The current time, updated once a second (or slower: pass a larger step to
  * re-render less often). Use it for relative times and countdowns.
+ *
+ * The value is the clock's own reading at the tick that caused the render,
+ * in epoch ms, not rounded to the step: `end - now` is the time that is
+ * really left, so a countdown that rounds up (formatCountdown,
+ * formatCountdownWords) never reads a second long. It is the same number
+ * for every render until the next tick, so it is safe in dependency lists.
  */
 export function useNow(stepMs = 1000) {
   useEffect(() => {
@@ -325,7 +385,14 @@ export function useNow(stepMs = 1000) {
       }
     };
   }, []);
-  return useStore(clock, (now) => Math.floor(now / stepMs) * stepMs);
+  // Re-render once per step; hand out the reading taken at that tick.
+  const step = useStore(clock, (now) => Math.floor(now / stepMs));
+  const reading = useRef(null);
+  // A component that mounts between two ticks reads the time itself: the
+  // shared clock's last reading is up to a second old by then.
+  if (reading.current === null) reading.current = { step, now: Date.now() };
+  else if (reading.current.step !== step) reading.current = { step, now: Math.max(clock.get(), reading.current.now) };
+  return reading.current.now;
 }
 
 /** A value that trails `value` by `ms`: for search boxes that query as you type. */
@@ -436,8 +503,15 @@ function matchCombo(event, combo) {
  * Shortcuts without "mod" are ignored while focus is in a text field unless
  * `allowInInput` is set. The handler receives the KeyboardEvent, which has
  * already had preventDefault() called.
+ *
+ * While a modal layer is open (drawer, modal, menu, command palette) the
+ * keyboard belongs to that layer: a shortcut is ignored, so "/" on the page
+ * behind a drawer does not pull focus out of it. A shortcut that is part of
+ * what a layer shows (Ctrl+S in a drawer's form) passes `inLayer: true`; it
+ * then works as usual with no layer open, and with one open only for keys
+ * pressed inside the topmost layer.
  */
-export function useHotkey(combo, handler, { enabled = true, allowInInput = false } = {}) {
+export function useHotkey(combo, handler, { enabled = true, allowInInput = false, inLayer = false } = {}) {
   const ref = useRef(handler);
   ref.current = handler;
   useEffect(() => {
@@ -447,12 +521,14 @@ export function useHotkey(combo, handler, { enabled = true, allowInInput = false
       if (event.defaultPrevented || event.isComposing) return;
       if (!matchCombo(event, combo)) return;
       if (!hasMod && !allowInInput && isEditable(event.target)) return;
+      const layer = topOverlay();
+      if (layer && !(inLayer && layer.element && layer.element.contains(event.target))) return;
       event.preventDefault();
       ref.current(event);
     };
     window.addEventListener('keydown', onKey);
     return () => window.removeEventListener('keydown', onKey);
-  }, [combo, enabled, allowInInput]);
+  }, [combo, enabled, allowInInput, inLayer]);
 }
 
 // ---------------------------------------------------------------------------
@@ -471,12 +547,13 @@ export function useUid(prefix) {
  */
 export function useSize() {
   const [size, setSize] = useState({ width: 0, height: 0 });
-  const watch = useRef({ el: null, observer: null });
+  const watch = useRef({ el: null, observer: null, measure: null, fresh: false });
   const ref = useCallback((el) => {
     const w = watch.current;
     if (w.el === el) return;
     w.observer?.disconnect();
     w.observer = null;
+    w.measure = null;
     w.el = el;
     if (!el) return;
     const measure = () => {
@@ -484,12 +561,24 @@ export function useSize() {
       const height = Math.round(el.clientHeight);
       setSize((s) => (s.width === width && s.height === height ? s : { width, height }));
     };
+    w.measure = measure;
+    w.fresh = true;
     measure();
     if (typeof ResizeObserver !== 'undefined') {
       w.observer = new ResizeObserver(measure);
       w.observer.observe(el);
     }
   }, []);
+  // The ref is called while the tree is still being built, when the element
+  // may not be in the document yet and measures 0. The ResizeObserver puts
+  // that right in a tab that is being painted, and never in one that is not
+  // (a background tab): so measure once more when the commit is done.
+  useLayoutEffect(() => {
+    const w = watch.current;
+    if (!w.fresh) return;
+    w.fresh = false;
+    w.measure?.();
+  });
   useEffect(() => () => watch.current.observer?.disconnect(), []);
   return [ref, size];
 }
@@ -511,9 +600,14 @@ export function usePresence(open, exitMs = 140) {
       const raf1 = requestAnimationFrame(() => {
         raf2 = requestAnimationFrame(() => setState('open'));
       });
+      // A tab in the background gets no frames, and a layer opened there
+      // would stay invisible while it already holds the focus. The timer
+      // opens it without them; whichever comes first wins.
+      const timer = setTimeout(() => setState('open'), PRESENCE_FALLBACK_MS);
       return () => {
         cancelAnimationFrame(raf1);
         cancelAnimationFrame(raf2);
+        clearTimeout(timer);
       };
     }
     setState('closed');
@@ -523,39 +617,103 @@ export function usePresence(open, exitMs = 140) {
   return { mounted: open || mounted, state: open ? state : 'closed' };
 }
 
+/** Longer than two frames at 30 Hz, short enough not to be noticed. */
+const PRESENCE_FALLBACK_MS = 80;
+
+/** Focus `el` and say whether it took. */
+function focusOn(el) {
+  if (!el || typeof el.focus !== 'function' || !document.contains(el)) return false;
+  el.focus({ preventScroll: true });
+  return document.activeElement === el;
+}
+
+/**
+ * Where focus goes when the control that opened a layer is gone (a row menu
+ * whose row was just deleted) or can no longer take it (disabled, hidden):
+ * the nearest thing around the opener that still exists and can hold focus
+ * (its row, its panel, the drawer it was in, the page's <main>). Not <body>:
+ * a keyboard user would start again from the top of the document.
+ * `trail` is the opener's ancestors, nearest first.
+ */
+function focusNear(trail) {
+  for (const node of trail) {
+    if (node === document.body) break;
+    if (document.contains(node) && isFocusable(node) && focusOn(node)) return true;
+  }
+  return false;
+}
+
+/** How long after a layer closes its opener is watched for being removed. */
+const OPENER_WATCH_MS = 2000;
+
 /**
  * Behaviour every modal layer needs while `active`:
  * focus moves inside (to [data-autofocus], else the first focusable, else the
  * container), Tab cycles within, Escape calls onClose (topmost layer only),
  * the page behind stops scrolling, and focus returns to where it was.
+ *
+ * Options:
+ *   onClose      (how) => void
+ *   lock         false leaves the page scrollable (menus)
+ *   dismissable  false: Escape does nothing, and the layer says so to the
+ *                overlay stack (the command palette will not open over it)
+ *   returnFocus  an element, a ref or a function returning an element: where
+ *                focus goes if the opener cannot take it back. Without it,
+ *                and when that is gone too, the nearest focusable ancestor
+ *                of the opener that is still in the document gets it.
+ *
+ * Handing the focus back is an offer, not an order. When the layer closes
+ * and the focus is neither inside it nor on <body>, someone has placed it
+ * since (the page, on the neighbour of a row the dialog deleted; the user,
+ * with a click): it is left there. And when the opener is gone, the
+ * fallback waits FOCUS_SETTLE_MS for the page to place the focus itself
+ * before it steps in, so a page that only looks for a lost focus afterwards
+ * does not find the fallback's choice and take it for its own.
  */
-export function useModalLayer(ref, active, { onClose, lock = true, dismissable = true } = {}) {
+export function useModalLayer(ref, active, { onClose, lock = true, dismissable = true, returnFocus } = {}) {
   const closeRef = useRef(onClose);
   closeRef.current = onClose;
   const dismissRef = useRef(dismissable);
   dismissRef.current = dismissable;
+  const returnRef = useRef(returnFocus);
+  returnRef.current = returnFocus;
+  const activeRef = useRef(active);
+  activeRef.current = active;
 
   useEffect(() => {
     if (!active) return undefined;
     const id = nextId('layer');
-    const pop = pushOverlay(id);
+    const pop = pushOverlay(id, { element: () => ref.current, dismissable: () => dismissRef.current });
     const unlock = lock ? lockScroll() : null;
     const previous = document.activeElement;
+    // The way back up from the opener, noted while it is still attached.
+    const trail = [];
+    for (let node = previous?.parentNode; node && node.nodeType === 1; node = node.parentNode) trail.push(node);
+    const root = ref.current;
+    if (root) handedBack.delete(root);
 
     const focusIn = () => {
       const root = ref.current;
-      if (!root || root.contains(document.activeElement)) return;
+      // `activeRef`: a layer told to close in the frame it opened in is
+      // still waiting for this effect's clean-up, and must not pull the
+      // focus back into itself meanwhile.
+      if (!activeRef.current || !root || root.contains(document.activeElement)) return;
       // A layer that marks itself (menus, the palette list) takes focus as a whole.
       const target = root.matches('[data-autofocus]') ? root : (root.querySelector('[data-autofocus]') ?? focusableWithin(root)[0] ?? root);
       target.focus({ preventScroll: true });
     };
     // Focus now, so typing right after opening lands in the layer; and once
-    // more on the next frame for layers whose content mounts a moment later.
+    // more on the next frame for layers whose content mounts a moment later
+    // (or after a short wait, in a tab that gets no frames).
     focusIn();
     const raf = requestAnimationFrame(focusIn);
+    const late = setTimeout(() => {
+      // Not from under a layer that has opened on top meanwhile.
+      if (isTopOverlay(id)) focusIn();
+    }, PRESENCE_FALLBACK_MS);
 
     const onKey = (event) => {
-      if (!isTopOverlay(id)) return;
+      if (!isTopOverlay(id) || !activeRef.current) return;
       const root = ref.current;
       if (event.key === 'Escape') {
         if (event.defaultPrevented) return;
@@ -588,15 +746,94 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
 
     return () => {
       cancelAnimationFrame(raf);
+      clearTimeout(late);
       document.removeEventListener('keydown', onKey);
       pop();
       unlock?.();
-      if (previous && typeof previous.focus === 'function' && document.contains(previous)) {
-        previous.focus({ preventScroll: true });
+      // Nothing had the focus when the layer opened: nothing to give it back to.
+      if (!previous || previous === document.body) return;
+      if (root) handedBack.set(root, { previous, trail, at: Date.now() });
+
+      // The focus is this layer's to hand back only while it is still inside
+      // the layer, or nowhere. Anywhere else, somebody put it there on
+      // purpose after the layer was told to close (a page that moves the
+      // keyboard to the neighbour of the row it just deleted, a click on
+      // another control): that choice stands.
+      const adrift = () => {
+        const at = document.activeElement;
+        return !at || at === document.body || !document.contains(at) || (root != null && root.contains(at));
+      };
+      if (!adrift()) return;
+
+      const fallback = returnRef.current;
+      const elsewhere = () => {
+        if (focusOn(typeof fallback === 'function' ? fallback() : fallback && 'current' in fallback ? fallback.current : fallback)) return;
+        // The opener may have been inside a layer that has closed since (the
+        // menu item that opened this dialog): go where that layer sent focus.
+        for (const node of [previous, ...trail]) {
+          const earlier = handedBack.get(node);
+          if (earlier && (focusOn(earlier.previous) || focusNear(earlier.trail))) return;
+        }
+        focusNear(trail);
+      };
+      // The opener is gone, and whatever removed it may be about to say
+      // where the keyboard goes (those pages focus on a timer or a frame).
+      // Wait a moment and step in only if the focus is still adrift: a
+      // fallback that got there first would be taken for the page's choice.
+      const elsewhereUnlessPlaced = () => {
+        setTimeout(() => {
+          if (adrift()) elsewhere();
+        }, FOCUS_SETTLE_MS);
+      };
+
+      // An opener inside a layer that has itself just closed (a button in the
+      // drawer that closes together with this dialog) is still in the
+      // document while that layer fades out, and would take the focus with
+      // it when it goes: it counts as gone.
+      let dying = false;
+      for (let node = previous; node && !dying; node = node.parentNode) {
+        const closed = handedBack.get(node);
+        dying = closed != null && Date.now() - closed.at < LAYER_FADE_MS;
       }
+      if (dying || !focusOn(previous)) {
+        elsewhereUnlessPlaced();
+        return;
+      }
+      // The opener took the focus back. What the layer was for may remove it
+      // a moment later (the list refetches after a delete, and the row with
+      // its menu button goes): the browser then drops focus on <body>
+      // without a word. Watch for that for a short while.
+      if (typeof MutationObserver === 'undefined') return;
+      let timer = null;
+      const watcher = new MutationObserver(() => {
+        if (document.contains(previous)) return;
+        clearTimeout(timer);
+        watcher.disconnect();
+        const at = document.activeElement;
+        if (!at || at === document.body) elsewhereUnlessPlaced();
+      });
+      timer = setTimeout(() => watcher.disconnect(), OPENER_WATCH_MS);
+      watcher.observe(document.body, { childList: true, subtree: true });
     };
   }, [active, ref, lock]);
 }
+
+/**
+ * Root element of a layer that has closed -> where it sent the focus. An
+ * entry is dropped when the same element becomes a layer again (a menu
+ * reopened while it fades out).
+ */
+const handedBack = new WeakMap();
+
+/** Longer than any layer's exit animation (the drawer's is 200 ms). */
+const LAYER_FADE_MS = 400;
+
+/**
+ * How long a closing layer waits for the page to place the focus itself
+ * before it falls back. Longer than a frame at 30 Hz plus a zero timer,
+ * which is when the pages that do it act; short enough not to be felt.
+ */
+const FOCUS_SETTLE_MS = 80;
 
 /** Call `handler` when a pointer goes down outside every given ref. */
 export function useOutsidePointer(refs, handler, enabled = true) {

@@ -33,6 +33,12 @@ pub enum Source {
 #[derive(Clone, Debug, PartialEq)]
 pub enum ConfigEvent {
     /// A configuration became the live one.
+    ///
+    /// Also sent, with [`Source::File`], when a file that was
+    /// [`Rejected`](ConfigEvent::Rejected) returns to the content of the
+    /// configuration in effect: nothing changes then, but the rejection is
+    /// over, and this is the only event that says so. Exactly one is sent
+    /// per recovery.
     Applied { source: Source, at: SystemTime },
     /// A configuration was refused; the previous one stays live.
     Rejected {
@@ -138,15 +144,16 @@ struct Hashes {
     /// store is always followed by applying what was written, under the same
     /// lock, so this is also the last content the store wrote.
     applied: Option<ContentHash>,
-    /// The text of that file. When the file on disk is unusable (deleted,
-    /// truncated, broken by a half-finished manual edit), an edit made
-    /// through the store is merged into this text instead, so the comments
-    /// and layout of the last good version are not lost.
+    /// The text of that file. When the file on disk is gone or empty, an
+    /// edit made through the store is merged into this text instead, so the
+    /// comments and layout of the last good version are not lost.
     applied_text: Option<Arc<str>>,
     /// Content that was last refused, remembered so that the same broken
     /// save is reported once and not at every look. Forgotten as soon as the
     /// file holds anything else — applied, or already live — so that the same
-    /// mistake made again later is reported again.
+    /// mistake made again later is reported again. While it is set, the file
+    /// going back to the live content is announced (see
+    /// [`ConfigStore::is_live`]).
     rejected: Option<ContentHash>,
 }
 
@@ -156,6 +163,18 @@ struct WatchGuard {
     _signal: mpsc::UnboundedSender<()>,
 }
 
+/// How the content of the file relates to the live configuration.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Live {
+    /// The file holds something else.
+    No,
+    /// The file holds the live configuration.
+    Yes,
+    /// The file holds the live configuration again after having been
+    /// rejected; this was announced.
+    Recovered,
+}
+
 /// Outcome of looking at the file on disk.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Check {
@@ -163,6 +182,8 @@ enum Check {
     Missing,
     /// Content the store already knows.
     Unchanged,
+    /// A configuration was applied, or the file went back to the live one
+    /// after a rejection; announced either way.
     Applied,
     Rejected,
     /// The content is unusable right now; it may be half-written.
@@ -311,7 +332,11 @@ impl ConfigStore {
     /// replace files by rename and container runtimes bind-mount single
     /// files. After a quiet period the file is read:
     ///
-    /// * content the store applied or wrote itself is ignored;
+    /// * content the store applied or wrote itself is ignored — unless the
+    ///   file was rejected in between: its return to the configuration in
+    ///   effect is announced once ([`ConfigEvent::Applied`] with
+    ///   [`Source::File`], and subscribers are notified), so that whoever
+    ///   showed "file refused" can stop;
     /// * a valid configuration becomes the live one
     ///   ([`ConfigEvent::Applied`] with [`Source::File`]);
     /// * an invalid one — or an empty file, which is what a save in progress
@@ -420,21 +445,31 @@ impl ConfigStore {
     /// Errors: [`ConfigStoreError::Edit`] when `edit` itself fails (its
     /// message is passed through) or the result cannot be written as TOML,
     /// [`ConfigStoreError::Invalid`] when the result fails validation,
-    /// [`ConfigStoreError::Io`] when the file cannot be written. In every
-    /// error case neither the file nor the live configuration changes.
+    /// [`ConfigStoreError::DiskInvalid`] when the file on disk holds an
+    /// invalid manual edit (see below), [`ConfigStoreError::Io`] when the
+    /// file cannot be written. In every error case neither the file nor the
+    /// live configuration changes.
     ///
     /// Concurrent calls run one after the other, each on the result of the
     /// previous one. A valid change made to the file on disk that the watcher
     /// has not picked up yet is adopted first, so it is not overwritten.
     ///
-    /// When the file on disk is not usable — deleted, empty, or left broken
-    /// by a manual edit that the store rejected — the edit is merged into the
-    /// text of the last applied configuration instead and the file is
-    /// replaced by the result, so the comments and layout of the last good
-    /// version survive. (What was in the broken file is lost; it was never in
-    /// effect.) A file that parses but breaks a semantic rule is edited as it
-    /// is: its text stays, the values go back to the live ones. Both cases
-    /// are logged as warnings.
+    /// A file on disk that holds something other than the live configuration
+    /// and is **not valid** — unparsable, not UTF-8, or breaking a rule: a
+    /// manual edit in progress, or one the store rejected — is never
+    /// overwritten by an edit: the call fails with
+    /// [`ConfigStoreError::DiskInvalid`], listing what is wrong with the
+    /// file, and neither the file nor the live configuration changes.
+    /// Writing the edit would mean rewriting the file from the last valid
+    /// configuration and silently discarding what the operator typed. The
+    /// file has to be fixed or restored by hand, or replaced as a whole with
+    /// [`replace_text`](Self::replace_text). (An edit that changes nothing
+    /// writes nothing and is therefore not refused.)
+    ///
+    /// A file that is gone or empty holds nothing to lose: the edit is
+    /// merged into the text of the last applied configuration and the file
+    /// is recreated from the result, so the comments and layout of the last
+    /// good version survive. This is logged as a warning.
     ///
     /// Dropping the returned future is safe at any point. Before the write
     /// starts nothing has changed. Once it has started, the write and the
@@ -454,40 +489,35 @@ impl ConfigStore {
             Err(e) => return Err(ConfigStoreError::io(&self.inner.path, e)),
         };
         // The text the edit is merged into: the file as it is, provided it
-        // reads as a configuration.
+        // holds a valid configuration.
         let mut base_text: Option<Arc<str>> = None;
-        let mut disk_unreadable = false;
-        // The file holds a hand edit that parses but was (or would be)
-        // rejected: its values are not live, and this edit writes the live
-        // ones back over them.
-        let mut disk_rejected = false;
+        // What is wrong with the file, when it holds something that is not
+        // live and not valid: a hand edit in progress, which must not be
+        // overwritten.
+        let mut disk_issues: Option<Vec<ConfigIssue>> = None;
+        // The file is gone or empty: nothing in it to lose.
+        let mut disk_empty = on_disk.is_none();
         if let Some(bytes) = on_disk {
             let hash = content_hash(&bytes);
-            match String::from_utf8(bytes) {
+            match decode(bytes) {
                 // An empty file is what a truncated save looks like.
-                Ok(text) if is_blank(&text) => {}
+                Ok(text) if is_blank(&text) => disk_empty = true,
                 Ok(text) => {
-                    let readable = merge::is_readable(&text);
-                    if !self.is_live(hash) {
+                    if self.is_live(hash) != Live::No {
+                        base_text = Some(Arc::from(text));
+                    } else {
                         match validate_text(&text) {
                             Ok(config) => {
                                 self.apply(Arc::new(config), Source::File, hash, &text);
+                                base_text = Some(Arc::from(text));
                             }
-                            Err(_) => disk_rejected = readable,
+                            Err(issues) => disk_issues = Some(issues),
                         }
                     }
-                    if readable {
-                        base_text = Some(Arc::from(text));
-                    } else {
-                        disk_unreadable = true;
-                    }
                 }
-                Err(_) => disk_unreadable = true,
+                Err(issues) => disk_issues = Some(issues),
             }
         }
-        let base_text = base_text
-            .or_else(|| self.inner.hashes.lock().applied_text.clone())
-            .unwrap_or_else(|| Arc::from(""));
 
         let current = self.current();
         let mut next = (*current).clone();
@@ -499,20 +529,24 @@ impl ConfigStore {
         if next == *current {
             return Ok(current);
         }
-
-        let rendered = merge::render_update(&base_text, &next).map_err(ConfigStoreError::Edit)?;
-        if disk_unreadable {
+        if let Some(issues) = disk_issues {
             tracing::warn!(
                 path = %self.inner.path.display(),
-                "the configuration file on disk is not a readable configuration; replacing it \
-                 with the last applied configuration and this change"
+                "the configuration file on disk is not valid; refusing to overwrite it with \
+                 an edit"
             );
+            return Err(ConfigStoreError::DiskInvalid(issues));
         }
-        if disk_rejected {
+
+        let base_text = base_text
+            .or_else(|| self.inner.hashes.lock().applied_text.clone())
+            .unwrap_or_else(|| Arc::from(""));
+        let rendered = merge::render_update(&base_text, &next).map_err(ConfigStoreError::Edit)?;
+        if disk_empty {
             tracing::warn!(
                 path = %self.inner.path.display(),
-                "the configuration file on disk holds changes that are not valid and were \
-                 never applied; this change writes the live values over them"
+                "the configuration file on disk is missing or empty; recreating it from the \
+                 last applied configuration and this change"
             );
         }
         if rendered.strategy == Strategy::Rewritten && !is_blank(&base_text) {
@@ -529,7 +563,10 @@ impl ConfigStore {
     ///
     /// The text is validated first; an invalid one is refused with
     /// [`ConfigStoreError::Invalid`] and nothing is written. A valid one is
-    /// written verbatim and applied.
+    /// written verbatim and applied — whatever the file holds at that
+    /// moment, a broken manual edit included: replacing the whole file is
+    /// what the caller asked for, and it is the way out of
+    /// [`ConfigStoreError::DiskInvalid`].
     ///
     /// Like [`update`](Self::update), the returned future can be dropped at
     /// any point: a write that has started is completed and applied.
@@ -542,19 +579,51 @@ impl ConfigStore {
     // -- internals ---------------------------------------------------------
 
     /// Whether the file on disk, whose content has this hash, is the live
-    /// configuration.
+    /// configuration. Callers hold the write lock.
     ///
     /// Finding the live content on disk also ends any earlier rejection: the
     /// file is good again, so the same mistake saved once more later is a new
     /// event and must be reported again, not taken for the one already
-    /// reported.
-    fn is_live(&self, hash: ContentHash) -> bool {
-        let mut hashes = self.inner.hashes.lock();
-        let live = hashes.applied == Some(hash);
-        if live {
-            hashes.rejected = None;
+    /// reported. And the recovery itself is news: whoever was told that the
+    /// file was refused is told, once, that it is fine again
+    /// ([`Live::Recovered`]).
+    fn is_live(&self, hash: ContentHash) -> Live {
+        let recovered = {
+            let mut hashes = self.inner.hashes.lock();
+            if hashes.applied != Some(hash) {
+                return Live::No;
+            }
+            hashes.rejected.take().is_some()
+        };
+        if recovered {
+            self.announce_recovery();
+            Live::Recovered
+        } else {
+            Live::Yes
         }
-        live
+    }
+
+    /// Tells subscribers that the file, refused earlier, is back to the
+    /// content of the configuration in effect.
+    ///
+    /// Nothing changes, yet it is announced like an applied file — the same
+    /// way a manual reload of unchanged content is — because a
+    /// [`ConfigEvent::Rejected`] went out for this file and nothing else
+    /// would ever take it back.
+    fn announce_recovery(&self) {
+        let config = self.current();
+        self.inner.updates.send_replace(config);
+        // No receiver is not an error.
+        let _ = self.inner.events.send(ConfigEvent::Applied {
+            source: Source::File,
+            at: SystemTime::now(),
+        });
+        tracing::info!(
+            path = %self.inner.path.display(),
+            source = ?Source::File,
+            "configuration applied: the file is valid again and matches the configuration \
+             in effect"
+        );
     }
 
     /// Whether this content was the last one refused, with nothing else seen
@@ -676,8 +745,11 @@ impl ConfigStore {
             }
         };
         let hash = content_hash(&bytes);
-        if self.is_live(hash) || self.is_reported(hash) {
-            return Check::Unchanged;
+        match self.is_live(hash) {
+            Live::Recovered => return Check::Applied,
+            Live::Yes => return Check::Unchanged,
+            Live::No if self.is_reported(hash) => return Check::Unchanged,
+            Live::No => {}
         }
         let blank = std::str::from_utf8(&bytes).is_ok_and(is_blank);
         let parsed = if blank {
@@ -1039,11 +1111,24 @@ mod tests {
         assert_eq!(store.check_disk(true).await, Check::Unchanged);
         assert!(events.try_recv().is_err());
 
-        // Back to the live content: nothing to apply, nothing to report…
+        let recovered = |event| {
+            matches!(
+                event,
+                Ok(ConfigEvent::Applied {
+                    source: Source::File,
+                    ..
+                })
+            )
+        };
+
+        // Back to the live content: nothing to apply, but the recovery is
+        // announced (once)…
         std::fs::write(&path, BASE).unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Applied);
+        assert!(recovered(events.try_recv()));
         assert_eq!(store.check_disk(true).await, Check::Unchanged);
         assert!(events.try_recv().is_err());
-        // …but the same mistake made again is reported again.
+        // …and the same mistake made again is reported again.
         std::fs::write(&path, bad).unwrap();
         assert_eq!(store.check_disk(false).await, Check::Retry);
         assert_eq!(store.check_disk(true).await, Check::Rejected);
@@ -1053,6 +1138,8 @@ mod tests {
         // the rejection just the same.
         std::fs::write(&path, BASE).unwrap();
         store.update(|_| Ok(())).await.unwrap();
+        assert!(recovered(events.try_recv()));
+        assert!(events.try_recv().is_err());
         std::fs::write(&path, bad).unwrap();
         assert_eq!(store.check_disk(true).await, Check::Rejected);
         assert!(rejected(events.try_recv()));
@@ -1068,9 +1155,9 @@ mod tests {
     }
 
     /// The text of the last applied configuration is the base of an edit
-    /// when the file on disk cannot serve as one.
+    /// when the file on disk is empty: there is nothing in it to lose.
     #[tokio::test]
-    async fn an_edit_over_an_unusable_file_starts_from_the_last_applied_text() {
+    async fn an_edit_over_an_empty_file_starts_from_the_last_applied_text() {
         let (_dir, store) = store_with(BASE);
         let path = store.path().to_path_buf();
 
@@ -1079,8 +1166,8 @@ mod tests {
         std::fs::write(&path, second).unwrap();
         assert_eq!(store.check_disk(true).await, Check::Applied);
 
-        for broken in ["", "   \n", "[server\nport = ", "[server]\nprot = 1\n"] {
-            std::fs::write(&path, broken).unwrap();
+        for empty in ["", "   \n"] {
+            std::fs::write(&path, empty).unwrap();
             store
                 .update(|c| {
                     c.server.port += 1;
@@ -1091,9 +1178,78 @@ mod tests {
         }
         assert_eq!(
             store.raw_text().unwrap(),
-            "# second version\n[server]\nport = 9404 # by hand\n"
+            "# second version\n[server]\nport = 9402 # by hand\n"
         );
-        assert_eq!(store.current().server.port, 9404);
+        assert_eq!(store.current().server.port, 9402);
+    }
+
+    /// Regression: an edit through the store used to rewrite a file that
+    /// held a broken manual edit from the last valid configuration,
+    /// discarding what the operator was typing. It is refused instead, the
+    /// refusal is not mistaken for the watcher's verdict, and the recovery
+    /// that follows a verdict is announced exactly once.
+    #[tokio::test]
+    async fn an_edit_never_overwrites_a_broken_file() {
+        let (_dir, store) = store_with(BASE);
+        let mut events = store.events();
+        let path = store.path().to_path_buf();
+        let edit = |c: &mut Config| {
+            c.server.port += 1;
+            Ok(())
+        };
+
+        for broken in [
+            &b"[server\nport = "[..],
+            b"[server]\nprot = 1\n",
+            b"[server]\nport = 0\n",
+            b"[server]\nhost = \"\xff\"\n",
+        ] {
+            std::fs::write(&path, broken).unwrap();
+            let err = store.update(edit).await.unwrap_err();
+            assert!(matches!(err, ConfigStoreError::DiskInvalid(_)), "{err}");
+            assert!(!err.issues().is_empty());
+            assert_eq!(std::fs::read(&path).unwrap(), broken);
+            assert_eq!(store.current().server.port, 9000);
+        }
+        // The refusal is the caller's answer, not a verdict on the file.
+        assert!(events.try_recv().is_err());
+
+        // The watcher gives the verdict; the edit is still refused.
+        assert_eq!(store.check_disk(true).await, Check::Rejected);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ConfigEvent::Rejected { .. })
+        ));
+        assert!(matches!(
+            store.update(edit).await,
+            Err(ConfigStoreError::DiskInvalid(_))
+        ));
+        // An edit that changes nothing writes nothing, so it is let through.
+        store.update(|_| Ok(())).await.unwrap();
+        assert!(events.try_recv().is_err());
+
+        // The file is put back: the next edit goes through, and the
+        // recovery it found is announced once, ahead of the edit itself.
+        std::fs::write(&path, BASE).unwrap();
+        store.update(edit).await.unwrap();
+        assert_eq!(store.current().server.port, 9001);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ConfigEvent::Applied {
+                source: Source::File,
+                ..
+            })
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(ConfigEvent::Applied {
+                source: Source::Admin,
+                ..
+            })
+        ));
+        assert!(events.try_recv().is_err());
+        assert_eq!(store.check_disk(true).await, Check::Unchanged);
+        assert!(events.try_recv().is_err());
     }
 
     #[test]

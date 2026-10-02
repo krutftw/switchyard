@@ -158,8 +158,9 @@ fn expected_asked(upstream: Protocol, scenario: &ClientRequest) -> Option<Asked>
         (Protocol::OpenaiChat | Protocol::OpenaiResponses, Depth::Off) => Asked::Reasoning,
         // Gemini 2.5 pro cannot be switched off: "off" is its minimum budget.
         (Protocol::Gemini, Depth::Off) => Asked::Reasoning,
-        // "Auto" has no spelling on the OpenAI protocols once it has been
-        // fitted to a level model it becomes `medium`.
+        // "Auto" — the provider decides — is spelled on the OpenAI protocols
+        // by leaving the effort out.
+        (Protocol::OpenaiChat | Protocol::OpenaiResponses, Depth::Auto) => Asked::Nothing,
         (_, _) => Asked::Reasoning,
     })
 }

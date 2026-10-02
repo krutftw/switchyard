@@ -252,6 +252,10 @@ pub(crate) struct AliasTarget {
     /// Index into [`Registry::models`].
     pub model: usize,
     pub pinned: Option<Depth>,
+    /// Index into [`AliasName::raw_targets`] of the configured target this
+    /// one came from (directly, or through nested aliases). When several
+    /// configured targets lead to the same model and depth, the first.
+    pub origin: usize,
 }
 
 /// A virtual model.
@@ -293,10 +297,18 @@ struct ModelTable {
     /// carrying such a suffix (`claude-sonnet-4-5` →
     /// `claude-sonnet-4-5-20250929`).
     undated: HashMap<String, usize>,
+    /// (model index, provider ordinal) of every route added, so that a
+    /// provider is listed once per name without scanning the name's routes:
+    /// a popular model has one route per provider, and comparing each new
+    /// one with all the others made building the table quadratic.
+    routed: HashSet<(usize, usize)>,
 }
 
 impl ModelTable {
-    fn add_route(&mut self, name: String, route: RouteRef) {
+    /// Adds `route` to `name`. `provider` identifies the route's provider
+    /// (providers of one name share an ordinal); a second route of the same
+    /// provider to the same name is dropped.
+    fn add_route(&mut self, name: String, provider: usize, route: RouteRef) {
         let index = match self.maps.exact.get(&name) {
             Some(&index) => index,
             None => {
@@ -322,9 +334,8 @@ impl ModelTable {
                 index
             }
         };
-        let routes = &mut self.models[index].routes;
-        if !routes.iter().any(|r| r.provider == route.provider) {
-            routes.push(route);
+        if self.routed.insert((index, provider)) {
+            self.models[index].routes.push(route);
         }
     }
 
@@ -437,10 +448,15 @@ impl Registry {
 
         // Client-facing model names.
         let mut table = ModelTable::default();
-        for provider in &providers {
+        for (index, provider) in providers.iter().enumerate() {
             if !provider.config.enabled {
                 continue;
             }
+            // Providers are told apart by name, as routes are.
+            let ordinal = provider_index
+                .get(&provider.config.name)
+                .copied()
+                .unwrap_or(index);
             let prefix = provider.config.normalized_prefix();
             for model in &provider.models {
                 let route = RouteRef {
@@ -450,10 +466,10 @@ impl Registry {
                     info: Arc::clone(&model.info),
                 };
                 if !prefix.is_empty() {
-                    table.add_route(format!("{prefix}/{}", model.client), route.clone());
+                    table.add_route(format!("{prefix}/{}", model.client), ordinal, route.clone());
                 }
                 if prefix.is_empty() || !config.routing.force_model_prefix {
-                    table.add_route(model.client.clone(), route);
+                    table.add_route(model.client.clone(), ordinal, route);
                 }
             }
         }
@@ -497,6 +513,24 @@ impl Registry {
     /// and listings.
     pub fn is_shadowed(&self, model_name: &str) -> bool {
         self.alias_maps.exact.contains_key(model_name)
+    }
+
+    /// How many client-facing names a request can be routed by: every model
+    /// that no alias replaces and every alias with at least one routable
+    /// target. Names hidden from listings count; ignored aliases do not.
+    pub fn routable_names(&self) -> usize {
+        let models = self
+            .table
+            .models
+            .iter()
+            .filter(|m| !self.is_shadowed(&m.name))
+            .count();
+        let aliases = self
+            .aliases
+            .iter()
+            .filter(|a| !a.targets.is_empty())
+            .count();
+        models + aliases
     }
 
     /// Resolves a client model name (possibly with a reasoning suffix).
@@ -725,19 +759,23 @@ struct AliasExpander<'a> {
 impl AliasExpander<'_> {
     /// Flattens the targets of alias `index` into `out`. `stack` holds the
     /// aliases currently being expanded (cycle guard); `inherited` is the
-    /// depth pinned by the alias target that led here. Returns what each
-    /// *direct* target matched, for `hide_targets`.
+    /// depth pinned by the alias target that led here, and `origin` the
+    /// position of that target among the targets of the alias being built
+    /// (`None` while its own targets are walked). Returns what each *direct*
+    /// target matched, for `hide_targets`.
     fn expand(
         &mut self,
         index: usize,
         stack: &mut Vec<usize>,
         inherited: Option<Depth>,
+        origin: Option<usize>,
         out: &mut Vec<AliasTarget>,
     ) -> Vec<Found> {
         let def = &self.defs[index];
         let root = self.defs[stack[0]].name;
         let mut direct = Vec::new();
-        for &target in &def.targets {
+        for (position, &target) in def.targets.iter().enumerate() {
+            let origin = origin.unwrap_or(position);
             let parsed = parse_model_suffix(target);
             if parsed.raw.is_some() && parsed.depth.is_none() {
                 self.warnings.push(format!(
@@ -748,10 +786,15 @@ impl AliasExpander<'_> {
             // The innermost pin wins: it is the most specific statement
             // about the model that finally serves the request.
             let pinned = parsed.depth.or(inherited);
+            // One entry per model and depth, whichever target got there
+            // first: a second one would only be the same attempt again.
             let mut push = |model: usize, pinned: Option<Depth>| {
-                let target = AliasTarget { model, pinned };
-                if !out.contains(&target) {
-                    out.push(target);
+                if !out.iter().any(|t| t.model == model && t.pinned == pinned) {
+                    out.push(AliasTarget {
+                        model,
+                        pinned,
+                        origin,
+                    });
                 }
             };
             match find_name(self.def_maps, self.table, parsed.base) {
@@ -777,7 +820,7 @@ impl AliasExpander<'_> {
                         continue;
                     }
                     stack.push(next);
-                    self.expand(next, stack, pinned, out);
+                    self.expand(next, stack, pinned, Some(origin), out);
                     stack.pop();
                     direct.push(Found::Alias(next));
                 }
@@ -852,7 +895,7 @@ fn build_aliases(
             table,
             warnings,
         };
-        let direct = expander.expand(index, &mut vec![index], None, &mut out);
+        let direct = expander.expand(index, &mut vec![index], None, None, &mut out);
         if defs[index].hide_targets {
             for found in direct {
                 match found {

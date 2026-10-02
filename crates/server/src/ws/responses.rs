@@ -16,9 +16,16 @@
 //! client sends counts as an answer, down to the bytes of a request that is
 //! still being uploaded.
 //!
-//! Turns always take the HTTP path to the upstream. Relaying to an
-//! upstream's own Responses WebSocket (`websocket = true` on an `openai`
-//! provider) is not implemented: such providers are served like any other.
+//! Turns always take the HTTP path to the upstream: there is no relay to an
+//! upstream's own Responses WebSocket, and no provider setting that asks
+//! for one.
+//!
+//! A turn the pipeline answers with an error becomes one frame
+//! `{"type":"error","status":<n>,"error":{…}}`. When the answer carried a
+//! `retry-after` header (a `429`: the model's credentials are resting, or
+//! the client key is over its rate limit), the frame's error object also
+//! has `headers: {"retry-after": "<seconds>"}` — a socket has no response
+//! headers to put it in.
 
 use super::transcript::{self, Completed, Fault, Prepared, Transcript};
 use super::{ClientSocket, GOING_AWAY, INTERNAL_ERROR};
@@ -283,7 +290,14 @@ fn with_lane(frame: String, lane: Option<&str>) -> String {
 }
 
 /// The error frame for a turn the pipeline answered with an error: the
-/// `error` object of the reply's body, under the status it came with.
+/// `error` object of the reply's body, under the status it came with:
+/// `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?}}`.
+///
+/// `error.headers` is present only when the reply carried a `retry-after`
+/// header, and then holds exactly that: `{"retry-after": "<seconds>"}` (a
+/// string, as a header value is). It is how a client of the socket learns
+/// how long to wait after a `429` — every credential of the model resting,
+/// the client key's own rate limit.
 fn error_frame(reply: &FullReply) -> Value {
     let status = if (400..=599).contains(&reply.status) {
         reply.status

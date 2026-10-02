@@ -4,14 +4,15 @@
 //
 // It syntax-checks every module, imports each one under Node (which catches
 // broken import paths and missing exports), checks that every route loads a
-// page component, asserts the pure logic in lib/ and the chart maths, then
-// renders components into a stub document (dom.mjs) and exercises the dev
-// server over real sockets (dev-server.mjs).
+// page component, asserts the pure logic in lib/ and the chart maths, checks
+// index.html against the gateway's Content-Security-Policy, then renders
+// components into a stub document (dom.mjs).
 // Run it before handing a page over. It does not replace looking at the page:
-// use tools/ui-dev.mjs for that.
+// run the gateway (cargo run -p switchyard) and open /admin/ for that.
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import vm from 'node:vm';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { installFrameClock } from './dom-stub.mjs';
@@ -31,8 +32,7 @@ function walk(dir) {
 const all = [
   ...walk(path.join(ui, 'js')).filter((f) => f.endsWith('.js')),
   ...walk(path.join(ui, 'tests')).filter((f) => f.endsWith('.mjs')),
-  path.resolve(ui, '..', 'tools', 'ui-dev.mjs'),
-].filter((f) => fs.existsSync(f));
+];
 let parsed = 0;
 for (const file of all) {
   const result = spawnSync(process.execPath, ['--check', file], { encoding: 'utf8' });
@@ -42,14 +42,29 @@ ${result.stderr}`);
 }
 console.log(`parsed ${parsed} modules`);
 
-// 1. Every module imports (app.js needs a document: it is only parsed here).
-const modules = walk(path.join(ui, 'js')).filter((f) => f.endsWith('.js') && !f.endsWith(`${path.sep}app.js`));
+// 1. Every module imports. Two files are only parsed above: app.js needs a
+// document, and theme-boot.js is a classic script for the browser (it is run
+// against a stub in step 18). A route module, a file directly in js/pages/,
+// must default-export its component. Sub-modules in js/pages/<name>/ are a
+// page's own business and may export whatever they like.
+const pagesDir = path.join(ui, 'js', 'pages');
+const notImported = new Set([path.join(ui, 'js', 'app.js'), path.join(ui, 'js', 'theme-boot.js')]);
+const modules = walk(path.join(ui, 'js')).filter((f) => f.endsWith('.js') && !notImported.has(f));
+/** Is this file a route module (and so needs a default-exported component)? */
+const isRouteModule = (file) => path.dirname(file) === pagesDir;
+assert.equal(isRouteModule(path.join(pagesDir, 'keys.js')), true);
+assert.equal(isRouteModule(path.join(pagesDir, 'keys', 'util.js')), false, 'a sub-module of a page is not a route module');
 let imported = 0;
+let routeModules = 0;
 for (const file of modules) {
   const mod = await import(pathToFileURL(file).href);
-  if (file.includes(`${path.sep}pages${path.sep}`)) assert.equal(typeof mod.default, 'function', `${file} needs a default export`);
+  if (isRouteModule(file)) {
+    assert.equal(typeof mod.default, 'function', `${file} needs a default export`);
+    routeModules += 1;
+  }
   imported += 1;
 }
+assert.ok(routeModules >= 11, 'the route modules were found');
 console.log(`imported ${imported} modules`);
 
 // 2. Routes: every entry loads a module with a default component.
@@ -105,6 +120,51 @@ assert.equal(f.formatRelativeTime(now + 5 * 60_000, now), 'in 5m');
 assert.equal(f.formatRelativeTime(now / 1000 - 3 * 3600, now), '3h ago'); // epoch seconds accepted
 assert.equal(f.plural(1, 'request'), '1 request');
 assert.equal(f.plural(2, 'request'), '2 requests');
+// A countdown in words ticks in whole seconds and rounds up: never "0s" with time left.
+assert.equal(f.formatCountdownWords(42), '42s');
+assert.equal(f.formatCountdownWords(41.2), '42s');
+assert.equal(f.formatCountdownWords(0.3), '1s');
+assert.equal(f.formatCountdownWords(0), '0s');
+assert.equal(f.formatCountdownWords(-5), '0s');
+assert.equal(f.formatCountdownWords(60), '1m 00s');
+assert.equal(f.formatCountdownWords(1781), '29m 41s');
+assert.equal(f.formatCountdownWords(3720), '1h 02m');
+assert.equal(f.formatCountdownWords(3600), '1h 00m');
+assert.equal(f.formatCountdownWords(90_000), '1d 1h');
+assert.equal(f.formatCountdownWords(undefined), '—');
+// A duration in words: the two largest units.
+assert.equal(f.formatDurationWords(30_000), '30 seconds');
+assert.equal(f.formatDurationWords(1000), '1 second');
+assert.equal(f.formatDurationWords(1_800_000), '30 minutes');
+assert.equal(f.formatDurationWords(5_400_000), '1 hour 30 minutes');
+assert.equal(f.formatDurationWords(86_400_000), '1 day');
+assert.equal(f.formatDurationWords(90_061_000), 'about 1 day 1 hour');
+assert.equal(f.formatDurationWords(0), '0 seconds');
+assert.equal(f.formatDurationWords(null), '—');
+// The whole instant: year and milliseconds always, the zone on request.
+{
+  const at = Date.UTC(2026, 9, 2, 14, 3, 27, 512);
+  assert.equal(f.formatTimestamp(at, { utc: true }), '2 Oct 2026 14:03:27.512 UTC');
+  const local = new Date(2026, 9, 2, 14, 3, 27, 512);
+  assert.equal(f.formatTimestamp(local), '2 Oct 2026 14:03:27.512');
+  assert.match(f.formatTimestamp(local, { zone: true }), /^2 Oct 2026 14:03:27\.512 UTC[+−]\d\d:\d\d$/);
+  assert.equal(f.formatTimestamp(null), '—');
+  // UTC variants of the existing formatters: a UTC day bucket keeps its date everywhere.
+  const midnight = Date.UTC(2026, 9, 2);
+  assert.equal(f.formatDate(midnight, new Date(Date.UTC(2026, 0, 1)), { utc: true }), '2 Oct');
+  assert.equal(f.formatTime(midnight, { utc: true }), '00:00:00');
+  assert.equal(f.formatTime(at, { utc: true, ms: true }), '14:03:27.512');
+  assert.match(f.formatDateTime(midnight, { utc: true }), /^2 Oct( 2026)? 00:00:00$/);
+}
+// A gateway message as a sentence, for text that is followed by more text.
+assert.equal(f.sentence('the request body is not valid JSON'), 'The request body is not valid JSON.');
+assert.equal(f.sentence('Already a sentence.'), 'Already a sentence.');
+assert.equal(f.sentence('is that so?'), 'Is that so?');
+assert.equal(f.sentence('routing.max_attempts: must be at least 1'), 'routing.max_attempts: must be at least 1.');
+assert.equal(f.sentence('rate_limit_rpm must be a whole number'), 'rate_limit_rpm must be a whole number.');
+assert.equal(f.sentence('`fast` has no routable target'), '`fast` has no routable target.');
+assert.equal(f.sentence(''), '');
+assert.equal(f.sentence(f.sentence('name must not be empty')), 'Name must not be empty.', 'applying it twice changes nothing');
 
 // 4. SSE parser: CRLF, split chunks, comments, multi-line data, [DONE], unterminated tail.
 const { createSSEParser, ApiError, API_BASE } = await import(url('js/lib/api.js'));
@@ -132,6 +192,13 @@ const r = await import(url('js/lib/router.js'));
 assert.deepEqual(r.parseHash('#/requests/req%201?status=error&q=a%20b'), { path: '/requests/req 1', segments: ['requests', 'req 1'], query: { status: 'error', q: 'a b' } });
 assert.deepEqual(r.parseHash(''), { path: '/', segments: [], query: {} });
 assert.equal(r.href('/requests/req 1', { status: 'error', empty: '', off: false, n: 0 }), '#/requests/req%201?status=error&n=0');
+assert.ok(r.sameRoute(r.parseHash('#/keys?a=1&b=2'), r.parseHash('#/keys?b=2&a=1')), 'the order of the query does not make a different view');
+assert.ok(!r.sameRoute(r.parseHash('#/keys?a=1'), r.parseHash('#/keys?a=2')));
+assert.ok(!r.sameRoute(r.parseHash('#/keys?a=1'), r.parseHash('#/keys')));
+assert.ok(!r.sameRoute(r.parseHash('#/keys'), r.parseHash('#/models')));
+assert.equal(typeof r.registerLeaveGuard, 'function');
+assert.equal(await r.mayLeave(), true, 'nothing objects when no guard is registered');
+// (The guards themselves are exercised in dom.mjs, against a stub history.)
 
 // 6. Store.
 const { createStore, shallowEqual } = await import(url('js/lib/store.js'));
@@ -154,6 +221,15 @@ assert.deepEqual(c.niceScale(0, 587).ticks, [0, 200, 400, 600]);
 assert.deepEqual(c.niceScale(0, 1).ticks, [0, 0.5, 1]);
 assert.deepEqual(c.niceScale(0, 0).ticks, [0, 0.5, 1]);
 assert.equal(c.niceScale(0, 1_950_000).max, 2_000_000);
+// Axes that count things: whole-number ticks, however small the maximum.
+assert.deepEqual(c.niceScale(0, 1, 4, { integer: true }).ticks, [0, 1], 'a maximum of 1 has no 0.5 tick');
+assert.deepEqual(c.niceScale(0, 0, 4, { integer: true }).ticks, [0, 1]);
+assert.deepEqual(c.niceScale(0, 3, 4, { integer: true }).ticks, [0, 1, 2, 3]);
+assert.deepEqual(c.niceScale(0, 1, 2, { integer: true }).ticks, [0, 1], 'also on a short chart, which asks for fewer ticks');
+assert.deepEqual(c.niceScale(0, 587, 4, { integer: true }).ticks, [0, 200, 400, 600], 'large counts are unchanged');
+for (const max of [1, 2, 3, 5, 7, 12, 99]) {
+  for (const target of [2, 4]) assert.ok(c.niceScale(0, max, target, { integer: true }).ticks.every(Number.isInteger), `whole ticks up to ${max}`);
+}
 assert.equal(c.seriesColor({ color: 'red' }, 0), 'red');
 assert.equal(c.seriesColor({}, 5), 'var(--series-6)');
 assert.equal(c.seriesColor({}, 6), 'var(--series-other)');
@@ -446,10 +522,123 @@ assert.equal(numberProblem('1,200', { max: 2000 }), null);
 assert.equal(numberProblem('', { min: 1 }), null);
 assert.equal(numberProblem('  ', { min: 1 }), null);
 
-// 17. Components in a document: see dom.mjs.
-await import('./dom.mjs');
+// 17. Icons the pages draw by hand until now.
+const { ICON_NAMES } = await import(url('js/components/icons.js'));
+for (const name of ['stop', 'arrow-left', 'grip']) assert.ok(ICON_NAMES.includes(name), `icon "${name}"`);
 
-// 18. The dev server: tools/ui-dev.mjs.
-await import('./dev-server.mjs');
+// 18. index.html under the gateway's Content-Security-Policy
+// (crates/admin/src/assets.rs: script-src 'self'). No inline script and no
+// inline event handler survives that policy, so there must be none; and the
+// theme has to be stamped by a blocking script before any stylesheet loads.
+{
+  const page = fs.readFileSync(path.join(ui, 'index.html'), 'utf8').replace(/<!--[\s\S]*?-->/g, '');
+  const scripts = [...page.matchAll(/<script\b([^>]*)>([\s\S]*?)<\/script>/gi)].map((m) => ({ attrs: m[1], body: m[2].trim(), at: m.index }));
+  assert.ok(scripts.length >= 2);
+  for (const script of scripts) {
+    assert.match(script.attrs, /\bsrc="[^":]+"/, 'every script is a same-origin file (script-src \'self\')');
+    assert.equal(script.body, '', 'no inline script: the policy blocks it');
+  }
+  assert.doesNotMatch(page, /<[^>]+\son[a-z]+\s*=/i, 'no inline event handlers');
+  assert.doesNotMatch(page, /javascript:/i);
+  const boot = scripts.find((s) => /src="js\/theme-boot\.js"/.test(s.attrs));
+  assert.ok(boot, 'the theme bootstrap is loaded from a file');
+  assert.doesNotMatch(boot.attrs, /\b(type="module"|async|defer)\b/, 'it blocks: the theme is set before the first paint');
+  assert.ok(boot.at < page.indexOf('rel="stylesheet"'), 'and it comes before the stylesheets');
+  assert.ok(boot.at < page.indexOf('<body'), 'in the head');
+
+  // The bootstrap itself, against the least it needs of a browser.
+  const source = fs.readFileSync(path.join(ui, 'js', 'theme-boot.js'), 'utf8');
+  const run = ({ stored, prefersLight = false, storageThrows = false }) => {
+    const attrs = {};
+    const meta = { content: '#101316', setAttribute: (name, value) => (meta[name] = value) };
+    vm.runInNewContext(source, {
+      document: {
+        documentElement: { setAttribute: (name, value) => (attrs[name] = value) },
+        querySelector: (selector) => (selector === 'meta[name="theme-color"]' ? meta : null),
+      },
+      localStorage: {
+        getItem: (key) => {
+          if (storageThrows) throw new Error('blocked');
+          return key === 'sy.theme' ? (stored ?? null) : null;
+        },
+      },
+      window: { matchMedia: true },
+      matchMedia: (query) => ({ matches: prefersLight && /prefers-color-scheme: light/.test(query) }),
+    });
+    return { theme: attrs['data-theme'], color: meta.content };
+  };
+  assert.deepEqual(run({ stored: 'light' }), { theme: 'light', color: '#eff1f4' }, 'a stored light theme is light from the first frame');
+  assert.deepEqual(run({ stored: 'dark', prefersLight: true }), { theme: 'dark', color: '#101316' }, 'a stored choice beats the system');
+  assert.deepEqual(run({ prefersLight: true }), { theme: 'light', color: '#eff1f4' }, 'without one the system decides');
+  assert.deepEqual(run({}), { theme: 'dark', color: '#101316' });
+  assert.deepEqual(run({ stored: 'purple' }), { theme: 'dark', color: '#101316' }, 'a value that is not ours is ignored');
+  assert.deepEqual(run({ storageThrows: true, prefersLight: true }), { theme: 'dark', color: '#101316' }, 'blocked storage is survived');
+  // The same key and colours as lib/theme.js, which takes over once the app runs.
+  const themeModule = fs.readFileSync(path.join(ui, 'js', 'lib', 'theme.js'), 'utf8');
+  for (const literal of ["'sy.theme'", "'#101316'", "'#eff1f4'"]) {
+    assert.ok(source.includes(literal) && themeModule.includes(literal), `theme-boot.js and lib/theme.js agree on ${literal}`);
+  }
+}
+
+// 19. Shared CSS: rules a page relies on and a browser-less check can still
+// hold on to. (How they look is checked in a browser.)
+{
+  const css = (name) => fs.readFileSync(path.join(ui, 'css', name), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const base = css('base.css');
+  const components = css('components.css');
+  /** The declarations of the first rule whose selector is exactly `selector`. */
+  const rule = (sheet, selector) => {
+    const escaped = selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const found = new RegExp(`(?:^|[}\\n])\\s*${escaped}\\s*\\{([^}]*)\\}`).exec(sheet);
+    assert.ok(found, `a rule for ${selector}`);
+    return found[1];
+  };
+  // The focus ring follows the element's own corners: no radius of its own.
+  assert.doesNotMatch(rule(base, ':focus-visible'), /border-radius/);
+  // The native clear button of a search field is hidden.
+  assert.match(base, /input\[type="search"\]::-webkit-search-cancel-button[^{]*\{[^}]*display:\s*none/);
+  // Fresh rows flash only when motion is welcome.
+  assert.match(components, /@media \(prefers-reduced-motion: no-preference\)\s*\{\s*\.table tbody tr\[data-fresh\]\s*\{[^}]*animation:/);
+  assert.doesNotMatch(components.replace(/@media \(prefers-reduced-motion: no-preference\)\s*\{[^{}]*\{[^{}]*\}\s*\}/g, ''), /tr\[data-fresh\]\s*\{[^}]*animation:/, 'the flash exists only inside that media query');
+  // Toasts can be lifted by a page; drawers and modals say what colour they are.
+  assert.match(rule(components, '.toasts'), /--toast-lift/);
+  assert.match(rule(components, '.track-bed'), /stroke:\s*var\(--surface-bg, var\(--bg-surface\)\)/);
+  assert.match(components, /\.modal,\s*\.drawer\s*\{[^}]*--surface-bg:\s*var\(--bg-raised\)/);
+  // Sticky headers: a variable for where they stop, 0 inside an overlay's body.
+  assert.match(rule(components, '.table[data-sticky] th'), /top:\s*var\(--table-sticky-top, 0px\)/);
+  assert.match(rule(components, '.table-wrap[data-page-sticky]'), /--table-sticky-top:\s*var\(--sticky-top, var\(--topbar-h\)\)/);
+  assert.match(rule(components, '.overlay-body'), /--sticky-top:\s*0px/);
+  // A focused row stops below the top bar and the sticky header, not under them.
+  assert.match(components, /\.table-wrap\[data-page-sticky\] tbody :is\(tr,[^)]*\[tabindex\]\)\s*\{[^}]*scroll-margin-top:\s*calc\(var\(--table-sticky-top\) \+/);
+  // No scroll-padding on the root: pages compensate for the top bar themselves (scroll-margin-top on their anchors).
+  assert.doesNotMatch(base + components + css('layout.css'), /scroll-padding/);
+  // The phone sort menu can be hidden by a page with one class.
+  assert.match(components, /:where\(\.table-wrap\[data-collapse\]\) \.table-sortbar\s*\{[^}]*display:\s*flex/);
+  assert.doesNotMatch(components, /(?<!:where\()\.table-wrap\[data-collapse\] \.table-sortbar/);
+  // Only icon buttons are squared inside an input; a segmented control in a field keeps its width.
+  assert.doesNotMatch(rule(components, '.input-actions .btn'), /width/);
+  assert.match(rule(components, '.input-actions .icon-btn'), /width/);
+  assert.match(rule(components, '.field > .seg'), /align-self:\s*flex-start/);
+  // A notice wraps on phones; legend labels are cut, not pushed out.
+  assert.match(components, /@media \(max-width: 720px\)\s*\{\s*\.notice\s*\{[^}]*flex-wrap:\s*wrap/);
+  assert.match(rule(components, '.chart-legend-label'), /text-overflow:\s*ellipsis/);
+}
+
+// 20. The guide tells the truth about the things this check can see.
+{
+  const guide = fs.readFileSync(path.join(ui, 'UI_GUIDE.md'), 'utf8');
+  assert.doesNotMatch(guide, /providers\.data\?\.providers/, 'the admin API returns bare arrays: rows=${providers.data}');
+  assert.match(guide, /rows=\$\{providers\.data\}/);
+  assert.doesNotMatch(guide, /ui-dev|dev-server/, 'the dev server is gone: the gateway serves ui/ from disk');
+  assert.match(guide, /cargo run -p switchyard/);
+  assert.equal(fs.existsSync(path.resolve(ui, '..', 'tools', 'ui-dev.mjs')), false);
+  assert.equal(fs.existsSync(path.join(ui, 'tests', 'dev-server.mjs')), false);
+  for (const name of ['useLeaveGuard', 'registerLeaveGuard', 'mayLeave', 'useLiveGap', 'keepPrevious', 'isPrevious', 'inLayer', 'returnFocus', 'errorTitle', 'sortMenu', 'data-row-key', 'lampLabel', 'tipFormat', 'minPoints', '--sticky-top', '--toast-lift', '--surface-bg', 'formatCountdownWords', 'formatDurationWords', 'formatTimestamp', 'sentence(', 'clearable', 'onClear', 'toneWord', 'toneLabel', 'overlayLocked']) {
+    assert.ok(guide.includes(name), `the guide documents ${name}`);
+  }
+}
+
+// 21. Components in a document: see dom.mjs.
+await import('./dom.mjs');
 
 console.log('all assertions passed');

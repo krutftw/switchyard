@@ -37,7 +37,7 @@ pub use error::PickError;
 pub use registry::SecretResolver;
 pub use scheduler::Scheduler;
 pub use types::{
-    CredentialId, CredentialSnapshot, CredentialStatus, CredentialView, LastError, Lease,
-    ModelCooldown, ModelEntry, ModelRoute, Outcome, PickRequest, ProviderSnapshot, Resolved,
+    CredentialId, CredentialSnapshot, CredentialStatus, CredentialView, DisabledBy, LastError,
+    Lease, ModelCooldown, ModelEntry, ModelRoute, Outcome, PickRequest, ProviderSnapshot, Resolved,
     ResolvedTarget, RouteRef,
 };

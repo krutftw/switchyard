@@ -96,6 +96,7 @@ async fn serve(path: &Path, args: &ServeArgs, log: LogControl) -> Result<(), Cli
 
     let mut admin = AdminOptions::from_env();
     admin.listen = Some(addr);
+    admin.tls = tls;
     let secret_from_env = admin.secret_override.is_some();
     let app = switchyard_server::router(gateway.clone())
         .merge(switchyard_admin::router(gateway.clone(), admin));

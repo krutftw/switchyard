@@ -15,7 +15,7 @@
 //               empty=${{ title: 'No providers yet', description: 'Add one to start routing.' }} />
 //   <//>`
 
-import { html, useMemo, useState } from '../../vendor/preact-htm.js';
+import { Component, html, useCallback, useLayoutEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
 import { Icon } from './icons.js';
 import { EmptyState, ErrorState, Skeleton } from './surface.js';
@@ -41,9 +41,107 @@ export function sortRows(rows, column, dir) {
 }
 
 /**
+ * The column's name as plain text: the label of its cells on phone cards
+ * (data-label) and its entry in the phone sort menu. `label` when given,
+ * else `header` when that is text.
+ */
+function columnLabel(column) {
+  if (column.label != null) return String(column.label);
+  return typeof column.header === 'string' || typeof column.header === 'number' ? String(column.header) : '';
+}
+
+const cellAttrs = (column) => ({
+  'data-align': column.align && column.align !== 'left' ? column.align : undefined,
+  'data-num': column.num ? '' : undefined,
+  'data-mono': column.mono ? '' : undefined,
+});
+
+/**
+ * One body row. A class with shouldComponentUpdate (the vendored Preact has
+ * no memo): the table renders again whenever a row is selected, a live row
+ * arrives or the parent ticks, and with a few thousand rows on screen
+ * rendering every cell each time is a visible pause. A row renders again
+ * only when something it shows has changed:
+ *
+ *   row        the record, by identity: replace a record to update its row
+ *   columns    the columns array, by identity: an array built on every
+ *              render keeps all rows up to date (and gives up the saving);
+ *              one from useMemo must list everything its `render`
+ *              functions read
+ *   selected, fresh, clickable
+ *   index      only when a column's render takes it as a second argument
+ */
+class TableRow extends Component {
+  shouldComponentUpdate(next) {
+    const now = this.props;
+    return (
+      next.row !== now.row ||
+      next.columns !== now.columns ||
+      next.selected !== now.selected ||
+      next.fresh !== now.fresh ||
+      next.clickable !== now.clickable ||
+      next.rowKey !== now.rowKey ||
+      (next.usesIndex && next.index !== now.index)
+    );
+  }
+
+  render({ row, index, rowKey, columns, selected, fresh, clickable, onActivate }) {
+    return html`
+      <tr
+        role="row"
+        data-row-key=${rowKey == null ? undefined : String(rowKey)}
+        data-clickable=${clickable ? '' : undefined}
+        data-selected=${selected ? '' : undefined}
+        data-fresh=${fresh ? '' : undefined}
+        tabindex=${clickable ? 0 : undefined}
+        onClick=${clickable
+          ? (event) => {
+              // Buttons, links and inputs inside a row act on their own.
+              if (event.target.closest('a, button, input, select, textarea, label')) return;
+              // Dragging to select text is not a click.
+              if (String(window.getSelection?.() ?? '').length > 0) return;
+              onActivate(row, event);
+            }
+          : undefined}
+        onKeyDown=${clickable
+          ? (event) => {
+              if (event.target !== event.currentTarget) return;
+              if (event.key === 'Enter' || event.key === ' ') {
+                event.preventDefault();
+                onActivate(row, event);
+              }
+            }
+          : undefined}
+      >
+        ${columns.map(
+          (column) => html`
+            <td
+              role="cell"
+              key=${column.key}
+              data-label=${columnLabel(column)}
+              data-primary=${column.primary ? '' : undefined}
+              data-hide-phone=${column.hideOnPhone ? '' : undefined}
+              ...${cellAttrs(column)}
+            >
+              ${column.render ? column.render(row, index) : row[column.key]}
+            </td>
+          `,
+        )}
+      </tr>
+    `;
+  }
+}
+
+/**
  * columns   [{
  *             key         unique id; also the row field read by default
- *             header      column heading (text)
+ *             header      column heading: text, markup (an abbreviation with
+ *                         its title, a visually hidden "Actions"), or
+ *                         nothing
+ *             label       the column's name as plain text, for the phone
+ *                         card (label of the cell) and the phone sort menu.
+ *                         Default: `header` when that is text. Give it when
+ *                         the header is markup or empty.
  *             render      (row, index) => cell content; default row[key]
  *             align       "left" | "right" | "center"
  *             num         numeric cell: monospace, tabular figures, no wrap
@@ -55,22 +153,36 @@ export function sortRows(rows, column, dir) {
  *             hideOnPhone drop this cell from the phone card
  *           }]
  * rows      array of records (undefined while loading)
- * rowKey    field name or (row) => key
+ * rowKey    field name or (row) => key. Each row carries it in the DOM as
+ *           data-row-key, so a page can find a row (to move focus to the
+ *           neighbour of a deleted one, say) without counting.
  * sort      { key, dir: "asc" | "desc" } for controlled sorting, with onSort;
  *           leave both out and the table sorts locally (defaultSort sets the
- *           initial order)
+ *           initial order). onSort(null) means "back to the default order"
+ *           (the phone sort menu always offers it).
  * onRowClick (row) => void; rows become focusable and respond to Enter
  * selectedKey  key of the row shown in a drawer, highlighted
  * freshKeys    Set of keys that arrived live just now; they flash once
  * loading   first load: skeleton rows
  * error     ApiError: shown in place of rows when there are none to show
+ * errorTitle  heading of that error state ("Could not load the providers");
+ *           default "Could not load this"
  * onRetry   retry handler for the error state
  * empty     { title, description, action, icon } for the empty state
- * sticky    keep the header visible while the table scrolls
+ * sticky    keep the header visible while the list scrolls (default true).
+ *           A table that scrolls with the page keeps its header under the
+ *           top bar; one with `maxHeight`, or one too wide for its box (it
+ *           then scrolls sideways in that box), keeps it at the top of its
+ *           own box. See --sticky-top in UI_GUIDE.md for a page with a
+ *           sticky bar of its own.
  * maxHeight CSS max-height; the table scrolls inside it (implies a scroll box)
  * dense     32px rows for streams
  * collapse  card layout on phones (default true)
+ * sortMenu  false leaves out the "Sort by" menu that collapsed tables show
+ *           on phones, for a page that has its own order control
  * caption   accessible description of the table
+ *
+ * Rows are memoised: see TableRow above for what makes a row render again.
  */
 export function Table({
   columns,
@@ -84,12 +196,14 @@ export function Table({
   freshKeys,
   loading = false,
   error = null,
+  errorTitle,
   onRetry,
   empty,
   sticky = true,
   maxHeight,
   dense = false,
   collapse = true,
+  sortMenu = true,
   caption,
   skeletonRows = 6,
   class: className,
@@ -107,6 +221,15 @@ export function Table({
     return sortRows(rows, columns.find((c) => c.key === activeSort.key), activeSort.dir);
   }, [rows, controlled, activeSort?.key, activeSort?.dir, columns]);
 
+  // Does any cell ask for the row's position? Then a row must follow it.
+  const usesIndex = useMemo(() => columns.some((c) => typeof c.render === 'function' && c.render.length > 1), [columns]);
+
+  // Rows get one handler for good; it calls whatever onRowClick is now.
+  const clickRef = useRef(onRowClick);
+  clickRef.current = onRowClick;
+  const activate = useCallback((row, event) => clickRef.current?.(row, event), []);
+  const clickable = typeof onRowClick === 'function';
+
   const changeSort = (next) => {
     if (controlled) onSort(next);
     else setLocalSort(next);
@@ -120,25 +243,48 @@ export function Table({
     else changeSort({ key: column.key, dir: activeSort.dir === 'asc' ? 'desc' : 'asc' });
   };
 
+  // Where the header sticks. `position: sticky` works against the nearest
+  // scrolling box, and a box that scrolls sideways is one: inside it the
+  // header can only stick to the box, which is useless when it is the page
+  // that scrolls. So a table that fits its box (the usual case) stops being
+  // a scroll box (overflow: clip) and its header sticks to the page, under
+  // the top bar. One that is too wide keeps scrolling sideways, as before.
+  const box = useRef(null);
+  const table = useRef(null);
+  const pageScrolled = sticky && !maxHeight;
+  const [fits, setFits] = useState(false);
+  useLayoutEffect(() => {
+    const wrapEl = box.current;
+    const tableEl = table.current;
+    if (!pageScrolled || !wrapEl || !tableEl) return undefined;
+    const measure = () => {
+      const next = tableEl.offsetWidth <= wrapEl.clientWidth + 1;
+      setFits((was) => (was === next ? was : next));
+    };
+    measure();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(measure);
+    observer.observe(wrapEl);
+    observer.observe(tableEl);
+    return () => observer.disconnect();
+  }, [pageScrolled]);
+
   const hasRows = sorted.length > 0;
   const showSkeleton = loading && !hasRows;
   const showError = error && !hasRows && !showSkeleton;
   const showEmpty = !hasRows && !showSkeleton && !showError;
 
-  const cellAttrs = (column) => ({
-    'data-align': column.align && column.align !== 'left' ? column.align : undefined,
-    'data-num': column.num ? '' : undefined,
-    'data-mono': column.mono ? '' : undefined,
-  });
-
   return html`
     <div
+      ref=${box}
       class=${cx('table-wrap', className)}
       data-collapse=${collapse ? '' : undefined}
       data-scroll=${maxHeight ? '' : undefined}
+      data-page-sticky=${pageScrolled && fits ? '' : undefined}
       style=${maxHeight ? `max-height:${maxHeight}` : undefined}
     >
-      ${sortable.length > 0 &&
+      ${sortMenu &&
+      sortable.length > 0 &&
       collapse &&
       hasRows &&
       html`
@@ -153,19 +299,21 @@ export function Table({
                 changeSort(key ? { key, dir } : null);
               }}
             >
-              ${!activeSort && html`<option value="">Default order</option>`}
-              ${sortable.map(
-                (c) => html`
-                  <option value=${`${c.key}:asc`}>${c.header}, ascending</option>
-                  <option value=${`${c.key}:desc`}>${c.header}, descending</option>
-                `,
-              )}
+              <option value="">Default order</option>
+              ${sortable.map((c) => {
+                const name = columnLabel(c) || c.key;
+                return html`
+                  <option value=${`${c.key}:asc`}>${name}, ascending</option>
+                  <option value=${`${c.key}:desc`}>${name}, descending</option>
+                `;
+              })}
             </select>
             <${Icon} name="chevron-down" size=${14} />
           </span>
         </label>
       `}
       <table
+        ref=${table}
         class="table"
         role="table"
         data-sticky=${sticky ? '' : undefined}
@@ -191,7 +339,7 @@ export function Table({
                   ${column.sortable
                     ? html`
                         <button type="button" class="th-sort" onClick=${() => toggleSort(column)}>
-                          <span>${column.header}</span>
+                          <span>${column.header ?? columnLabel(column)}</span>
                           <${Icon} name=${active ? (activeSort.dir === 'asc' ? 'arrow-up' : 'arrow-down') : 'sort'} size=${12} />
                         </button>
                       `
@@ -222,7 +370,7 @@ export function Table({
             <tr role="row">
               <td role="cell" class="table-state-cell" data-label="" colspan=${columns.length} style="padding:0">
                 ${showError
-                  ? html`<${ErrorState} error=${error} onRetry=${onRetry} compact />`
+                  ? html`<${ErrorState} error=${error} title=${errorTitle} onRetry=${onRetry} compact />`
                   : html`<${EmptyState} compact title=${empty?.title ?? 'Nothing to show'} description=${empty?.description} action=${empty?.action} icon=${empty?.icon} />`}
               </td>
             </tr>
@@ -230,50 +378,18 @@ export function Table({
           ${hasRows &&
           sorted.map((row, index) => {
             const key = keyOf(row);
-            const clickable = typeof onRowClick === 'function';
-            return html`
-              <tr
-                role="row"
-                key=${key}
-                data-clickable=${clickable ? '' : undefined}
-                data-selected=${selectedKey != null && key === selectedKey ? '' : undefined}
-                data-fresh=${freshKeys?.has(key) ? '' : undefined}
-                tabindex=${clickable ? 0 : undefined}
-                onClick=${clickable
-                  ? (event) => {
-                      // Buttons, links and inputs inside a row act on their own.
-                      if (event.target.closest('a, button, input, select, textarea, label')) return;
-                      // Dragging to select text is not a click.
-                      if (String(window.getSelection?.() ?? '').length > 0) return;
-                      onRowClick(row, event);
-                    }
-                  : undefined}
-                onKeyDown=${clickable
-                  ? (event) => {
-                      if (event.target !== event.currentTarget) return;
-                      if (event.key === 'Enter' || event.key === ' ') {
-                        event.preventDefault();
-                        onRowClick(row, event);
-                      }
-                    }
-                  : undefined}
-              >
-                ${columns.map(
-                  (column) => html`
-                    <td
-                      role="cell"
-                      key=${column.key}
-                      data-label=${column.header ?? ''}
-                      data-primary=${column.primary ? '' : undefined}
-                      data-hide-phone=${column.hideOnPhone ? '' : undefined}
-                      ...${cellAttrs(column)}
-                    >
-                      ${column.render ? column.render(row, index) : row[column.key]}
-                    </td>
-                  `,
-                )}
-              </tr>
-            `;
+            return html`<${TableRow}
+              key=${key}
+              row=${row}
+              index=${index}
+              rowKey=${key}
+              columns=${columns}
+              usesIndex=${usesIndex}
+              selected=${selectedKey != null && key === selectedKey}
+              fresh=${!!freshKeys?.has(key)}
+              clickable=${clickable}
+              onActivate=${activate}
+            />`;
           })}
         </tbody>
       </table>

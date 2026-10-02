@@ -203,8 +203,10 @@ fn openai_levels_expect(ask: Ask, _limit: bool) -> Value {
     match ask {
         // §5.2 step 6: off on a level model without `none` → `Levels[0]`.
         Ask::None => json!("low"),
-        // §5.2 step 5: auto without `DynamicAllowed` on a level model → medium.
-        Ask::Auto => json!("medium"),
+        // "Let the provider decide" is spelled on OpenAI's APIs by saying
+        // nothing: the effort is left out, whatever levels the model lists
+        // (the reference wrote `medium`, §5.2 step 5).
+        Ask::Auto => Value::Null,
         // §3 clampLevel: nearest supported level.
         Ask::Minimal => json!("low"),
         Ask::Low => json!("low"),
@@ -225,9 +227,11 @@ fn openai_levels_expect(ask: Ask, _limit: bool) -> Value {
 /// `levels [minimal, low, medium, high]`.
 fn openai_minimal_expect(ask: Ask, _limit: bool) -> Value {
     match ask {
-        // "`none` → effort `minimal`", "`auto` → effort `medium`".
+        // "`none` → effort `minimal`". For `auto` the reference wrote effort
+        // `medium`; the gateway leaves the effort out, which is how these
+        // APIs say "the provider decides".
         Ask::None => json!("minimal"),
-        Ask::Auto => json!("medium"),
+        Ask::Auto => Value::Null,
         Ask::Minimal => json!("minimal"),
         Ask::Low => json!("low"),
         Ask::Medium => json!("medium"),
@@ -354,8 +358,10 @@ fn claude_manual_expect(ask: Ask, _limit: bool) -> Value {
 fn claude_hybrid_expect(ask: Ask, _limit: bool) -> Value {
     match ask {
         Ask::None => disabled(),
-        // No dynamic mode: the midpoint budget (§5.2 step 5).
-        Ask::Auto => enabled(64512),
+        // A model that takes effort levels has adaptive thinking, which is
+        // Anthropic's "the provider decides": no effort, no budget. (Only a
+        // budget-only model gets the midpoint budget, as above.)
+        Ask::Auto => adaptive(None),
         // §7.3: level on an adaptive model → `adaptive` + effort; Anthropic
         // has no `minimal` (MapToClaudeEffort: minimal → low).
         Ask::Minimal => adaptive(Some("low")),

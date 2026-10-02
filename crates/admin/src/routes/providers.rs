@@ -1,15 +1,17 @@
 //! Providers and their credentials.
 
-use super::{JsonBody, OptionalJson, PathParam};
+use super::{
+    BODY_LIMIT, OptionalJson, PathParam, from_json_value, parse_json, read_body, shape_failure,
+};
 use crate::Shared;
 use crate::error::{ApiFailure, ApiResult, json_with_status, ok_json};
 use crate::views::{
     CredentialSource, credential_sources, provider_view_by_name, provider_views, scheduled_config,
 };
-use axum::extract::State;
+use axum::extract::{FromRequest, Request, State};
 use http::StatusCode;
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{Value, json};
 use switchyard_config_store::unmask_into;
 use switchyard_core::config::{ConfigIssue, CredentialConfig, ProviderConfig, resolve_secret};
 use switchyard_core::{ApiError, Config, ErrorKind};
@@ -51,17 +53,75 @@ fn normalise(mut provider: ProviderConfig) -> ProviderConfig {
     provider
 }
 
+/// A provider entry as `POST /providers` and `PUT /providers/{name}` take
+/// it: the entry, and which of its credentials say **`"api_key": null`**.
+///
+/// An empty `api_key` means "keep the stored key" (the dashboard only ever
+/// sees masks), which leaves no way to say "this credential has no key" —
+/// a keyless credential behind a proxy, say, that takes the place of one
+/// with a key. An explicit JSON `null` says exactly that: the credential
+/// ends up without a key, whatever is stored at its place or under its
+/// label.
+pub(crate) struct ProviderEntry {
+    provider: ProviderConfig,
+    /// Indexes into `provider.credentials` of the entries whose `api_key`
+    /// was `null`.
+    keyless: Vec<usize>,
+}
+
+impl ProviderEntry {
+    fn from_value(mut value: Value) -> Result<ProviderEntry, ApiFailure> {
+        let mut keyless = Vec::new();
+        if let Some(credentials) = value.get_mut("credentials").and_then(Value::as_array_mut) {
+            for (index, credential) in credentials.iter_mut().enumerate() {
+                if let Some(fields) = credential.as_object_mut()
+                    && fields.get("api_key").is_some_and(Value::is_null)
+                {
+                    // The entry's type has no place for `null`: the choice
+                    // is remembered here and the field left out.
+                    fields.remove("api_key");
+                    keyless.push(index);
+                }
+            }
+        }
+        let provider = from_json_value(value, "").map_err(shape_failure)?;
+        Ok(ProviderEntry { provider, keyless })
+    }
+}
+
+impl<S: Send + Sync> FromRequest<S> for ProviderEntry {
+    type Rejection = ApiFailure;
+
+    async fn from_request(request: Request, _state: &S) -> Result<Self, Self::Rejection> {
+        let bytes = read_body(request, BODY_LIMIT).await?;
+        ProviderEntry::from_value(parse_json(&bytes)?)
+    }
+}
+
+/// What stands in for the key of a credential that is to have none while
+/// secrets are restored: a literal no stored secret can equal, so the
+/// credential is taken for one whose key was replaced and nothing stored is
+/// handed to it.
+const NO_KEY: &str = "\u{1}no key\u{1}";
+
 /// Puts the stored secrets back into an incoming provider entry whose
 /// secrets are masked or empty, as `unmask_into` defines it. `index` is the
 /// position the entry takes in `current` (its length for a new provider).
+/// The credentials at `keyless` stay without a key (see [`ProviderEntry`]).
 ///
 /// Only issues about this provider are reported: the rest of the
 /// configuration is not part of the request.
 fn restore_secrets(
     current: &Config,
     index: usize,
-    incoming: ProviderConfig,
+    mut incoming: ProviderConfig,
+    keyless: &[usize],
 ) -> Result<ProviderConfig, ApiFailure> {
+    for &credential in keyless {
+        if let Some(credential) = incoming.credentials.get_mut(credential) {
+            credential.api_key = NO_KEY.to_string();
+        }
+    }
     let mut probe = current.clone();
     if index < probe.providers.len() {
         probe.providers[index] = incoming;
@@ -84,27 +144,42 @@ fn restore_secrets(
         }
     }
     let index = index.min(probe.providers.len().saturating_sub(1));
-    Ok(probe.providers.swap_remove(index))
+    let mut provider = probe.providers.swap_remove(index);
+    for &credential in keyless {
+        if let Some(credential) = provider.credentials.get_mut(credential) {
+            credential.api_key.clear();
+        }
+    }
+    Ok(provider)
+}
+
+/// 409: the name a provider is to get belongs to another one.
+fn name_taken(name: &str) -> ApiFailure {
+    ApiFailure::conflict_on(
+        "name",
+        "is the name of another provider",
+        format!("a provider named `{name}` already exists"),
+    )
 }
 
 /// `POST /providers`: adds a provider. Its name must be new.
-pub(crate) async fn create(
-    State(state): State<Shared>,
-    JsonBody(body): JsonBody<ProviderConfig>,
-) -> ApiResult {
+pub(crate) async fn create(State(state): State<Shared>, entry: ProviderEntry) -> ApiResult {
+    let ProviderEntry {
+        provider: body,
+        keyless,
+    } = entry;
     let body = normalise(body);
     let name = body.name.clone();
     let (config, ()) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
             if config.provider(&body.name).is_some() {
-                return Err(ApiFailure::conflict(format!(
-                    "a provider named `{}` already exists",
-                    body.name
-                )));
+                return Err(name_taken(&body.name));
             }
+            let index = config.providers.len();
+            scope.set(format!("providers[{index}]"));
             // A new provider inherits nothing: a masked secret in it cannot
             // be resolved and is reported.
-            let provider = restore_secrets(config, config.providers.len(), body)?;
+            let provider = restore_secrets(config, index, body, &keyless)?;
             config.providers.push(provider);
             Ok(())
         })
@@ -120,23 +195,25 @@ pub(crate) async fn create(
 pub(crate) async fn replace(
     State(state): State<Shared>,
     PathParam(name): PathParam,
-    JsonBody(body): JsonBody<ProviderConfig>,
+    entry: ProviderEntry,
 ) -> ApiResult {
+    let ProviderEntry {
+        provider: body,
+        keyless,
+    } = entry;
     let body = normalise(body);
     let new_name = body.name.clone();
     let (config, ()) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
             let Some(index) = config.providers.iter().position(|p| p.name == name) else {
                 return Err(unknown_provider(&name));
             };
+            scope.set(format!("providers[{index}]"));
             let renamed = body.name != name;
             if renamed && config.provider(&body.name).is_some() {
-                return Err(ApiFailure::conflict(format!(
-                    "a provider named `{}` already exists",
-                    body.name
-                )));
+                return Err(name_taken(&body.name));
             }
-            let provider = restore_secrets(config, index, body)?;
+            let provider = restore_secrets(config, index, body, &keyless)?;
             if renamed && !provider.name.is_empty() {
                 // Payload rules name the provider they apply to.
                 let payload = &mut config.payload;
@@ -161,7 +238,7 @@ pub(crate) async fn replace(
 /// `DELETE /providers/{name}`.
 pub(crate) async fn remove(State(state): State<Shared>, PathParam(name): PathParam) -> ApiResult {
     state
-        .edit_config(move |config| {
+        .edit_config(move |config, _| {
             let before = config.providers.len();
             config.providers.retain(|provider| provider.name != name);
             if config.providers.len() == before {
@@ -349,7 +426,7 @@ fn write_disabled(
 async fn set_credential_disabled(state: Shared, id: String, disabled: bool) -> ApiResult {
     let lookup = id.clone();
     let (config, provider_name) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, _| {
             let (provider_index, source) =
                 locate_credential(config, &lookup).ok_or_else(|| unknown_credential(&lookup))?;
             let provider = &mut config.providers[provider_index];
@@ -395,7 +472,8 @@ mod tests {
         let masked = mask_config(&stored);
 
         // Unchanged masks keep their keys.
-        let back = restore_secrets(&stored, 0, normalise(masked.providers[0].clone())).unwrap();
+        let back =
+            restore_secrets(&stored, 0, normalise(masked.providers[0].clone()), &[]).unwrap();
         assert_eq!(back.api_keys, [KEY_A, KEY_B]);
 
         // First key deleted, a blank row left behind, a new key added: the
@@ -406,13 +484,13 @@ mod tests {
             edited.api_keys[1].clone(),
             "sk-new-key".into(),
         ];
-        let back = restore_secrets(&stored, 0, normalise(edited)).unwrap();
+        let back = restore_secrets(&stored, 0, normalise(edited), &[]).unwrap();
         assert_eq!(back.api_keys, [KEY_B, "sk-new-key"]);
 
         // A blank row alone removes the keys; it does not resurrect one.
         let mut emptied = masked.providers[0].clone();
         emptied.api_keys = vec!["  ".into()];
-        let back = restore_secrets(&stored, 0, normalise(emptied)).unwrap();
+        let back = restore_secrets(&stored, 0, normalise(emptied), &[]).unwrap();
         assert!(back.api_keys.is_empty());
     }
 
@@ -422,14 +500,102 @@ mod tests {
         let masked = mask_config(&stored);
         let mut fresh = ProviderConfig::new("third", ProviderKind::Openai);
         fresh.api_keys = vec![masked.providers[0].api_keys[0].clone()];
-        let error = restore_secrets(&stored, stored.providers.len(), fresh).unwrap_err();
+        let error = restore_secrets(&stored, stored.providers.len(), fresh, &[]).unwrap_err();
         assert_eq!(error.status, StatusCode::UNPROCESSABLE_ENTITY);
         assert_eq!(error.issues[0].path, "providers[2].api_keys[0]");
 
         let mut literal = ProviderConfig::new("third", ProviderKind::Openai);
         literal.api_keys = vec!["sk-literal".into(), "env:THIRD_KEY".into()];
-        let back = restore_secrets(&stored, stored.providers.len(), literal).unwrap();
+        let back = restore_secrets(&stored, stored.providers.len(), literal, &[]).unwrap();
         assert_eq!(back.api_keys, ["sk-literal", "env:THIRD_KEY"]);
+    }
+
+    /// The reviewers' case: a credential with a key and a keyless one behind
+    /// a proxy are replaced by one keyless credential. Sent without a key it
+    /// would be handed the key stored at its position; `"api_key": null`
+    /// says that it has none.
+    #[test]
+    fn a_null_key_means_no_key() {
+        let mut provider = ProviderConfig::new("local", ProviderKind::OpenaiCompat);
+        provider.base_url = "http://127.0.0.1:9/v1".into();
+        provider.credentials = vec![
+            CredentialConfig {
+                api_key: KEY_A.into(),
+                label: "old".into(),
+                ..CredentialConfig::default()
+            },
+            CredentialConfig {
+                label: "keyless via proxy".into(),
+                proxy: "http://127.0.0.1:3128".into(),
+                ..CredentialConfig::default()
+            },
+        ];
+        let stored = Config {
+            providers: vec![provider],
+            ..Config::default()
+        };
+        let body = |api_key: Value| {
+            json!({
+                "name": "local",
+                "kind": "openai-compat",
+                "base_url": "http://127.0.0.1:9/v1",
+                "credentials": [{"label": "local", "api_key": api_key, "proxy": "http://127.0.0.1:3128"}],
+            })
+        };
+
+        // Empty, or left out: the key stored at that position is kept.
+        for kept in [body(json!("")), {
+            let mut body = body(json!(""));
+            body["credentials"][0]
+                .as_object_mut()
+                .unwrap()
+                .remove("api_key");
+            body
+        }] {
+            let entry = ProviderEntry::from_value(kept).unwrap();
+            assert!(entry.keyless.is_empty());
+            let back = restore_secrets(&stored, 0, entry.provider, &entry.keyless).unwrap();
+            assert_eq!(back.credentials[0].api_key, KEY_A);
+        }
+
+        // `null`: no key, and nothing of the sentinel either.
+        let entry = ProviderEntry::from_value(body(Value::Null)).unwrap();
+        assert_eq!(entry.keyless, [0]);
+        let back = restore_secrets(&stored, 0, entry.provider, &entry.keyless).unwrap();
+        assert_eq!(back.credentials.len(), 1);
+        assert_eq!(back.credentials[0].api_key, "");
+        assert_eq!(back.credentials[0].label, "local");
+        assert_eq!(back.credentials[0].proxy, "http://127.0.0.1:3128");
+        let written = serde_json::to_string(&back).unwrap();
+        assert!(!written.contains(KEY_A) && !written.contains("no key"));
+
+        // Next to a credential that keeps its key by its mask: only the
+        // `null` one loses it, wherever it sits.
+        let masked = mask_config(&stored);
+        let mixed = json!({
+            "name": "local",
+            "kind": "openai-compat",
+            "base_url": "http://127.0.0.1:9/v1",
+            "credentials": [
+                {"label": "keyless now", "api_key": null},
+                {"label": "old", "api_key": masked.providers[0].credentials[0].api_key},
+            ],
+        });
+        let entry = ProviderEntry::from_value(mixed).unwrap();
+        let back = restore_secrets(&stored, 0, entry.provider, &entry.keyless).unwrap();
+        assert_eq!(back.credentials[0].api_key, "");
+        assert_eq!(back.credentials[1].api_key, KEY_A);
+
+        // `null` is accepted for the key only.
+        let error = ProviderEntry::from_value(json!({
+            "name": "local", "kind": "openai-compat",
+            "credentials": [{"label": null}],
+        }))
+        .err()
+        .unwrap();
+        assert_eq!(error.status, StatusCode::BAD_REQUEST);
+        assert_eq!(error.issues[0].path, "credentials[0].label");
+        assert_eq!(error.issues[0].message, "expected a string, got null");
     }
 
     #[test]
@@ -437,7 +603,7 @@ mod tests {
         let stored = config();
         let mut renamed = mask_config(&stored).providers[1].clone();
         renamed.name = "claude".into();
-        let back = restore_secrets(&stored, 1, renamed).unwrap();
+        let back = restore_secrets(&stored, 1, renamed, &[]).unwrap();
         assert_eq!(back.name, "claude");
         assert_eq!(back.credentials[0].api_key, KEY_C);
     }

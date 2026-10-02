@@ -10,28 +10,20 @@
     <title>Switchyard</title>
 
     <!--
-      Theme bootstrap. Runs before the first paint so the page never flashes
-      the wrong theme: a stored choice wins, otherwise the operating system
-      decides. js/lib/theme.js applies the same rule once the app is running.
+      Theme bootstrap. A blocking classic script, ahead of the stylesheets, so
+      it has run before the first paint and the page never flashes the wrong
+      theme: a stored choice wins, otherwise the operating system decides.
+      js/lib/theme.js applies the same rule once the app is running.
+
+      It is a file on purpose. The gateway serves this page with
+      "Content-Security-Policy: script-src 'self'": an inline script or an
+      inline event handler here would be refused. Keep this document free of
+      both.
+
       Everything is local: no fonts, scripts or styles are fetched from
       another origin, so the dashboard works on an air-gapped host.
     -->
-    <script>
-      (function () {
-        var root = document.documentElement;
-        var theme = 'dark';
-        try {
-          var stored = localStorage.getItem('sy.theme');
-          if (stored === 'light' || stored === 'dark') theme = stored;
-          else if (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) theme = 'light';
-        } catch (e) {
-          /* storage blocked: stay on the default */
-        }
-        root.dataset.theme = theme;
-        var meta = document.querySelector('meta[name="theme-color"]');
-        if (meta) meta.setAttribute('content', theme === 'light' ? '#eff1f4' : '#101316');
-      })();
-    </script>
+    <script src="js/theme-boot.js"></script>
 
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
     <link rel="preload" href="fonts/archivo-latin-var.woff2" as="font" type="font/woff2" crossorigin />

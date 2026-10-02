@@ -15,6 +15,7 @@ use switchyard_core::config::{
     ProviderConfig, is_secret_reference, resolve_secret,
 };
 use switchyard_core::util::mask_secret;
+use switchyard_gateway::DiscoveryState;
 use switchyard_scheduler::{CredentialSnapshot, ModelEntry, ProviderSnapshot};
 use switchyard_telemetry::Totals;
 
@@ -46,7 +47,7 @@ pub(crate) fn provider_config_json(masked: &ProviderConfig) -> Map<String, Value
         Value::Object(map) => map,
         _ => Map::new(),
     };
-    let defaults: [(&str, Value); 19] = [
+    let defaults: [(&str, Value); 18] = [
         ("name", json!("")),
         ("kind", Value::Null),
         ("enabled", json!(true)),
@@ -63,7 +64,6 @@ pub(crate) fn provider_config_json(masked: &ProviderConfig) -> Map<String, Value
         ("wire_api", json!("auto")),
         ("legacy_max_tokens", Value::Null),
         ("stream_usage", Value::Null),
-        ("websocket", json!(false)),
         ("project", json!("")),
         ("location", json!("")),
     ];
@@ -170,6 +170,9 @@ fn credential_view(
         "disabled",
         json!(runtime.map_or(entry.disabled, |r| r.disabled)),
     );
+    // What switched it off, when its status is `disabled`: the provider,
+    // the credential's own entry, or a switch flipped at runtime.
+    put("disabled_by", json!(runtime.and_then(|r| r.disabled_by)));
     put(
         "weight",
         json!(runtime.map_or(entry.effective_weight(), |r| r.weight)),
@@ -217,13 +220,26 @@ fn credential_view(
     Value::Object(view)
 }
 
+/// Where the discovery of a provider's model list stands:
+/// `{state, at, error, models}`. A provider the gateway has not got to yet
+/// (the configuration that brings it was stored a moment ago) is `pending`
+/// without a time.
+fn discovery_view(discovery: Option<&DiscoveryState>) -> Value {
+    match discovery {
+        Some(discovery) => to_value(discovery),
+        None => json!({"state": "pending", "at": null, "error": null, "models": 0}),
+    }
+}
+
 /// One provider as `GET /providers` shows it: its configuration (secrets
-/// masked), its credentials merged with their runtime state, and the
-/// client-facing names of its models.
+/// masked), its credentials merged with their runtime state, the
+/// client-facing names of its models and where the discovery of its model
+/// list stands.
 pub(crate) fn provider_view(
     masked: &ProviderConfig,
     runtime: Option<&ProviderSnapshot>,
-    models: &[ModelEntry],
+    names: &[&str],
+    discovery: Option<&DiscoveryState>,
 ) -> Value {
     let editable = provider_config_json(masked);
     let mut view = editable.clone();
@@ -237,12 +253,6 @@ pub(crate) fn provider_view(
             credential_view(masked, *source, snapshot)
         })
         .collect();
-    let names: Vec<&str> = models
-        .iter()
-        .filter(|entry| entry.alias_targets.is_none())
-        .filter(|entry| entry.routes.iter().any(|r| r.provider == masked.name))
-        .map(|entry| entry.name.as_str())
-        .collect();
     let model_count = runtime.map_or(names.len(), |r| r.models);
 
     view.insert("credentials".to_string(), Value::Array(credentials));
@@ -253,6 +263,7 @@ pub(crate) fn provider_view(
         json!(masked.effective_base_url()),
     );
     view.insert("protocols".to_string(), json!(masked.protocols()));
+    view.insert("discovery".to_string(), discovery_view(discovery));
     view.insert("config".to_string(), Value::Object(editable));
     Value::Object(view)
 }
@@ -266,6 +277,31 @@ pub(crate) fn provider_view(
 /// applying it the two differ; the views then show the configuration alone
 /// (credential status `unknown`) rather than another row's state.
 pub(crate) fn provider_views(state: &AdminState, config: &Config) -> Vec<Value> {
+    views_of(state, config, None)
+}
+
+/// The client-facing names each provider serves, by provider name, each
+/// list in the model table's order (sorted).
+///
+/// Collected in one pass over the table: looking through every model's
+/// routes once per provider made the provider list quadratic in the number
+/// of providers.
+fn names_by_provider(models: &[ModelEntry]) -> HashMap<&str, Vec<&str>> {
+    let mut served: HashMap<&str, Vec<&str>> = HashMap::new();
+    for entry in models.iter().filter(|e| e.alias_targets.is_none()) {
+        for route in &entry.routes {
+            let names = served.entry(route.provider.as_str()).or_default();
+            // Two routes of one provider under one name are one name.
+            if names.last() != Some(&entry.name.as_str()) {
+                names.push(entry.name.as_str());
+            }
+        }
+    }
+    served
+}
+
+/// The views of every provider of `config`, or of the one at `only`.
+fn views_of(state: &AdminState, config: &Config, only: Option<usize>) -> Vec<Value> {
     let masked = mask_config(config);
     let scheduler = state.gateway.scheduler();
     let in_step = *scheduler.config() == *config;
@@ -283,17 +319,25 @@ pub(crate) fn provider_views(state: &AdminState, config: &Config) -> Vec<Value> 
     } else {
         Vec::new()
     };
+    let served = names_by_provider(&models);
+    let discoveries = state.gateway.discovery_states();
     masked
         .providers
         .iter()
-        .map(|provider| {
+        .enumerate()
+        .filter(|(index, _)| only.is_none_or(|only| only == *index))
+        .map(|(_, provider)| {
             let runtime = by_name
                 .get(provider.name.as_str())
                 .copied()
                 // A rebuild between the comparison above and the snapshot
                 // shows as a different number of credentials.
                 .filter(|runtime| runtime.credentials.len() == credential_sources(provider).len());
-            provider_view(provider, runtime, &models)
+            let names = served
+                .get(provider.name.as_str())
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            provider_view(provider, runtime, names, discoveries.get(&provider.name))
         })
         .collect()
 }
@@ -312,7 +356,7 @@ pub(crate) fn provider_view_by_name(
     name: &str,
 ) -> Option<Value> {
     let index = config.providers.iter().position(|p| p.name == name)?;
-    provider_views(state, config).into_iter().nth(index)
+    views_of(state, config, Some(index)).pop()
 }
 
 // ---------------------------------------------------------------------------
@@ -343,15 +387,34 @@ pub(crate) struct KeyUsage {
     pub last_used_at: Option<i64>,
 }
 
+/// Model patterns as the gateway reads them: trimmed, without blanks, each
+/// one once (the first place it appears in). This is how `POST /keys` and
+/// `PATCH /keys/{id}` store a list, and how a list written by hand into the
+/// file is shown.
+pub(crate) fn clean_models<S: AsRef<str>>(models: &[S]) -> Vec<String> {
+    let mut clean: Vec<String> = Vec::with_capacity(models.len());
+    for pattern in models {
+        let pattern = pattern.as_ref().trim();
+        if !pattern.is_empty() && !clean.iter().any(|kept| kept == pattern) {
+            clean.push(pattern.to_string());
+        }
+    }
+    clean
+}
+
+/// A client key as `GET /keys` shows it. Name and model patterns are shown
+/// the way the endpoints store them — a name padded with spaces or a list
+/// with blank and repeated patterns can only come from a hand-edited file,
+/// and means what its tidy form means.
 pub(crate) fn key_view(key: &ClientKey, usage: &KeyUsage) -> Value {
     json!({
         "id": key_id(key),
-        "name": key.name,
+        "name": key.name.trim(),
         "masked": mask_value(&key.key),
         "is_reference": is_secret_reference(&key.key),
         "resolved": key_resolved(key),
         "enabled": key.enabled,
-        "models": key.models,
+        "models": clean_models(&key.models),
         "rate_limit_rpm": key.rate_limit_rpm,
         "usage": {
             "requests": usage.totals.requests,
@@ -454,7 +517,6 @@ mod tests {
                 "wire_api",
                 "legacy_max_tokens",
                 "stream_usage",
-                "websocket",
                 "project",
                 "location",
             ]

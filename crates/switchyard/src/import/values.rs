@@ -2,8 +2,8 @@
 
 use serde_json::{Map, Value};
 use std::collections::HashSet;
-use switchyard_core::config::{ModelConfig, Strategy};
-use switchyard_core::{Effort, ThinkingSupport};
+use switchyard_core::config::{AliasConfig, ModelConfig, Strategy};
+use switchyard_core::{Config, Effort, ThinkingSupport};
 
 pub(super) fn lookup<'v>(root: &'v Map<String, Value>, path: &str) -> Option<&'v Value> {
     let mut segments = path.split('.');
@@ -158,6 +158,47 @@ pub(super) fn is_bcrypt_hash(secret: &str) -> bool {
         && ["$2a$", "$2b$", "$2y$"]
             .iter()
             .any(|p| secret.starts_with(p))
+}
+
+/// A secret that reads as an environment reference naming no variable
+/// (`env:`, `${}`). The source program uses such text as the secret itself;
+/// Switchyard's configuration refuses it, so it cannot be carried over.
+pub(super) fn is_empty_reference(secret: &str) -> bool {
+    let secret = secret.trim();
+    match secret.strip_prefix("env:") {
+        Some(name) => name.trim().is_empty(),
+        None => secret
+            .strip_prefix("${")
+            .and_then(|rest| rest.strip_suffix('}'))
+            .is_some_and(|name| name.trim().is_empty()),
+    }
+}
+
+/// Whether the configuration accepts `host` as `server.host`. Asked of the
+/// validation itself, so that the two cannot disagree.
+pub(super) fn is_valid_host(host: &str) -> bool {
+    let mut probe = Config::default();
+    probe.server.host = host.to_string();
+    !probe
+        .validate()
+        .iter()
+        .any(|issue| issue.path == "server.host")
+}
+
+/// Whether the configuration accepts `name` as the name of a virtual model
+/// (`[[aliases]]`): no spaces, no reasoning suffix. Asked of the validation
+/// itself, so that the two cannot disagree.
+pub(super) fn is_valid_alias_name(name: &str) -> bool {
+    let mut probe = Config::default();
+    probe.aliases.push(AliasConfig {
+        name: name.to_string(),
+        targets: vec!["target".to_string()],
+        hide_targets: false,
+    });
+    !probe
+        .validate()
+        .iter()
+        .any(|issue| issue.path == "aliases[0].name")
 }
 
 pub(super) fn strategy(name: &str) -> Option<Strategy> {
@@ -465,6 +506,28 @@ mod tests {
         assert!(is_bcrypt_hash("$2a$10$abcdefghijklmnopqrstuv"));
         assert!(!is_bcrypt_hash("$2a$"));
         assert!(!is_bcrypt_hash("plain-secret"));
+    }
+
+    #[test]
+    fn what_the_stricter_validation_refuses() {
+        for empty in ["env:", " env:  ", "${}", "${ }"] {
+            assert!(is_empty_reference(empty), "{empty}");
+        }
+        for named in ["env:NAME", "${NAME}", "plain", "", "$", "${"] {
+            assert!(!is_empty_reference(named), "{named}");
+        }
+        for host in ["127.0.0.1", "0.0.0.0", "::", "[::1]", "gw.internal"] {
+            assert!(is_valid_host(host), "{host}");
+        }
+        for host in ["a..b", "-x", "host:8317", ":::", "[]"] {
+            assert!(!is_valid_host(host), "{host}");
+        }
+        for name in ["big-pool", "fast(v2)", "or/pool"] {
+            assert!(is_valid_alias_name(name), "{name}");
+        }
+        for name in ["has space", "fast(high)", "deep(8192)", ""] {
+            assert!(!is_valid_alias_name(name), "{name}");
+        }
     }
 
     #[test]

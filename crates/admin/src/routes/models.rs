@@ -30,7 +30,8 @@ pub(crate) async fn put_aliases(
     JsonBody(aliases): JsonBody<Vec<AliasConfig>>,
 ) -> ApiResult {
     let (config, ()) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
+            scope.set("aliases");
             config.aliases = aliases;
             Ok(())
         })
@@ -49,7 +50,8 @@ pub(crate) async fn put_payload(
     JsonBody(payload): JsonBody<PayloadConfig>,
 ) -> ApiResult {
     let (config, ()) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
+            scope.set("payload");
             config.payload = payload;
             Ok(())
         })
@@ -68,7 +70,8 @@ pub(crate) async fn put_pricing(
     JsonBody(pricing): JsonBody<Vec<PriceConfig>>,
 ) -> ApiResult {
     let (config, ()) = state
-        .edit_config(move |config| {
+        .edit_config(move |config, scope| {
+            scope.set("pricing");
             config.pricing = pricing;
             Ok(())
         })

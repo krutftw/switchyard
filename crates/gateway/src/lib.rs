@@ -13,8 +13,8 @@
 //! * [`Gateway::count_tokens`], [`Gateway::raw`],
 //!   [`Gateway::open_upstream_ws`], [`Gateway::models`] cover the other
 //!   client routes;
-//! * [`Gateway::test_provider`] and [`Gateway::discover`] serve the admin
-//!   API.
+//! * [`Gateway::test_provider`], [`Gateway::discover`] and
+//!   [`Gateway::discovery_states`] serve the admin API.
 //!
 //! # One request
 //!
@@ -93,8 +93,8 @@ mod ws;
 pub use auth::ClientIdentity;
 pub use gateway::Gateway;
 pub use types::{
-    ClientRequest, FullReply, GatewayOptions, PresentedCredentials, ProviderTest, RawRequest,
-    Reply, StartError, StreamReply, WsOpenRequest,
+    ClientRequest, DiscoveryState, DiscoveryStatus, FullReply, GatewayOptions,
+    PresentedCredentials, ProviderTest, RawRequest, Reply, StartError, StreamReply, WsOpenRequest,
 };
 pub use ws::{UpstreamWsSession, WsEnd, WsOutcome};
 

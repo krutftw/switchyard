@@ -17,7 +17,7 @@
  * validated for colour-vision-deficiency separation; do not reorder it.
  *
  * Dark is the default. <html data-theme="light|dark"> is stamped before first
- * paint by the inline script in index.html.
+ * paint by js/theme-boot.js, loaded in the <head> of index.html.
  */
 
 @font-face {

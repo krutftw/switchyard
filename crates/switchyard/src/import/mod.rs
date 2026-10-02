@@ -42,6 +42,11 @@ const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const PAYLOAD_NESTED: &str = "requests.payload";
 const PAYLOAD_FLAT: &str = "payload";
 
+/// Why a secret written as `env:` or `${}` is left out. The text is fixed,
+/// so the secret itself never reaches the report.
+const EMPTY_REFERENCE: &str = "written as `env:` or `${}` with no name after it, which \
+     Switchyard reads as a reference to an environment variable that is not named; left out";
+
 /// The result of converting one source document.
 #[derive(Clone, Debug)]
 pub struct Imported {

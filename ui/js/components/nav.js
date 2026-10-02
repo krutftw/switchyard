@@ -11,9 +11,12 @@
 //   html`<${Segmented} label="Range" value=${range} onChange=${setRange}
 //          options=${['1h', '24h', '7d', '30d']} />`
 
-import { html, useRef } from '../../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useRef } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
 import { Icon } from './icons.js';
+
+/** Space kept between a revealed tab and the edge of its strip, in px (the width of the fade). */
+const TAB_REVEAL_MARGIN = 28;
 
 /**
  * Arrow-key movement shared by both. Returns the index to move to (which is
@@ -73,9 +76,56 @@ export function rovingIndex(key, index, count, isDisabled = () => false) {
  *
  * Keyboard: Tab enters the strip at the selected tab; arrows, Home and End
  * move and select, skipping disabled tabs.
+ *
+ * A strip wider than its box scrolls sideways (its scrollbar is hidden).
+ * The selected tab is brought into view inside the strip whenever the
+ * selection changes, by the URL or the palette as much as by a click; the
+ * page itself is never scrolled. An edge of the strip fades out while more
+ * tabs are hidden beyond it.
  */
 export function Tabs({ tabs, value, onChange, label, class: className }) {
   const list = useRef(null);
+
+  // Which edges have tabs beyond them: data-more-start / data-more-end, read
+  // by the CSS fade. Written straight to the element: scrolling the strip
+  // should not render it again.
+  const markEdges = () => {
+    const strip = list.current;
+    if (!strip || typeof strip.scrollWidth !== 'number') return;
+    const overflow = strip.scrollWidth - strip.clientWidth;
+    strip.toggleAttribute('data-more-start', overflow > 1 && strip.scrollLeft > 1);
+    strip.toggleAttribute('data-more-end', overflow > 1 && strip.scrollLeft < overflow - 1);
+  };
+
+  // Bring the selected tab into view by moving the strip's own scrollLeft.
+  // Not scrollIntoView: that scrolls every scrollable ancestor too, the page
+  // included.
+  useLayoutEffect(() => {
+    const strip = list.current;
+    if (!strip || typeof strip.scrollWidth !== 'number') return;
+    const tab = strip.querySelector('[aria-selected="true"]');
+    if (tab && strip.scrollWidth > strip.clientWidth + 1) {
+      const box = strip.getBoundingClientRect();
+      const at = tab.getBoundingClientRect();
+      // Room for the fade, so the tab is clear of it.
+      const margin = Math.min(TAB_REVEAL_MARGIN, Math.max(0, (strip.clientWidth - at.width) / 2));
+      if (at.left < box.left + margin) strip.scrollLeft += at.left - box.left - margin;
+      else if (at.right > box.right - margin) strip.scrollLeft += at.right - box.right + margin;
+    }
+    markEdges();
+  }, [value, tabs.length]);
+
+  // The strip's width follows the window; its content follows the labels and counts.
+  useEffect(() => {
+    const strip = list.current;
+    if (!strip) return undefined;
+    markEdges();
+    if (typeof ResizeObserver === 'undefined') return undefined;
+    const observer = new ResizeObserver(markEdges);
+    observer.observe(strip);
+    return () => observer.disconnect();
+  }, []);
+
   const onKeyDown = (event, index) => {
     const next = rovingIndex(event.key, index, tabs.length, (i) => !!tabs[i].disabled);
     if (next === -1) return;
@@ -87,7 +137,7 @@ export function Tabs({ tabs, value, onChange, label, class: className }) {
   // names no enabled tab (a stale id from the URL), the first enabled one.
   const stop = tabs.some((tab) => tab.id === value && !tab.disabled) ? value : tabs.find((tab) => !tab.disabled)?.id;
   return html`
-    <div ref=${list} class=${cx('tabs', className)} role="tablist" aria-label=${label}>
+    <div ref=${list} class=${cx('tabs', className)} role="tablist" aria-label=${label} onScroll=${markEdges}>
       ${tabs.map(
         (tab, index) => html`
           <button

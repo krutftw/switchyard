@@ -192,9 +192,9 @@ cargo build --release -p switchyard     # Rust 1.88+
 cargo test --workspace
 ```
 
-The dashboard in `ui/` has no build step and is embedded at compile time.
-`node tools/ui-dev.mjs --api http://127.0.0.1:8317` serves it from disk for
-development.
+The dashboard in `ui/` has no build step and is embedded at compile time. A
+debug build (`cargo run -p switchyard`) serves it straight from `ui/` on disk, so
+edits show up on reload; `node ui/tests/check.mjs` runs its self-checks.
 
 ## Acknowledgements
 

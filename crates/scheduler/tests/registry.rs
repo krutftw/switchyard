@@ -1103,7 +1103,7 @@ kind = "anthropic"
 
 #[test]
 fn credential_view_carries_transport_settings() {
-    let f = fixture(
+    let mut config = common::config(
         r#"
 [upstream]
 proxy = "http://global-proxy.test:8080"
@@ -1112,7 +1112,7 @@ proxy = "http://global-proxy.test:8080"
 name = "a"
 kind = "openai"
 api_keys = ["sk-a-plain-aaaaaaaaaaaaaaaa"]
-headers = { "X-Org" = " acme ", "X-Empty" = "" }
+headers = { "X-Org" = " acme " }
 
 [[providers.credentials]]
 api_key = "sk-a-own-proxy-aaaaaaaaaaaa"
@@ -1125,6 +1125,13 @@ proxy = "direct"
 api_keys = ["sk-b-aaaaaaaaaaaaaaaaaaaaaa"]
 "#,
     );
+    // A header without a value no longer passes validation; one that
+    // reaches the scheduler anyway (a configuration built in code) is
+    // dropped rather than sent empty.
+    config.providers[0]
+        .headers
+        .insert("X-Empty".to_string(), String::new());
+    let f = fixture_from(&config);
     let a = f.scheduler.credentials("a");
     assert_eq!(a.len(), 2);
     assert_eq!(a[0].proxy, "http://global-proxy.test:8080");

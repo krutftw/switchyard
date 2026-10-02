@@ -396,7 +396,7 @@ async fn the_environment_overrides_secret_and_remote_access() {
     let options = AdminOptions {
         secret_override: Some("  secret-from-the-environment  ".into()),
         allow_remote_override: true,
-        listen: None,
+        ..AdminOptions::default()
     };
     let app = App::start_with(BASE, options).await;
 

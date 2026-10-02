@@ -8,7 +8,7 @@
 // something the user needs (touch screens do not show tooltips at all).
 
 import { html, useEffect, useLayoutEffect, useRef, useState } from '../../vendor/preact-htm.js';
-import { cx, focusableWithin, placeFloating } from '../lib/dom.js';
+import { cx, focusableWithin, placeFloating, scrollMoves } from '../lib/dom.js';
 import { usePresence, useUid } from '../lib/hooks.js';
 import { Portal } from './portal.js';
 
@@ -66,7 +66,11 @@ export function Tooltip({ content, side = 'top', align = 'center', delay = 450, 
     const onKey = (event) => {
       if (event.key === 'Escape') hide();
     };
-    const onScroll = () => hide();
+    // Only scrolling that moves the anchor: a list elsewhere that scrolls by
+    // itself (a log tail) must not take every tooltip down.
+    const onScroll = (event) => {
+      if (scrollMoves(event.target, anchor.current)) hide();
+    };
     document.addEventListener('keydown', onKey);
     window.addEventListener('scroll', onScroll, true);
     return () => {

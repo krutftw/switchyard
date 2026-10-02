@@ -89,10 +89,21 @@ pub(crate) async fn clear(State(state): State<Shared>) -> ApiResult {
     ok_json(&json!({ "ok": true }))
 }
 
-/// `GET /logs?limit=&level=&q=&before=`.
+/// `GET /logs?limit=&level=&q=&target=&before=`: a page of the log buffer,
+/// plus `started_at`, the start of this process. Sequence numbers begin at
+/// 1 again after a restart, so a client that combines pages with live
+/// events needs to know which process the numbers belong to.
 pub(crate) async fn logs(
     State(state): State<Shared>,
     Params(query): Params<LogQuery>,
 ) -> ApiResult {
-    ok_json(&state.gateway.telemetry().logs().page(&query))
+    let telemetry = state.gateway.telemetry();
+    let mut page = crate::views::to_value(&telemetry.logs().page(&query));
+    if let serde_json::Value::Object(fields) = &mut page {
+        fields.insert(
+            "started_at".to_string(),
+            json!(telemetry.gauges().started_at()),
+        );
+    }
+    ok_json(&page)
 }

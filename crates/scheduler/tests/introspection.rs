@@ -285,11 +285,16 @@ fn model_table_lists_names_routes_and_availability() {
         vec![ModelRoute {
             provider: "openai".into(),
             upstream_model: "gpt-5.5".into(),
+            target: None,
+            // The tier of the best credential that can serve it: "second".
+            priority: 7,
             credentials_total: 4,
             // Two of the four are disabled / unusable.
             credentials_available: 2,
         }]
     );
+    assert!(table.iter().all(|entry| !entry.ignored));
+    assert_eq!(f.scheduler.models_routable(), 5);
 
     let sol = &table[4];
     assert_eq!(sol.info.id, "sol");
@@ -306,14 +311,25 @@ fn model_table_lists_names_routes_and_availability() {
     assert_eq!(smart.info.id, "smart");
     // Metadata of the first target.
     assert_eq!(smart.info.context_window, Some(1_000_000));
-    let routes: Vec<(&str, &str)> = smart
+    // Each route says which target it belongs to, as written.
+    let routes: Vec<(&str, &str, Option<&str>, i32)> = smart
         .routes
         .iter()
-        .map(|r| (r.provider.as_str(), r.upstream_model.as_str()))
+        .map(|r| {
+            (
+                r.provider.as_str(),
+                r.upstream_model.as_str(),
+                r.target.as_deref(),
+                r.priority,
+            )
+        })
         .collect();
     assert_eq!(
         routes,
-        vec![("claude", "claude-opus-4-6"), ("openai", "gpt-5.5")]
+        vec![
+            ("claude", "claude-opus-4-6", Some("claude-opus-4-6"), 0),
+            ("openai", "gpt-5.5", Some("gpt-5.5(high)"), 7)
+        ]
     );
 }
 
@@ -350,12 +366,14 @@ fn model_table_serialises() {
     let value = serde_json::to_value(f.scheduler.models()).unwrap();
     assert_eq!(value[2]["name"], "gpt-5.5");
     assert_eq!(value[2]["hidden"], false);
+    assert_eq!(value[2]["ignored"], false);
     assert!(value[2].get("alias_targets").is_none());
     assert_eq!(
         value[2]["routes"],
         json!([{
             "provider": "openai",
             "upstream_model": "gpt-5.5",
+            "priority": 7,
             "credentials_total": 4,
             "credentials_available": 2
         }])
@@ -366,6 +384,251 @@ fn model_table_serialises() {
         value[3]["alias_targets"],
         json!(["claude-opus-4-6", "gpt-5.5(high)"])
     );
+    assert_eq!(
+        value[3]["routes"],
+        json!([
+            {
+                "provider": "claude",
+                "upstream_model": "claude-opus-4-6",
+                "target": "claude-opus-4-6",
+                "priority": 0,
+                "credentials_total": 1,
+                "credentials_available": 1
+            },
+            {
+                "provider": "openai",
+                "upstream_model": "gpt-5.5",
+                "target": "gpt-5.5(high)",
+                "priority": 7,
+                "credentials_total": 4,
+                "credentials_available": 2
+            }
+        ])
+    );
+}
+
+/// Regression: an alias none of whose targets can be routed was listed like
+/// any other name (`routes: []`, nothing saying it is ignored) while the
+/// gateway ignored it, so the table and the model count disagreed.
+#[test]
+fn an_alias_without_a_routable_target_is_marked_and_not_counted() {
+    let f = fixture(
+        r#"
+[[providers]]
+name = "openai"
+kind = "openai"
+api_keys = ["sk-one-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers]]
+name = "parked"
+kind = "anthropic"
+enabled = false
+api_keys = ["sk-ant-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "claude-opus-4-6"
+
+[[aliases]]
+name = "dead"
+targets = ["no-such-model", "claude-opus-4-6"]
+
+[[aliases]]
+name = "alive"
+targets = ["gpt-5.5(low)"]
+hide_targets = true
+"#,
+    );
+    let table = f.scheduler.models();
+    let flags: Vec<(&str, bool, bool, usize)> = table
+        .iter()
+        .map(|m| (m.name.as_str(), m.ignored, m.hidden, m.routes.len()))
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            ("alive", false, false, 1),
+            ("dead", true, false, 0),
+            // Hidden from listings, still routable.
+            ("gpt-5.5", false, true, 1)
+        ]
+    );
+    // The count agrees with what can be routed, not with the rows.
+    assert_eq!(f.scheduler.models_routable(), 2);
+    assert_eq!(
+        table.iter().filter(|m| !m.ignored).count(),
+        f.scheduler.models_routable()
+    );
+    assert!(matches!(
+        f.pick("dead"),
+        Err(PickError::UnknownModel { .. })
+    ));
+    let value = serde_json::to_value(&table).unwrap();
+    assert_eq!(value[1]["ignored"], true);
+    assert_eq!(value[1]["routes"], json!([]));
+    assert_eq!(value[0]["ignored"], false);
+}
+
+/// Regression: routes carried no priority, so a dashboard had to join the
+/// provider list to tell which routes take the requests.
+#[test]
+fn route_priority_is_the_tier_of_the_best_credential_that_can_serve() {
+    let f = fixture(
+        r#"
+[[providers]]
+name = "low"
+kind = "openai"
+priority = 1
+api_keys = ["sk-low-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers]]
+name = "mixed"
+kind = "openai"
+priority = 5
+
+[[providers.credentials]]
+api_key = "sk-mixed-top-aaaaaaaaaaaaaaa"
+label = "top"
+priority = 9
+
+[[providers.credentials]]
+api_key = "sk-mixed-base-aaaaaaaaaaaaaa"
+label = "base"
+
+[[providers.credentials]]
+api_key = "sk-mixed-off-aaaaaaaaaaaaaaa"
+label = "off"
+priority = 50
+disabled = true
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers]]
+name = "keyless"
+kind = "openai"
+priority = 3
+
+[[providers.models]]
+id = "gpt-5.5"
+"#,
+    );
+    let priorities = || -> Vec<(String, i32, usize)> {
+        f.scheduler
+            .models()
+            .into_iter()
+            .find(|m| m.name == "gpt-5.5")
+            .unwrap()
+            .routes
+            .into_iter()
+            .map(|r| (r.provider, r.priority, r.credentials_available))
+            .collect()
+    };
+    let row = |provider: &str, priority: i32, available: usize| {
+        (provider.to_string(), priority, available)
+    };
+    // The disabled credential's 50 does not count; a provider without
+    // credentials shows its own priority.
+    assert_eq!(
+        priorities(),
+        vec![row("low", 1, 1), row("mixed", 9, 2), row("keyless", 3, 0)]
+    );
+
+    // The top credential rests: requests now reach the route at tier 5.
+    let lease = f.pick("gpt-5.5").unwrap();
+    assert_eq!(lease.credential.label, "top");
+    f.fail_class(&lease, FailureClass::Auth);
+    assert_eq!(
+        priorities(),
+        vec![row("low", 1, 1), row("mixed", 5, 1), row("keyless", 3, 0)]
+    );
+    // Nothing available: the tier of what could be selected at all.
+    let lease = f.pick("gpt-5.5").unwrap();
+    assert_eq!(lease.credential.label, "base");
+    f.fail_class(&lease, FailureClass::Auth);
+    assert_eq!(
+        priorities(),
+        vec![row("low", 1, 1), row("mixed", 9, 0), row("keyless", 3, 0)]
+    );
+}
+
+/// Regression: the routes of an alias were one flat list with nothing
+/// saying which target each belongs to or what depth that target pins.
+#[test]
+fn alias_routes_name_the_target_they_belong_to() {
+    let f = fixture(
+        r#"
+[[providers]]
+name = "one"
+kind = "openai"
+api_keys = ["sk-one-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers.models]]
+id = "gpt-6-sol"
+alias = "sol"
+
+[[providers]]
+name = "two"
+kind = "openai"
+api_keys = ["sk-two-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[aliases]]
+name = "inner"
+targets = ["sol(low)", "gpt-5.5"]
+
+[[aliases]]
+name = "outer"
+targets = ["gpt-5.5(high)", "inner(8192)", "gpt-5.5(high)", "nope"]
+"#,
+    );
+    let table = f.scheduler.models();
+    let outer = table.iter().find(|m| m.name == "outer").unwrap();
+    let routes: Vec<(&str, &str, &str)> = outer
+        .routes
+        .iter()
+        .map(|r| {
+            (
+                r.target.as_deref().unwrap_or("-"),
+                r.provider.as_str(),
+                r.upstream_model.as_str(),
+            )
+        })
+        .collect();
+    assert_eq!(
+        routes,
+        vec![
+            ("gpt-5.5(high)", "one", "gpt-5.5"),
+            ("gpt-5.5(high)", "two", "gpt-5.5"),
+            // What the nested alias expands to carries the target that
+            // names it: `sol` at its own pin, `gpt-5.5` at the inherited
+            // one (a different attempt from the first target's).
+            ("inner(8192)", "one", "gpt-6-sol"),
+            ("inner(8192)", "one", "gpt-5.5"),
+            ("inner(8192)", "two", "gpt-5.5"),
+        ]
+    );
+    // Models have no target.
+    let plain = table.iter().find(|m| m.name == "gpt-5.5").unwrap();
+    assert!(plain.routes.iter().all(|r| r.target.is_none()));
+    // Resolution is what the table says: three attempts, in that order.
+    let resolved = f.scheduler.resolve("outer").unwrap();
+    let targets: Vec<(&str, usize)> = resolved
+        .targets
+        .iter()
+        .map(|t| (t.client_model.as_str(), t.routes.len()))
+        .collect();
+    assert_eq!(targets, vec![("gpt-5.5", 2), ("sol", 1), ("gpt-5.5", 2)]);
 }
 
 #[test]

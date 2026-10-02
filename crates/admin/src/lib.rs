@@ -49,6 +49,7 @@ mod auth;
 mod error;
 mod key_usage;
 mod routes;
+mod shape;
 mod state;
 mod views;
 mod ws;
@@ -72,6 +73,10 @@ pub struct AdminOptions {
     pub allow_remote_override: bool,
     /// The address the server listens on, for `GET /admin/api/status`.
     pub listen: Option<std::net::SocketAddr>,
+    /// Whether that listener serves HTTPS (`server.tls` was in effect when
+    /// it was bound), for `GET /admin/api/status`: the address alone does
+    /// not say which scheme a client has to use.
+    pub tls: bool,
 }
 
 impl AdminOptions {
@@ -88,6 +93,7 @@ impl AdminOptions {
             secret_override,
             allow_remote_override,
             listen: None,
+            tls: false,
         }
     }
 }

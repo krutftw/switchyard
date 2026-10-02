@@ -72,6 +72,10 @@ pub(crate) struct ModelState {
 #[derive(Clone, Debug, Default)]
 pub(crate) struct CredState {
     pub runtime_disabled: bool,
+    /// Why the credential cannot be used, as found out at runtime by the
+    /// gateway (see `Scheduler::set_unusable`): something the configuration
+    /// alone cannot tell, such as a service-account file that is missing.
+    pub runtime_unusable: Option<String>,
     /// Rest period covering every model.
     pub cooldown: Option<Cooldown>,
     /// The failure behind `cooldown`: when it happened and its one-line
@@ -363,7 +367,7 @@ pub(crate) fn rate_limit_backoff_ms(base_secs: u64, max_secs: u64, streak: u32) 
 /// and quoted to clients in "cooling down" errors) and removes key material:
 /// the credential's own key should the upstream have echoed it, and anything
 /// else shaped like a vendor key or token.
-fn scrub(message: &str, secret: &str) -> String {
+pub(crate) fn scrub(message: &str, secret: &str) -> String {
     let without_own = redact_own_secret(message, secret);
     let one_line = without_own.split_whitespace().collect::<Vec<_>>().join(" ");
     truncate_chars(&mask_key_like(&one_line), ERROR_MESSAGE_CHARS)

@@ -1476,8 +1476,10 @@ fn output_format(request: &Request) -> OutputFormat {
 ///   text. A Chat Completions client asks by turning reasoning on (it has no
 ///   other way to), so its effort brings `summary: "auto"` along unless it
 ///   said otherwise. OpenAI only generates summaries for verified
-///   organisations on some models; an operator whose organisation is not
-///   can remove the field with a payload filter rule.
+///   organisations on some models. Nothing has to be configured for one
+///   that is not: the gateway asks an upstream that refuses the summary
+///   once more without it and then leaves the field out by itself for that
+///   provider (or model).
 /// * Output format: see [`output_format`] for what becomes of a JSON schema
 ///   and of JSON mode written for another vendor.
 /// * When the model may reason and the request does not rely on stored state

@@ -7,9 +7,9 @@ it takes or returns. All of it is re-exported from the crate root.
 
 ```rust
 use switchyard_gateway::{
-    ClientIdentity, ClientRequest, FullReply, Gateway, GatewayOptions, PresentedCredentials,
-    ProviderTest, RawRequest, Reply, StartError, StreamReply, UpstreamWsSession, WsEnd,
-    WsOpenRequest, WsOutcome,
+    ClientIdentity, ClientRequest, DiscoveryState, DiscoveryStatus, FullReply, Gateway,
+    GatewayOptions, PresentedCredentials, ProviderTest, RawRequest, Reply, StartError,
+    StreamReply, UpstreamWsSession, WsEnd, WsOpenRequest, WsOutcome,
     // conveniences re-exported from dependencies:
     ConfigStore, Transport, UpstreamWebSocket, WsMessage,
 };
@@ -28,8 +28,9 @@ config store are still applied). `Default` is `./switchyard.toml`, watched.
 Loads and validates the configuration (the file must exist), builds telemetry
 (data directory = `server.data_dir` resolved against the config file's
 directory; usage history is loaded), the scheduler, the upstream client and
-the reasoning store, registers the mock provider's models, and spawns the
-background tasks: config watcher, the task that applies configuration
+the reasoning store, registers the mock providers' models (all of them in one
+go), checks the service-account files (see Configuration changes), and spawns
+the background tasks: config watcher, the task that applies configuration
 changes, model discovery, telemetry writers and the hourly prune. Needs a
 tokio runtime. `Gateway` is `Clone + Send + Sync + 'static`; clones share
 everything.
@@ -82,18 +83,55 @@ a secret. Nothing is published while the bus has no subscriber.
 ## Configuration changes
 
 The gateway reacts to `ConfigStore::subscribe()`: whatever the store applies —
-a file change or an admin edit — rebuilds the scheduler (credential state is
-kept), the client-key table (rate-limit counts of unchanged keys are kept),
-reconfigures telemetry, drops cached service-account files, forgets which
-providers and models refused reasoning summaries (see Generation), calls the
-log-level hook, re-runs model discovery in the background and publishes
-`Event::ConfigReloaded { ok: true, .. }` on the telemetry bus.
+a file change or an admin edit — rebuilds the scheduler once (credential
+state is kept; the mock providers' model lists go in with the rebuild), reads
+the service-account files again (below), rebuilds the client-key table
+(rate-limit counts of unchanged keys are kept), reconfigures telemetry,
+forgets which providers and models refused reasoning summaries (see
+Generation), calls the log-level hook, publishes
+`Event::ConfigReloaded { ok: true, .. }` on the telemetry bus and then starts
+model discovery in the background — for the providers the change concerns
+(see `discovery_states` under Admin operations). Applying costs the same
+whether the configuration has three providers or three hundred times that
+per provider: nothing in it is done once per provider *per* provider.
+
+**Service-account files.** Every credential that names a
+`service_account_file` has the file (resolved against the configuration
+file's directory) read and validated when a configuration is applied. A file
+that is missing, unreadable or not a usable key file marks the credential
+unusable through `Scheduler::set_unusable`, with a reason that names the file
+and the problem — `cannot read the service account file `sa.json`: …`, `the
+service account file `sa.json` is not usable: `private_key` is not a PEM
+block` — and never anything the file holds, nor the directory it is looked
+for in. Such a credential is never picked, shows `usable: false`, status
+`unusable` and the reason in snapshots, and is listed by
+`Scheduler::warnings()`. A file that is fine takes the mark off, and so does
+a credential that stops naming a file: one that has an `api_key` as well
+keeps its id (and with it the scheduler's mark) when its
+`service_account_file` is removed, so the gateway remembers which marks it
+set and takes off those whose credential no longer names a file. The check
+runs again before `test_provider` and `discover`, so repairing the file and
+testing the provider brings the credential back without a reload. Checks run
+one at a time, and the one for a configuration always runs after any that
+began under the previous one.
 
 A configuration the store **refuses** (`ConfigEvent::Rejected`: a broken edit
 of the file, a failed `reload_from_disk`) changes nothing and is announced as
 `Event::ConfigReloaded { ok: false, message }`, the message naming the first
 issues — so the dashboard can say why a save had no effect without following
 `ConfigStore::events()` itself.
+
+**Order of the announcements.** `ConfigReloaded` events are published in the
+order the store decided things, however far the gateway is behind: `ok:
+false` for a refused file comes before the `ok: true` of the file that put
+it right, and after the `ok: true` of a configuration applied before it. The
+latest event therefore says how the file stands. (The store reports verdicts
+in order on `events()` and the configuration itself on `subscribe()`; the
+gateway takes its order from the verdicts and applies whatever configuration
+is waiting when it reads an `Applied`. When several were applied and refused
+before it got to look, the configuration is applied once, on the first
+`Applied`, and a later `Applied` that follows a refusal is announced again
+without applying anything twice.)
 
 ## Authentication
 
@@ -297,6 +335,10 @@ as an attempt starts, so a request abandoned mid-call (status 499) still says
 who was called; a cancelled call is listed as an attempt with status 499.
 Captured bodies (`logging.request_log`) always describe one attempt, the
 last: what was sent, and what came back — the upstream's error body included.
+They can be read (`telemetry().bodies().read(id)`) from the moment
+`request.finished` is published for a record with `has_bodies`: whoever
+reacts to the event finds them, whether or not the file is written yet. A
+request served by a `mock` provider has no upstream response to capture.
 
 **What the client sees of the upstream.** Passthrough forwards the upstream's
 bytes — a complete Responses body that reports a failed generation excepted
@@ -394,7 +436,7 @@ that has none, or for embeddings from a chat model.
 
 `path_and_query` is relative to the provider's API root with `{model}`
 standing for the upstream model id: `"realtime?model={model}"` for the
-Realtime relay, `"responses"` for the Responses relay. `headers` are the
+Realtime relay (the one relay the server has). `headers` are the
 client's request headers; only an allow-list is offered to the upstream
 handshake (`openai-beta`, `openai-safety-identifier`,
 `sec-websocket-protocol`, `x-client-request-id`).
@@ -475,7 +517,10 @@ upstream's HTTP status (`0`: no response) — or, for a `2xx` whose body is not
 a usable response, the status that failure amounts to (429 for a failed
 generation that was rate limited, 400 for one that blames the request, 502
 otherwise). `error` is omitted when `None` and is addressed to the operator:
-it says what the upstream said (credentials removed).
+it says what the upstream said, without key material — the credential that
+was used is removed, and anything else the upstream quoted that is shaped
+like a key, a token or a password is masked
+(`switchyard_telemetry::redact_text`).
 
 ### `Gateway::discover(&self, provider) -> Result<Vec<ModelInfo>, ApiError>` (async)
 
@@ -483,7 +528,48 @@ Asks the provider's upstream for its model list now (first usable credential,
 short timeouts), feeds it to the scheduler and returns it. For a `mock`
 provider returns the built-in list. 404 for an unknown provider, 503 when it
 has no usable credential, otherwise the upstream failure converted to an
-`ApiError`.
+`ApiError` whose message is masked like a provider test's `error`. The
+outcome is recorded as the provider's discovery state, unless that state is
+`off`.
+
+### `Gateway::discovery_states(&self) -> HashMap<String, DiscoveryState>`
+
+Where the discovery of each provider's model list stands, by provider name;
+every provider of the configuration in effect has an entry.
+
+`DiscoveryState { state, at, error, models }` is `Serialize` with every field
+always present:
+
+| Field | Meaning |
+|---|---|
+| `state: DiscoveryStatus` | `"off"` — the upstream is not asked: the provider is disabled, has `discover = false`, lists its `models` itself, or is a `mock`. `"pending"` — a listing is under way and none has answered since the provider's settings last changed. `"ok"` — the latest listing succeeded. `"failed"` — the latest listing failed. |
+| `at: Option<i64>` | Unix ms: when the latest listing succeeded or failed; while `pending`, when it was started. `None` for `off`. |
+| `error: Option<String>` | `failed` only: why, as one line of at most 300 characters ("provider `x` has no usable credential" when there was nothing to ask with). Without key material: the transport removes the credential the listing was asked with, and anything else the upstream quotes that is shaped like a key, a token or a password is masked with `switchyard_telemetry::redact_text`, like the log line of the same failure. |
+| `models: usize` | Models in the upstream's list that is in use (`Scheduler::discovered_models`): the latest successful listing's — also after a later listing failed, **which keeps the previous list**, and across the provider being switched off and on again — and `0` when there is none (or the provider's `kind` or `base_url` changed, which drops the list). `0` while `off`. |
+
+Discovery runs in the background, never holding up a request or a
+configuration edit:
+
+* **at start** for every provider that wants it;
+* **after a configuration change** only for the providers whose
+  discovery-relevant settings changed: a provider that is new; another
+  `kind`, `base_url`, `api_keys`, `credentials`, `proxy`, `headers`,
+  `project` or `location`; a provider that wants discovery now and did not
+  before (enabled, `discover` switched on, its `models` list emptied); and
+  every provider when `upstream.proxy` changed. Editing anything else — an
+  alias, a price, a client key, the provider's `priority`, `prefix` or
+  `exclude` — asks nobody: the lists are kept;
+* **after a reload that changed nothing** (`reload_from_disk` on an unchanged
+  file) for every provider that wants it: that is the operator asking again;
+* **on request**, through `discover`.
+
+A background listing that finishes after the provider's settings changed
+again, or after the provider is gone, is dropped: its list does not reach the
+scheduler and its outcome does not replace the newer state. That holds when
+a provider is removed and created again under the same name while the first
+one's listing is still under way: listings are numbered across all providers
+for as long as the gateway runs, so the old listing is never taken for the
+new provider's.
 
 ---------------------------------------------------------------------------
 
@@ -578,15 +664,21 @@ match gateway.generate(request).await {
 }
 ```
 
-When the serving provider is `openai` with `websocket = true`, use
-`open_upstream_ws` with `path_and_query: "responses"` instead and relay frames
-in both directions; call `session.finish(..)` when either side closes, and
-close the client with 1012 after `WsOutcome::upstream_failed`. If
-`open_upstream_ws` returns `Err` (the upstream has no WebSocket endpoint
-after all, or every credential refused), serve the connection with HTTP turns
-as above: the refusal has not taken the model out of rotation. Pass close
-reasons and upstream error messages you show or log through
-`session.redact(..)`.
+The error frame is `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?}}`.
+The Responses WebSocket error frame may carry `error.headers`: when
+`full.header("retry-after")` is set (a `429` for resting credentials or for
+the client key's rate limit), put it there as
+`"headers": {"retry-after": "<seconds>"}` — a socket has no response headers,
+and this is where the vendor's own protocol puts them.
+
+Turns always take this HTTP path, whatever the upstream: there is no provider
+setting that asks for a relay to an upstream's own Responses WebSocket (the
+`websocket` option of earlier versions was removed; it never did anything).
+`open_upstream_ws` serves the Realtime relay below. Should a server relay
+frames of another upstream WebSocket endpoint with it, the same rules apply
+as there: call `session.finish(..)` when either side closes, close the client
+with 1012 after `WsOutcome::upstream_failed`, and pass close reasons and
+upstream error messages you show or log through `session.redact(..)`.
 
 ## Realtime relay
 

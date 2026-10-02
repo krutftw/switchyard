@@ -1,10 +1,9 @@
 {
   "name": "switchyard-dashboard",
   "private": true,
-  "description": "Switchyard dashboard sources. There is no build step and there are no dependencies; this file only tells Node and editors that the .js files are ES modules.",
+  "description": "Switchyard dashboard sources. There is no build step and there are no dependencies; this file only tells Node and editors that the .js files are ES modules. To work on the dashboard, run the gateway (cargo run -p switchyard): a debug build serves this directory from disk.",
   "type": "module",
   "scripts": {
-    "dev": "node ../tools/ui-dev.mjs",
     "check": "node tests/check.mjs"
   }
 }

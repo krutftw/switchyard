@@ -347,11 +347,15 @@ async fn invalid_providers_are_refused_and_change_nothing() {
         .collect();
     assert_eq!(
         paths,
-        [
-            "providers[1].name",
-            "providers[1].base_url",
-            "providers[1].proxy"
-        ]
+        // By their place in the request body, the provider entry.
+        ["name", "base_url", "proxy"]
+    );
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("the configuration is not valid: name: may only contain"),
+        "{body}"
     );
 
     // A masked secret in a new provider has nothing to stand for.
@@ -362,10 +366,7 @@ async fn invalid_providers_are_refused_and_change_nothing() {
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(
-        body["error"]["issues"][0]["path"],
-        "providers[1].api_keys[0]"
-    );
+    assert_eq!(body["error"]["issues"][0]["path"], "api_keys[0]");
 
     let (status, body) = app
         .put(
@@ -374,7 +375,7 @@ async fn invalid_providers_are_refused_and_change_nothing() {
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(body["error"]["issues"][0]["path"], "providers[0].base_url");
+    assert_eq!(body["error"]["issues"][0]["path"], "base_url");
 
     assert_eq!(app.file(), BASE);
     assert_eq!(names(&app.get_ok("/providers").await), ["mock"]);
@@ -450,10 +451,7 @@ async fn masked_secrets_round_trip_through_put() {
     bogus["api_keys"] = json!(["sk-zzz…9999"]);
     let (status, body) = app.put("/providers/upstream", bogus).await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(
-        body["error"]["issues"][0]["path"],
-        "providers[1].api_keys[0]"
-    );
+    assert_eq!(body["error"]["issues"][0]["path"], "api_keys[0]");
     assert_eq!(
         app.gateway
             .config()

@@ -17,30 +17,46 @@ import { cx } from '../lib/dom.js';
 
 export const TONES = ['clear', 'caution', 'stop', 'info', 'off'];
 
+const TONE_WORDS = { clear: 'Healthy', caution: 'Warning', stop: 'Critical', info: 'In progress', off: 'Inactive' };
+
+/**
+ * A tone in a word a person would say: the name of a lamp that was given no
+ * words of its own. The tone names themselves ("caution", "stop") are the
+ * design system's vocabulary, not the reader's.
+ */
+export function toneWord(tone) {
+  return TONE_WORDS[tone] ?? TONE_WORDS.off;
+}
+
 /**
  * A signal lamp, usually with its label.
  *
  * tone    see above; default "off"
  * label   visible text next to the lamp. A lamp without a label must get
- *         `title` so the state is not carried by colour alone.
+ *         `title` so the state is not carried by colour alone (without one
+ *         its accessible name is toneWord(tone): "Warning", "Critical").
  * detail  quieter text after the label (a countdown, a count)
  * pulse   a slow ring for things that are live right now
  * size    "md" | "lg"
+ * Other props (data-*, id, aria-describedby) and `class` go to the root
+ * element: the lamp itself when there is no label, else the wrapper.
  */
-export function StatusLamp({ tone = 'off', label, detail, pulse = false, size = 'md', title, class: className }) {
+export function StatusLamp({ tone = 'off', label, detail, pulse = false, size = 'md', title, class: className, ...rest }) {
+  const alone = label == null;
   const lamp = html`<span
-    class="lamp"
+    class=${cx('lamp', alone && className)}
     data-tone=${tone}
     data-size=${size === 'lg' ? 'lg' : undefined}
     data-pulse=${pulse ? '' : undefined}
     role=${label ? undefined : 'img'}
-    aria-label=${label ? undefined : title || tone}
+    aria-label=${label ? undefined : title || toneWord(tone)}
     aria-hidden=${label ? 'true' : undefined}
     title=${label ? undefined : title}
+    ...${alone ? rest : null}
   ></span>`;
-  if (label == null) return lamp;
+  if (alone) return lamp;
   return html`
-    <span class=${cx('status', className)} title=${title}>
+    <span class=${cx('status', className)} title=${title} ...${rest}>
       ${lamp}
       <span>${label}</span>
       ${detail != null && html`<span class="status-detail">${detail}</span>`}
@@ -55,8 +71,9 @@ export function StatusLamp({ tone = 'off', label, detail, pulse = false, size = 
  * mono     monospace, for identifiers (protocols, HTTP status, model ids)
  * outline  hairline outline instead of a wash, for quieter metadata
  * lamp     show a lamp in the badge's tone before the text
+ * Other props (data-*, id, aria-*) go to the badge's element.
  */
-export function Badge({ tone = 'neutral', mono = false, outline = false, lamp = false, title, class: className, children }) {
+export function Badge({ tone = 'neutral', mono = false, outline = false, lamp = false, title, class: className, children, ...rest }) {
   return html`
     <span
       class=${cx('badge', className)}
@@ -64,6 +81,7 @@ export function Badge({ tone = 'neutral', mono = false, outline = false, lamp = 
       data-mono=${mono ? '' : undefined}
       data-outline=${outline ? '' : undefined}
       title=${title}
+      ...${rest}
     >
       ${lamp && html`<span class="lamp" data-tone=${tone === 'neutral' ? 'off' : tone} aria-hidden="true"></span>`}${children}
     </span>

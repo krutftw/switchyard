@@ -128,7 +128,11 @@ function toText(value, language) {
  *            JavaScript sees it (large integers rounded, 1.0 as 1).
  * language   "auto" (default): objects and JSON-looking strings are
  *            pretty-printed and coloured; "json": always colour; "text": never
- * title      label in the header bar; without it the tools float top right
+ * title      label in the header bar (text or markup); without it the tools
+ *            float top right
+ * label      accessible name of the scrolling block. Default: the title
+ *            when it is a string, else "Code". Give one when the title is
+ *            markup.
  * wrap       initial wrap state when the user has no stored preference
  *            (default false: long lines scroll sideways)
  * copy       show the copy button (default true)
@@ -136,7 +140,7 @@ function toText(value, language) {
  * note       quiet footer line ("Truncated at 64 KB")
  * actions    extra controls in the tools row
  */
-export function CodeBlock({ value, language = 'auto', title, wrap = false, copy = true, maxHeight = '420px', note, actions, class: className }) {
+export function CodeBlock({ value, language = 'auto', title, label, wrap = false, copy = true, maxHeight = '420px', note, actions, class: className }) {
   const [wrapped, setWrapped] = useLocalStorage('code.wrap', wrap);
   const { text, json } = useMemo(() => toText(value, language), [value, language]);
   const body = useMemo(() => (json && text.length <= HIGHLIGHT_LIMIT ? highlightJson(text) : text), [text, json]);
@@ -160,7 +164,7 @@ export function CodeBlock({ value, language = 'auto', title, wrap = false, copy 
       ${title
         ? html`<div class="code-bar"><span class="code-title">${title}</span>${tools}</div>`
         : tools}
-      <pre class="code-pre" tabindex="0" style=${maxHeight ? `max-height:${maxHeight}` : undefined} aria-label=${title || 'Code'}><code>${body}</code></pre>
+      <pre class="code-pre" tabindex="0" style=${maxHeight ? `max-height:${maxHeight}` : undefined} aria-label=${label || (typeof title === 'string' && title) || 'Code'}><code>${body}</code></pre>
       ${note && html`<div class="code-note">${note}</div>`}
     </div>
   `;

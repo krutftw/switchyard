@@ -12,14 +12,24 @@ import { EmptyState, ErrorState, Page, Skeleton } from '../components/surface.js
 import { Toaster } from '../components/toast.js';
 import { Tooltip } from '../components/tooltip.js';
 import { api } from '../lib/api.js';
+import { overlayLocked } from '../lib/dom.js';
 import { formatTime } from '../lib/format.js';
 import { hotkeyLabel, useHotkey, useIsPhone, useLocalStorage, useNow, useResource } from '../lib/hooks.js';
 import { live, liveState } from '../lib/live.js';
-import { href, navigate, useRoute } from '../lib/router.js';
+import { href, mayLeave, navigate, useRoute } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import { setThemePref, theme } from '../lib/theme.js';
 import { DEFAULT_ROUTE, NAV_GROUPS, ROUTES, matchRoute } from '../routes.js';
 import { CommandPalette } from './palette.js';
+
+/**
+ * Sign out, unless a view has something to lose and the user decides to
+ * stay (lib/router.js, leave guards). Every sign-out control goes through
+ * here. A session the gateway ends (a 401) cannot be held back.
+ */
+export async function signOut() {
+  if (await mayLeave(null, 'signout')) api.logout();
+}
 
 // ---------------------------------------------------------------------------
 // Live connection indicator
@@ -197,7 +207,7 @@ function MoreSheet({ open, onClose, currentPath, version }) {
         </div>
       </div>
       <div class="sheet-section">
-        <${Button} icon="logout" block onClick=${() => api.logout()}>Sign out<//>
+        <${Button} icon="logout" block onClick=${signOut}>Sign out<//>
       </div>
     <//>
   `;
@@ -330,7 +340,26 @@ export function Shell() {
     setMoreOpen(false);
   }, [currentPath]);
 
-  useHotkey('mod+k', () => setPaletteOpen((open) => !open));
+  // Ctrl/Cmd+K toggles the palette. It may open over a drawer or a dialog
+  // (its commands go through the leave guards like any other navigation),
+  // but not while a layer that is not dismissable is open: that layer has
+  // said it must be dealt with first (a save in flight, a secret shown
+  // once). Every layer is asked, not only the topmost: a menu open inside
+  // such a dialog is itself dismissable and does not change the answer.
+  // `inLayer`: the key is pressed with focus inside whatever layer is open,
+  // the palette itself included.
+  const openPalette = () => {
+    if (overlayLocked()) return;
+    setPaletteOpen(true);
+  };
+  useHotkey(
+    'mod+k',
+    () => {
+      if (paletteOpen) setPaletteOpen(false);
+      else openPalette();
+    },
+    { inLayer: true },
+  );
   useHotkey('mod+b', () => setRail((value) => !value), { enabled: !isPhone });
 
   const commands = useMemo(
@@ -365,7 +394,7 @@ export function Shell() {
         group: 'Actions',
         icon: 'logout',
         keywords: 'log out logout leave lock',
-        run: () => api.logout(),
+        run: () => signOut(),
       },
     ],
     [],
@@ -385,7 +414,7 @@ export function Shell() {
             <${LogoMark} size=${22} />
             <span class="brand-name">Switchyard</span>
           </a>
-          <button type="button" class="palette-trigger" aria-label="Open the command palette" aria-keyshortcuts="Control+K Meta+K" onClick=${() => setPaletteOpen(true)}>
+          <button type="button" class="palette-trigger" aria-label="Open the command palette" aria-keyshortcuts="Control+K Meta+K" onClick=${openPalette}>
             <${Icon} name="search" size=${14} />
             <span>Jump to…</span>
             <${Kbd}>${hotkeyLabel('mod+k')}<//>
@@ -393,7 +422,7 @@ export function Shell() {
           <div class="topbar-spacer"></div>
           <div class="topbar-actions">
             <${LiveChip} />
-            ${isPhone && html`<${IconButton} icon="search" label="Search pages and actions" onClick=${() => setPaletteOpen(true)} />`}
+            ${isPhone && html`<${IconButton} icon="search" label="Search pages and actions" onClick=${openPalette} />`}
             ${!isPhone && html`<${ThemeMenu} />`}
             ${!isPhone &&
             html`<${Menu}
@@ -401,7 +430,7 @@ export function Shell() {
               icon="lock"
               items=${[
                 { heading: 'Admin session' },
-                { label: 'Sign out', icon: 'logout', onSelect: () => api.logout() },
+                { label: 'Sign out', icon: 'logout', onSelect: () => signOut() },
               ]}
             />`}
           </div>

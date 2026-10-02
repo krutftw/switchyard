@@ -41,14 +41,21 @@ import { Notice } from './surface.js';
  *              the scrim and the close button (set it while saving). Your
  *              own buttons in the footer are yours to disable.
  *
+ * returnFocus  where focus goes on closing if the control that opened the
+ *              dialog cannot take it back (it was removed, or disabled): an
+ *              element, a ref, or a function returning an element. Without
+ *              it the nearest focusable thing around the opener is used
+ *              (its row, its drawer, the page's main region). A focus the
+ *              page has placed itself by then is never taken away.
+ *
  * Focus goes to the element marked autoFocus (data-autofocus), else the
  * first control.
  */
-export function Modal({ open, onClose, title, description, size = 'sm', footer, dismissable = true, class: className, children }) {
+export function Modal({ open, onClose, title, description, size = 'sm', footer, dismissable = true, returnFocus, class: className, children }) {
   const ref = useRef(null);
   const titleId = useUid('modal-title');
   const { mounted, state } = usePresence(open, 140);
-  useModalLayer(ref, open, { onClose, dismissable });
+  useModalLayer(ref, open, { onClose, dismissable, returnFocus });
   if (!mounted) return null;
   return html`
     <${Portal}>
@@ -89,7 +96,7 @@ export function Modal({ open, onClose, title, description, size = 'sm', footer, 
  *   html`<${Drawer} open=${!!id} onClose=${() => setQuery({ open: null })}
  *         title="Request" subtitle=${id} width="640px">...<//>`
  *
- * open, onClose, title, footer, dismissable: as Modal
+ * open, onClose, title, footer, dismissable, returnFocus: as Modal
  * subtitle  monospace line under the title (an id)
  * actions   controls in the header, before the close button
  * width     CSS width on desktop (default 560px); phones use the full width
@@ -98,11 +105,11 @@ export function Modal({ open, onClose, title, description, size = 'sm', footer, 
  * Keep the open record's id in the URL (useQueryParam) so the drawer can be
  * linked to and Back closes it.
  */
-export function Drawer({ open, onClose, title, subtitle, actions, footer, width, side = 'right', dismissable = true, class: className, children }) {
+export function Drawer({ open, onClose, title, subtitle, actions, footer, width, side = 'right', dismissable = true, returnFocus, class: className, children }) {
   const ref = useRef(null);
   const titleId = useUid('drawer-title');
   const { mounted, state } = usePresence(open, 200);
-  useModalLayer(ref, open, { onClose, dismissable });
+  useModalLayer(ref, open, { onClose, dismissable, returnFocus });
   if (!mounted) return null;
   return html`
     <${Portal}>
@@ -159,8 +166,10 @@ export function Drawer({ open, onClose, title, subtitle, actions, footer, width,
  * onClose       called after a successful confirm and on cancel
  * typeToConfirm when set, the user must type this text first (for wiping
  *               usage data, for example)
+ * returnFocus   as Modal: where focus goes if the control that asked is gone
+ *               when the dialog closes (the row that was just deleted)
  */
-export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, onConfirm, onClose, typeToConfirm, children }) {
+export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', cancelLabel = 'Cancel', danger = false, onConfirm, onClose, typeToConfirm, returnFocus, children }) {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState(null);
   const [typed, setTyped] = useState('');
@@ -195,6 +204,7 @@ export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', 
       onClose=${() => !busy && onClose?.('cancelled')}
       title=${title}
       dismissable=${!busy}
+      returnFocus=${returnFocus}
       footer=${html`
         <${Button} disabled=${busy} data-autofocus=${danger && typeToConfirm == null ? '' : undefined} onClick=${() => onClose?.('cancelled')}>${cancelLabel}<//>
         <${Button}
@@ -247,6 +257,11 @@ const confirmStore = createStore({ request: null });
  *
  * Resolves true once confirmed (and, with `action`, once it succeeded), false
  * when cancelled. Needs <ConfirmHost /> mounted, which the app shell does.
+ *
+ * `returnFocus` (an element, a ref, or a function returning an element) says
+ * where focus goes when the control that asked is gone by the time the
+ * dialog closes; without it the nearest focusable thing around that control
+ * gets it.
  */
 export function confirm(options) {
   return new Promise((resolve) => {
@@ -274,6 +289,7 @@ export function ConfirmHost() {
       cancelLabel=${options.cancelLabel}
       danger=${options.danger}
       typeToConfirm=${options.typeToConfirm}
+      returnFocus=${options.returnFocus}
       onConfirm=${options.action}
       onClose=${(reason) => {
         if (!request) return;

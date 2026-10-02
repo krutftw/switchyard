@@ -53,6 +53,9 @@ const PATHS = {
   filter: html`<path d="M3 5h18" /><path d="M6.5 12h11" /><path d="M10 19h4" />`,
   play: html`<path d="M7 4.5v15l12-7.5Z" />`,
   pause: html`<path d="M8 5v14M16 5v14" />`,
+  stop: html`<rect x="6" y="6" width="12" height="12" rx="1.5" />`,
+  // Six dots: the handle of a row that can be dragged to reorder.
+  grip: html`<circle cx="9" cy="6" r="1.25" fill="currentColor" /><circle cx="15" cy="6" r="1.25" fill="currentColor" /><circle cx="9" cy="12" r="1.25" fill="currentColor" /><circle cx="15" cy="12" r="1.25" fill="currentColor" /><circle cx="9" cy="18" r="1.25" fill="currentColor" /><circle cx="15" cy="18" r="1.25" fill="currentColor" />`,
   logout: html`<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" /><path d="m16 17 5-5-5-5" /><path d="M21 12H9" />`,
   wrap: html`<path d="M3 6h18" /><path d="M3 12h15a3 3 0 1 1 0 6h-4" /><path d="m16 16-2 2 2 2" /><path d="M3 18h7" />`,
   table: html`<rect x="3" y="3" width="18" height="18" rx="2" /><path d="M3 9h18M3 15h18M9 3v18" />`,
@@ -72,6 +75,7 @@ const PATHS = {
   'arrow-up': html`<path d="M12 19V5" /><path d="m5 12 7-7 7 7" />`,
   'arrow-down': html`<path d="M12 5v14" /><path d="m19 12-7 7-7-7" />`,
   'arrow-right': html`<path d="M5 12h14" /><path d="m12 5 7 7-7 7" />`,
+  'arrow-left': html`<path d="M19 12H5" /><path d="m12 19-7-7 7-7" />`,
   sidebar: html`<rect x="3" y="3" width="18" height="18" rx="2" /><path d="M9 3v18" />`,
   command: html`<path d="M15 6v12a3 3 0 1 0 3-3H6a3 3 0 1 0 3 3V6a3 3 0 1 0-3 3h12a3 3 0 1 0-3-3" />`,
   sun: html`<circle cx="12" cy="12" r="4" /><path d="M12 2v2M12 20v2M4.900 4.900l1.400 1.400M17.700 17.700l1.400 1.400M2 12h2M20 12h2M4.900 19.100l1.400-1.400M17.700 6.300l1.400-1.400" />`,

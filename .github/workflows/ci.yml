@@ -18,7 +18,7 @@ env:
 
 jobs:
   lint:
-    name: Format, Clippy, UI syntax
+    name: Format, Clippy, dashboard checks
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
@@ -29,12 +29,8 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
-      - name: Dashboard syntax check
-        run: |
-          set -e
-          find ui/js tools -name '*.js' -o -name '*.mjs' | while read -r f; do
-            node --check "$f"
-          done
+      - name: Dashboard checks
+        run: node ui/tests/check.mjs
 
   test:
     name: Test (${{ matrix.os }})

@@ -429,6 +429,11 @@ pub struct StatsTick {
     pub p50_ms: u64,
     /// 95th percentile request duration over the last hour.
     pub p95_ms: u64,
+    /// Requests `p50_ms` and `p95_ms` were computed from. `0` means no
+    /// request finished in the last hour and the two percentiles (then `0`)
+    /// say nothing: show "no data", not "0 ms".
+    #[serde(default)]
+    pub latency_samples: u64,
 }
 
 /// Outcome filter of the request list.
@@ -496,6 +501,11 @@ pub const MAX_PAGE_SIZE: usize = 500;
 /// Filters and paging of `GET /requests`. Deserialises straight from a query
 /// string: every field is optional, empty values count as absent, and an
 /// unparseable `limit` or `status` is ignored rather than rejected.
+///
+/// Only **finished** requests are listed: a record exists from the moment a
+/// request ends. Requests still in flight are announced on the event bus
+/// (`request.started`) and counted by the gauges, but are in no list and
+/// cannot be looked up by id until they finish.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Deserialize)]
 #[serde(default)]
 pub struct RequestQuery {
@@ -509,10 +519,13 @@ pub struct RequestQuery {
     #[serde(deserialize_with = "lenient::opt_string")]
     pub before: Option<String>,
     /// Exact model name (requested, client-facing or upstream),
-    /// case-insensitive.
+    /// case-insensitive. `unknown` selects the requests that have no model
+    /// (refused before one could be read from the body), which is the name
+    /// the summaries group them under ([`crate::UNKNOWN`]).
     #[serde(deserialize_with = "lenient::opt_string")]
     pub model: Option<String>,
-    /// Exact provider name, case-insensitive.
+    /// Exact provider name, case-insensitive; `unknown` selects requests
+    /// that failed before routing.
     #[serde(deserialize_with = "lenient::opt_string")]
     pub provider: Option<String>,
     /// Client key name or id, case-insensitive; `anonymous` selects requests
@@ -537,6 +550,9 @@ impl RequestQuery {
 }
 
 /// One page of the request list, newest first.
+///
+/// The list holds finished requests only (see [`RequestQuery`]), and only
+/// the most recent [`capacity`](RequestPage::capacity) of them.
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct RequestPage {
     pub items: Vec<Arc<RequestRecord>>,
@@ -544,8 +560,14 @@ pub struct RequestPage {
     /// page.
     pub next_before: Option<String>,
     pub has_more: bool,
-    /// Requests in memory matching the filters, ignoring paging.
+    /// Requests in memory matching the filters, ignoring paging. Never
+    /// more than `capacity`.
     pub total: usize,
+    /// How many finished requests the in-memory list can hold
+    /// ([`crate::DEFAULT_RECENT_CAPACITY`] unless configured otherwise).
+    /// Once that many are held, each new one pushes out the one that
+    /// finished longest ago: the list is "the newest `capacity` requests".
+    pub capacity: usize,
 }
 
 pub(crate) mod lenient {
@@ -878,7 +900,8 @@ mod tests {
             serde_json::to_value(StatsTick::default()).unwrap(),
             json!({
                 "at": 0, "in_flight": 0, "active_streams": 0, "ws_connections": 0,
-                "rpm": 0, "tpm": 0, "error_rate_1m": 0.0, "p50_ms": 0, "p95_ms": 0
+                "rpm": 0, "tpm": 0, "error_rate_1m": 0.0, "p50_ms": 0, "p95_ms": 0,
+                "latency_samples": 0
             })
         );
     }

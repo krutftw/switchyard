@@ -164,7 +164,8 @@ fn client_key(rng: &mut Rng) -> ClientKey {
         models: (0..rng.below(3))
             .map(|_| format!("{}-*", rng.unique()))
             .collect(),
-        rate_limit_rpm: rng.chance(3).then(|| rng.below(1000) as u32),
+        // Zero is refused: no limit is written by leaving the setting out.
+        rate_limit_rpm: rng.chance(3).then(|| 1 + rng.below(1000) as u32),
     }
 }
 
@@ -227,18 +228,27 @@ fn credential(rng: &mut Rng, kind: ProviderKind) -> CredentialConfig {
     }
 }
 
+/// A header the validation accepts: the name is an HTTP token (which still
+/// includes characters a bare TOML key cannot hold), the value any text
+/// without control characters.
 fn header(rng: &mut Rng) -> (String, String) {
     let name = rng
         .pick(&[
             "X-Title",
             "HTTP-Referer",
             "Authorization",
-            "x api",
+            "x_api",
             "X.Dotted",
-            "ключ",
+            "X-It's~odd!",
         ])
         .to_string();
-    (name, word(rng))
+    let value = loop {
+        let value = word(rng);
+        if !value.chars().any(char::is_control) {
+            break value;
+        }
+    };
+    (name, value)
 }
 
 fn provider(rng: &mut Rng) -> ProviderConfig {
@@ -280,7 +290,6 @@ fn provider(rng: &mut Rng) -> ProviderConfig {
     ]);
     p.legacy_max_tokens = rng.chance(4).then(|| rng.chance(2));
     p.stream_usage = rng.chance(4).then(|| rng.chance(2));
-    p.websocket = rng.chance(6);
     if kind == ProviderKind::Vertex {
         p.project = format!("proj-{}", rng.unique());
         p.location = "global".to_string();
@@ -560,7 +569,7 @@ fn mutate(rng: &mut Rng, c: &mut Config) -> Option<Kind> {
                 3 => p.discover = !p.discover,
                 4 => p.wire_api = *rng.pick(&[WireApi::Auto, WireApi::Chat, WireApi::Responses]),
                 5 => p.legacy_max_tokens = rng.pick(&[None, Some(true), Some(false)]).to_owned(),
-                6 => p.websocket = !p.websocket,
+                6 => p.stream_usage = rng.pick(&[None, Some(true), Some(false)]).to_owned(),
                 7 => p.name = format!("renamed-{}", rng.unique()),
                 _ => {
                     p.proxy = if p.proxy.is_empty() {
@@ -605,8 +614,9 @@ fn mutate(rng: &mut Rng, c: &mut Config) -> Option<Kind> {
                     }
                 }
                 _ => {
+                    let (_, replacement) = header(rng);
                     if let Some(value) = p.headers.values_mut().last() {
-                        *value = word(rng);
+                        *value = replacement;
                     }
                 }
             }
@@ -1059,6 +1069,17 @@ fn generated_configs_are_valid_and_varied() {
         assert_eq!(parse(&c.to_toml().unwrap()), c);
     }
     assert!(with_providers > 100);
+
+    // The generators themselves only produce what the validation accepts —
+    // header names and values, rate limits, thinking ranges, alias names
+    // and targets, prices — so `valid_config` throws nothing away and the
+    // properties cover every generated shape.
+    let mut rng = Rng::new(11);
+    for case in 0..500 {
+        let c = config(&mut rng);
+        let issues: Vec<String> = c.validate().iter().map(ToString::to_string).collect();
+        assert!(issues.is_empty(), "case {case}: {issues:?}");
+    }
 }
 
 /// Runs `cases` random edits, in sequences of one to five per starting file,

@@ -61,13 +61,18 @@ export function foldSeries(series, keep = MAX_SERIES - 1, otherLabel = 'Other') 
   return [...series.filter((s) => kept.has(s)), other];
 }
 
-/** Round axis bounds and ticks: 0 / 250 / 500 / 750 / 1,000. */
-export function niceScale(min, max, target = 4) {
+/**
+ * Round axis bounds and ticks: 0 / 250 / 500 / 750 / 1,000.
+ * `integer: true` keeps every tick a whole number, for axes that count
+ * things: a maximum of 1 gives 0 / 1, not 0 / 0.5 / 1.
+ */
+export function niceScale(min, max, target = 4, { integer = false } = {}) {
   if (!(max > min)) max = min + 1;
   const rawStep = (max - min) / target;
   const magnitude = 10 ** Math.floor(Math.log10(rawStep));
   const residual = rawStep / magnitude;
-  const step = (residual >= 5 ? 10 : residual >= 2 ? 5 : residual >= 1 ? 2 : 1) * magnitude;
+  let step = (residual >= 5 ? 10 : residual >= 2 ? 5 : residual >= 1 ? 2 : 1) * magnitude;
+  if (integer) step = Math.max(1, Math.round(step));
   const lo = Math.floor(min / step) * step;
   const hi = Math.ceil(max / step) * step;
   const ticks = [];
@@ -77,18 +82,26 @@ export function niceScale(min, max, target = 4) {
 
 const isTimeAxis = (x) => x.length > 0 && typeof x[0] === 'number' && x[0] > 1e11;
 
-/** Axis and tooltip formatters for a time axis, picked from its span. */
-function timeFormats(x) {
+/**
+ * Axis and tooltip formatters for a time axis, picked from its span. With
+ * `utc` the clock and the calendar are UTC's, and the tooltip says so: day
+ * buckets cut at UTC midnight read as the previous day west of Greenwich
+ * when printed in local time.
+ */
+function timeFormats(x, utc = false) {
   const span = x[x.length - 1] - x[0];
   const DAY = 86_400_000;
-  const hm = (t) => formatTime(t).slice(0, 5);
+  const hm = (t) => formatTime(t, { utc }).slice(0, 5);
+  const date = (t) => formatDate(t, new Date(), { utc });
+  const zone = utc ? ' UTC' : '';
   if (span <= 36 * 3_600_000) {
     // Within a day and a half: clock times; the tooltip adds the date when the range crosses midnight.
-    const crossesDay = toDate(x[0])?.getDate() !== toDate(x[x.length - 1])?.getDate();
-    return { tick: hm, tip: (t) => (crossesDay ? `${formatDate(t)} ${hm(t)}` : formatTime(t)) };
+    const dayOf = (t) => (utc ? toDate(t)?.getUTCDate() : toDate(t)?.getDate());
+    const crossesDay = dayOf(x[0]) !== dayOf(x[x.length - 1]);
+    return { tick: hm, tip: (t) => `${crossesDay ? `${date(t)} ${hm(t)}` : formatTime(t, { utc })}${zone}` };
   }
-  if (span <= 14 * DAY) return { tick: (t) => formatDate(t), tip: (t) => `${formatDate(t)} ${hm(t)}` };
-  return { tick: (t) => formatDate(t), tip: (t) => formatDate(t) };
+  if (span <= 14 * DAY) return { tick: date, tip: (t) => `${date(t)} ${hm(t)}${zone}` };
+  return { tick: date, tip: (t) => `${date(t)}${zone}` };
 }
 
 /** Evenly spread tick indices: first and last always included. */
@@ -162,11 +175,14 @@ function useChartHover(count, indexAt) {
 function Legend({ series, shape }) {
   return html`
     <ul class="chart-legend">
-      ${series.map(
-        (s, i) => html`<li key=${s.key ?? i}>
-          <span class="chart-key" data-shape=${shape === 'rect' ? 'rect' : undefined} style=${`--key:${seriesColor(s, i)}`}></span>${s.label ?? s.key}
-        </li>`,
-      )}
+      ${series.map((s, i) => {
+        const name = s.label ?? s.key;
+        // A long name is cut with an ellipsis; the full one is in the title.
+        return html`<li key=${s.key ?? i} title=${typeof name === 'string' ? name : undefined}>
+          <span class="chart-key" data-shape=${shape === 'rect' ? 'rect' : undefined} style=${`--key:${seriesColor(s, i)}`}></span>
+          <span class="chart-legend-label">${name}</span>
+        </li>`;
+      })}
     </ul>
   `;
 }
@@ -220,12 +236,36 @@ function ChartFrame({ series, x, shape, legend, table, stale, xLabel, xText, val
   `;
 }
 
-function ChartTip({ left, flip, head, rows, total }) {
+/** From this many series on, a tooltip leaves out the ones that are zero in the bucket. */
+const TIP_SKIP_ZEROS_FROM = 5;
+
+/**
+ * The tooltip's rows for one bucket: one per series. With many series the
+ * ones whose value there is zero (or missing) are left out, so the readout
+ * of a quiet minute in a seven-series chart is one or two lines, not seven
+ * of "0". Returns { rows, skipped }.
+ */
+function tipRowsFor(series, index, { shape, format }) {
+  const all = series.map((s, i) => ({
+    key: s.key ?? i,
+    shape,
+    color: seriesColor(s, i),
+    label: s.label ?? s.key,
+    raw: s.values[index],
+    value: s.values[index] == null ? DASH : format(s.values[index]),
+  }));
+  if (series.length < TIP_SKIP_ZEROS_FROM) return { rows: all, skipped: 0 };
+  const rows = all.filter((row) => row.raw != null && row.raw !== 0);
+  return { rows, skipped: all.length - rows.length };
+}
+
+function ChartTip({ left, flip, head, rows, total, skipped = 0 }) {
   // translate() keeps pointer tracking off the layout path.
   const style = flip ? `transform:translate(calc(${round(left - 12)}px - 100%), 8px)` : `transform:translate(${round(left + 12)}px, 8px)`;
   return html`
     <div class="chart-tip" style=${style} role="status">
       <div class="chart-tip-head">${head}</div>
+      ${rows.length === 0 && skipped > 0 && html`<div class="chart-tip-row chart-tip-none"><span class="chart-tip-label">Nothing in this bucket</span></div>`}
       ${rows.map(
         (row) => html`
           <div class="chart-tip-row" key=${row.key}>
@@ -245,17 +285,20 @@ function ChartTip({ left, flip, head, rows, total }) {
 }
 
 /** Geometry shared by the two axis charts. */
-function useAxes({ x, tops, width, height, yMin, yMax, yFormat, xFormat, band }) {
+function useAxes({ x, tops, width, height, yMin, yMax, yFormat, xFormat, tipFormat, utc, integer, band }) {
   return useMemo(() => {
     const n = x.length;
     const time = isTimeAxis(x);
     let dataMax = 0;
     for (const values of tops) for (const v of values) if (v != null && v > dataMax) dataMax = v;
-    const scale = niceScale(yMin, yMax ?? (dataMax > 0 ? dataMax : 1), height < 160 ? 2 : 4);
+    const scale = niceScale(yMin, yMax ?? (dataMax > 0 ? dataMax : 1), height < 160 ? 2 : 4, { integer });
     if (yMax != null) scale.max = Math.max(scale.max, yMax);
-    const fmt = time ? timeFormats(x) : null;
+    const fmt = time ? timeFormats(x, utc) : null;
     const tickText = xFormat ?? (fmt ? fmt.tick : (v) => String(v));
-    const tipText = fmt ? fmt.tip : (v) => String(v);
+    // The x value in full: the tooltip's head and the first column of the table view.
+    const tipText = tipFormat ?? (fmt ? fmt.tip : (v) => String(v));
+    // (In the table the column heading carries the "UTC".)
+    const tableText = tipFormat ?? (time ? (v) => formatDateTime(v, { utc }) : (v) => String(v));
 
     const left = Math.ceil(Math.max(...scale.ticks.map((t) => labelWidth(yFormat(t)))) + 10);
     const right = 12;
@@ -283,8 +326,8 @@ function useAxes({ x, tops, width, height, yMin, yMax, yFormat, xFormat, band })
     const tickCount = Math.max(2, Math.min(8, Math.floor(innerW / (widest + 28))));
     const xTicks = pickTicks(n, tickCount);
 
-    return { n, time, scale, left, right, top, bottom, innerW, innerH, xPos, yPos, xTicks, tickText, tipText };
-  }, [x, tops, width, height, yMin, yMax, yFormat, xFormat, band]);
+    return { n, time, scale, left, right, top, bottom, innerW, innerH, xPos, yPos, xTicks, tickText, tipText, tableText };
+  }, [x, tops, width, height, yMin, yMax, yFormat, xFormat, tipFormat, utc, integer, band]);
 }
 
 function Axes({ axes, width, yFormat, x, band }) {
@@ -321,12 +364,23 @@ function Axes({ axes, width, yFormat, x, band }) {
  * yFormat      formats axis ticks (default formatCompact)
  * valueFormat  formats tooltip and table values (default yFormat)
  * xFormat      overrides the axis tick text
+ * tipFormat    formats the x value in full, for the tooltip's head and the
+ *              first column of the table view (default: the time with as
+ *              much of the date as the range needs; the label for categories)
+ * utc          a time axis is printed in UTC (ticks, tooltip head, table
+ *              view), and the tooltip and the table say "UTC". For buckets
+ *              the gateway cuts at UTC midnight.
+ * integer      whole-number y ticks, for axes that count things (requests,
+ *              errors): a maximum of 1 gives 0 / 1, never 0.5
  * yMin, yMax   axis bounds; yMin defaults to 0
  * xLabel       heading of the x column in the table twin (default "Time")
  * label        accessible summary: say what the chart shows
  * stale        dim the plot while a refetch is in flight
  * legend, table  set false to drop the legend / the table toggle
  * emptyText    shown when there is nothing to plot
+ *
+ * The tooltip lists every series; from five series on it leaves out those
+ * whose value in the bucket is zero.
  */
 export function LineChart({
   x = [],
@@ -337,6 +391,9 @@ export function LineChart({
   yFormat = formatCompact,
   valueFormat,
   xFormat,
+  tipFormat,
+  utc = false,
+  integer = false,
   yMin = 0,
   yMax,
   xLabel = 'Time',
@@ -366,7 +423,7 @@ export function LineChart({
   }, [series, stacked, x.length]);
 
   const tops = useMemo(() => layers.map((l) => l.top), [layers]);
-  const axes = useAxes({ x, tops, width, height, yMin, yMax, yFormat, xFormat, band: false });
+  const axes = useAxes({ x, tops, width, height, yMin, yMax, yFormat, xFormat, tipFormat, utc, integer, band: false });
   const { n, left, innerW, innerH, top, xPos, yPos, tipText, scale } = axes;
 
   const indexAt = (px) => {
@@ -418,16 +475,7 @@ export function LineChart({
     });
   }, [layers, width, height, hasData, axes, area, stacked]);
 
-  const tipRows =
-    hover == null
-      ? []
-      : series.map((s, i) => ({
-          key: s.key ?? i,
-          shape: stacked ? 'rect' : 'line',
-          color: seriesColor(s, i),
-          label: s.label ?? s.key,
-          value: s.values[hover] == null ? DASH : fmtValue(s.values[hover]),
-        }));
+  const tip = hover == null ? { rows: [], skipped: 0 } : tipRowsFor(series, hover, { shape: stacked ? 'rect' : 'line', format: fmtValue });
   const tipTotal = hover != null && stacked && series.length > 1 ? fmtValue(series.reduce((sum, s) => sum + (s.values[hover] || 0), 0)) : null;
 
   return html`
@@ -438,8 +486,8 @@ export function LineChart({
       legend=${legend}
       table=${table && hasData}
       stale=${stale}
-      xLabel=${xLabel}
-      xText=${axes.time ? formatDateTime : String}
+      xLabel=${axes.time && utc && !tipFormat ? `${xLabel} (UTC)` : xLabel}
+      xText=${axes.tableText}
       valueFormat=${fmtValue}
       class=${className}
     >
@@ -479,7 +527,8 @@ export function LineChart({
               </g>
             `}
           </svg>
-          ${hover != null && html`<${ChartTip} left=${xPos(hover)} flip=${xPos(hover) > left + innerW * 0.55} head=${tipText(x[hover])} rows=${tipRows} total=${tipTotal} />`}
+          ${hover != null &&
+          html`<${ChartTip} left=${xPos(hover)} flip=${xPos(hover) > left + innerW * 0.55} head=${tipText(x[hover])} rows=${tip.rows} skipped=${tip.skipped} total=${tipTotal} />`}
         `}
       </div>
     <//>
@@ -506,7 +555,8 @@ function columnPath(x, y, w, h, r) {
  * at the bottom); the tooltip lists each and the total.
  *
  * Props are the same as LineChart (x, series, height, yFormat, valueFormat,
- * xFormat, yMax, xLabel, label, stale, legend, table, emptyText).
+ * xFormat, tipFormat, utc, integer, yMax, xLabel, label, stale, legend,
+ * table, emptyText).
  */
 export function BarChart({
   x = [],
@@ -515,6 +565,9 @@ export function BarChart({
   yFormat = formatCompact,
   valueFormat,
   xFormat,
+  tipFormat,
+  utc = false,
+  integer = false,
   yMax,
   xLabel = 'Time',
   label,
@@ -530,7 +583,7 @@ export function BarChart({
 
   const totals = useMemo(() => x.map((_, j) => series.reduce((sum, s) => sum + (s.values[j] || 0), 0)), [x, series]);
   const tops = useMemo(() => [totals], [totals]);
-  const axes = useAxes({ x, tops, width, height, yMin: 0, yMax, yFormat, xFormat, band: true });
+  const axes = useAxes({ x, tops, width, height, yMin: 0, yMax, yFormat, xFormat, tipFormat, utc, integer, band: true });
   const { n, left, innerW, innerH, top, xPos, yPos, tipText, scale } = axes;
 
   const bandW = n > 0 ? innerW / n : 0;
@@ -568,10 +621,7 @@ export function BarChart({
     return out;
   }, [series, x, width, height, hasData, axes, barW]);
 
-  const tipRows =
-    hover == null
-      ? []
-      : series.map((s, i) => ({ key: s.key ?? i, shape: 'rect', color: seriesColor(s, i), label: s.label ?? s.key, value: s.values[hover] == null ? DASH : fmtValue(s.values[hover]) }));
+  const tip = hover == null ? { rows: [], skipped: 0 } : tipRowsFor(series, hover, { shape: 'rect', format: fmtValue });
 
   return html`
     <${ChartFrame}
@@ -581,8 +631,8 @@ export function BarChart({
       legend=${legend}
       table=${table && hasData}
       stale=${stale}
-      xLabel=${xLabel}
-      xText=${axes.time ? formatDateTime : String}
+      xLabel=${axes.time && utc && !tipFormat ? `${xLabel} (UTC)` : xLabel}
+      xText=${axes.tableText}
       valueFormat=${fmtValue}
       class=${className}
     >
@@ -609,7 +659,8 @@ export function BarChart({
             left=${xPos(hover)}
             flip=${xPos(hover) > left + innerW * 0.55}
             head=${tipText(x[hover])}
-            rows=${tipRows}
+            rows=${tip.rows}
+            skipped=${tip.skipped}
             total=${series.length > 1 ? fmtValue(totals[hover]) : null}
           />`}
         `}
@@ -622,6 +673,9 @@ export function BarChart({
 // Sparkline
 // ---------------------------------------------------------------------------
 
+/** The shortest line worth drawing, in px: under this it reads as a blot, not a trend. */
+const SPARK_MIN_RUN = 10;
+
 /**
  * A trend line with no axes. The line is drawn in the quiet ink colour and
  * the latest point is lit in the accent.
@@ -630,20 +684,28 @@ export function BarChart({
  * width, height   px (default 96 x 28)
  * area    wash under the line (default true)
  * min, max  fix the scale; by default it spans the data, starting at 0
+ * minPoints  fewer values than this draw nothing (default 2). Raise it when
+ *         a trend of two or three points would say more than is known.
  * label   accessible summary ("Requests per minute, last hour"); without it
  *         the sparkline is decorative and hidden from screen readers
+ *
+ * With too little to show a trend the sparkline is an empty box of the same
+ * size, so the layout holds: fewer than `minPoints` values, or values that
+ * sit so close together at one end of the range (the first two readings of
+ * an hour) that the line would be a speck with a dot on it.
  */
-export function Sparkline({ data = [], width = 96, height = 28, area = true, min, max, label, class: className }) {
+export function Sparkline({ data = [], width = 96, height = 28, area = true, min, max, minPoints = 2, label, class: className }) {
   const points = data.map((v, i) => [i, v]).filter(([, v]) => v != null && Number.isFinite(v));
-  if (points.length < 2) {
-    return html`<svg class=${cx('spark', className)} width=${width} height=${height} aria-hidden="true"></svg>`;
-  }
   const pad = 3;
+  const last = data.length - 1 || 1;
+  const px = (i) => pad + (i / last) * (width - pad * 2);
+  const drawn = points.length >= 2 ? px(points[points.length - 1][0]) - px(points[0][0]) : 0;
+  if (points.length < Math.max(2, minPoints) || drawn < SPARK_MIN_RUN) {
+    return html`<svg class=${cx('spark', className)} width=${width} height=${height} data-empty="" aria-hidden="true"></svg>`;
+  }
   const lo = min ?? Math.min(0, ...points.map(([, v]) => v));
   const hi = max ?? Math.max(...points.map(([, v]) => v));
   const span = hi - lo || 1;
-  const last = data.length - 1 || 1;
-  const px = (i) => pad + (i / last) * (width - pad * 2);
   const py = (v) => height - pad - ((v - lo) / span) * (height - pad * 2);
   const line = points.map(([i, v], k) => `${k === 0 ? 'M' : 'L'}${round(px(i))} ${round(py(v))}`).join('');
   const [endI, endV] = points[points.length - 1];
@@ -811,13 +873,15 @@ export function Meter({ value, max = 1, tone, text, label, class: className }) {
  * buckets  [{ ok, failed, label? }]; `label` is the slot's time range
  * slots    fixed number of blocks (default 20); missing older slots are unlit
  * label    what this is the health of ("Credential key-1")
+ * noun     what the buckets count, in the plural, for the accessible summary
+ *          (default "requests"; "upstream attempts" on a provider board)
  */
-export function HealthStrip({ buckets = [], slots = 20, label, class: className }) {
+export function HealthStrip({ buckets = [], slots = 20, label, noun = 'requests', class: className }) {
   const recent = buckets.slice(-slots);
   const padded = [...Array.from({ length: Math.max(0, slots - recent.length) }, () => null), ...recent];
   const ok = recent.reduce((sum, b) => sum + (b.ok || 0), 0);
   const failed = recent.reduce((sum, b) => sum + (b.failed || 0), 0);
-  const summary = ok + failed === 0 ? 'no recent traffic' : `${formatPercent(ok / (ok + failed))} of ${ok + failed} recent requests succeeded`;
+  const summary = ok + failed === 0 ? 'no recent traffic' : `${formatPercent(ok / (ok + failed))} of ${ok + failed} recent ${noun} succeeded`;
   return html`
     <span class=${cx('health', className)} role="img" aria-label=${`${label ? `${label}: ` : ''}${summary}`}>
       ${padded.map((bucket, i) => {

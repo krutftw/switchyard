@@ -491,6 +491,51 @@ pub struct ProviderTest {
     pub error: Option<String>,
 }
 
+/// Where the discovery of a provider's model list stands. Serialises as
+/// `"off"`, `"pending"`, `"ok"` or `"failed"`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DiscoveryStatus {
+    /// The provider's upstream is not asked: the provider is disabled, has
+    /// `discover = false`, lists its models itself, or is a `mock`.
+    Off,
+    /// The upstream is being asked, or is about to be, and has not answered
+    /// since the provider's settings last changed.
+    Pending,
+    /// The latest listing succeeded.
+    Ok,
+    /// The latest listing failed; the list of an earlier success, if there
+    /// was one, is still in use.
+    Failed,
+}
+
+/// The discovery state of one provider, see
+/// [`crate::Gateway::discovery_states`]. Every field is always serialised.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct DiscoveryState {
+    /// Where discovery stands.
+    pub state: DiscoveryStatus,
+    /// Unix milliseconds: when the latest listing succeeded or failed, or —
+    /// while `pending` — when it was started. `None` for `off`.
+    pub at: Option<i64>,
+    /// Why the latest listing failed (`failed` only): one line, credentials
+    /// removed.
+    pub error: Option<String>,
+    /// Models in the upstream's list that is in use: the latest successful
+    /// listing's, also after a later one failed. `0` when there is none.
+    pub models: usize,
+}
+
+impl DiscoveryState {
+    /// The state of a provider whose upstream is not asked.
+    pub(crate) const OFF: DiscoveryState = DiscoveryState {
+        state: DiscoveryStatus::Off,
+        at: None,
+        error: None,
+        models: 0,
+    };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

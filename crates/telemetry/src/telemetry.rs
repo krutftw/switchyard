@@ -318,6 +318,13 @@ impl Telemetry {
     /// [`flush`](Telemetry::flush) and [`shutdown`](Telemetry::shutdown)
     /// wait for such writes. Outside a runtime the file is written before
     /// returning.
+    ///
+    /// Either way the bodies can be read ([`BodyStore::read`]) as soon as
+    /// this has returned `true`: while the file is being written they are
+    /// served from memory, redacted and truncated like the file. So when
+    /// `request.finished` is published for a record with `has_bodies`, a
+    /// reader that reacts to the event finds the bodies, not a gap until
+    /// the write has finished.
     pub fn capture_bodies(&self, record: &RequestRecord, bodies: CapturedBodies) -> bool {
         let store = &self.inner.bodies;
         if !store.accepts(&record.id, !record.ok) || bodies.is_empty() {
@@ -325,12 +332,14 @@ impl Telemetry {
         }
         match Handle::try_current() {
             Ok(handle) => {
-                let store = store.clone();
-                let (id, started_at, failed) = (record.id.clone(), record.started_at, !record.ok);
+                let (started_at, failed) = (record.started_at, !record.ok);
+                // Readable from here on; the copy in memory is let go of
+                // when the file is in place (or the task is discarded).
+                let held = store.hold(&record.id, bodies);
                 let pending = self.inner.body_writes.begin();
                 handle.spawn_blocking(move || {
                     let _pending = pending;
-                    store.capture_at(&id, started_at, failed, bodies)
+                    held.write(started_at, failed)
                 });
                 true
             }
@@ -731,13 +740,69 @@ mod tests {
         assert!(r.has_bodies);
         let stored = telemetry.finish_request(r);
         assert!(stored.has_bodies);
-        for _ in 0..400 {
-            if telemetry.bodies().read("r1").is_some() {
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // Readable at once, whether or not the file is written yet.
         assert_eq!(telemetry.bodies().read("r1").unwrap(), bodies());
+        telemetry.flush().await.unwrap();
+        assert!(tmp.path().join("requests/2026-10-02/r1.json").is_file());
+        assert_eq!(telemetry.bodies().read("r1").unwrap(), bodies());
+    }
+
+    /// Regression: the gateway captures the bodies and publishes the record
+    /// in one go, without waiting; the file was written in the background,
+    /// so for some 60 ms after `request.finished` the record said
+    /// `has_bodies` while nothing could be read. Whoever reacts to the
+    /// event now finds the bodies — the redacted ones, as the file will
+    /// hold them.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bodies_can_be_read_when_the_finished_event_arrives() {
+        const SECRET: &str = "sk-proj-abcdefghijklmnopqrstuvwxyz0123";
+        let tmp = tempfile::tempdir().unwrap();
+        let telemetry = Telemetry::new(TelemetryOptions {
+            logging: LoggingConfig {
+                request_log: RequestLogMode::All,
+                ..LoggingConfig::default()
+            },
+            ..options(tmp.path())
+        });
+        let mut events = telemetry.subscribe();
+        for i in 0..20 {
+            let id = format!("r{i}");
+            // Large enough for the redaction and the write to take a while.
+            let raw = CapturedBodies {
+                client_request: Some(format!(
+                    r#"{{"model":"sonnet","api_key":"{SECRET}","input":"{}"}}"#,
+                    "lorem ipsum ".repeat(2_000)
+                )),
+                client_response: Some("ok".repeat(1_000)),
+                ..CapturedBodies::default()
+            };
+            let expected = telemetry.bodies().prepare(raw.clone());
+            let mut r = record(&id, T0, 200);
+            r.has_bodies = telemetry.capture_bodies(&r, raw);
+            telemetry.finish_request(r);
+
+            let published = match events.try_recv().unwrap() {
+                Event::RequestFinished(record) => record,
+                other => panic!("unexpected event {other:?}"),
+            };
+            assert!(published.has_bodies);
+            // What GET /requests/{id} does on receiving the event.
+            let found = telemetry.usage().find(&published.id).unwrap();
+            assert!(found.has_bodies);
+            let read = telemetry
+                .bodies()
+                .read(&published.id)
+                .unwrap_or_else(|| panic!("{id}: has_bodies is true but nothing can be read"));
+            assert_eq!(read, expected, "{id}");
+            assert!(!read.client_request.as_deref().unwrap().contains(SECRET));
+        }
+        // Once everything is on disk the answer is the same, and nothing is
+        // kept in memory any longer.
+        telemetry.flush().await.unwrap();
+        let from_file = telemetry.bodies().read("r7").unwrap();
+        assert!(!from_file.client_request.unwrap().contains(SECRET));
+        assert!(tmp.path().join("requests/2026-10-02/r19.json").is_file());
+        assert!(format!("{:?}", telemetry.bodies()).contains("held: 0"));
     }
 
     #[tokio::test]

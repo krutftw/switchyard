@@ -143,7 +143,6 @@ retention_days = 30
 # wire_api = "auto"           # auto | chat | responses
 # legacy_max_tokens = true    # send max_tokens instead of max_completion_tokens
 # stream_usage = true         # ask for usage in Chat Completions streams (stream_options)
-# websocket = false           # openai only: relay WebSocket clients over the upstream WebSocket
 #
 # [[providers.credentials]]   # credentials that need more than a key
 # api_key = "sk-another-…"

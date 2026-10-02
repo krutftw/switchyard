@@ -74,7 +74,6 @@ kind = "{kind}"
 wire_api = "chat"
 base_url = "{base}/v1"
 api_keys = ["key-local-1"]
-websocket = true
 [[providers.models]]
 id = "up-chat"
 alias = "m"

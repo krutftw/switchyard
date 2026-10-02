@@ -96,7 +96,7 @@ pub(crate) async fn patch_settings(
     };
     check_sections(&patch)?;
     let (config, ()) = state
-        .edit_config(move |config| apply_settings(config, &patch))
+        .edit_config(move |config, _| apply_settings(config, &patch))
         .await?;
     ok_json(&config_view(&state, &config))
 }
@@ -200,10 +200,10 @@ fn apply_settings(config: &mut Config, patch: &Map<String, Value>) -> Result<(),
         }
     }
     if !issues.is_empty() {
-        return Err(ApiFailure {
+        return Err(ApiFailure::bad_fields(
+            "the settings patch does not fit the configuration schema",
             issues,
-            ..ApiFailure::bad_request("the settings patch does not fit the configuration schema")
-        });
+        ));
     }
 
     // The dashboard only ever saw masks: `admin.secret` and a password in
