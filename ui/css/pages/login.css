@@ -1,0 +1,156 @@
+/* Sign-in page: the form on the left, the yard at night behind it. */
+
+.login {
+  position: relative;
+  min-height: 100dvh;
+  display: grid;
+  grid-template-columns: minmax(0, 520px) minmax(0, 1fr);
+  background: var(--bg-ground);
+  overflow: hidden;
+  isolation: isolate;
+}
+
+.login-tools {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  z-index: 2;
+}
+
+.login-main {
+  position: relative;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-8) var(--space-6);
+  background: var(--bg-surface);
+  border-right: var(--hairline) solid var(--rule);
+}
+
+.login-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  width: 100%;
+  max-width: 360px;
+}
+
+.login-brand {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-xl);
+  font-weight: var(--weight-semibold);
+  font-stretch: var(--stretch-heading);
+}
+
+.login-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-4);
+}
+
+.login-head h1 {
+  font-size: var(--text-3xl);
+  letter-spacing: -0.015em;
+}
+
+.login-help {
+  padding-top: var(--space-4);
+  border-top: var(--hairline) solid var(--rule);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  color: var(--text-3);
+}
+
+/* ---- The yard ----------------------------------------------------------- */
+
+.yard {
+  position: absolute;
+  inset: 0 0 0 520px;
+  width: calc(100% - 520px);
+  height: 100%;
+  z-index: 0;
+}
+
+.yard path {
+  fill: none;
+  stroke-linecap: butt;
+}
+
+/* Rails: a wide stroke with the ground colour run down the middle. */
+.yard-tracks path {
+  stroke: var(--rule-strong);
+  stroke-width: 9;
+}
+
+.yard-beds path {
+  stroke: var(--bg-ground);
+  stroke-width: 5;
+}
+
+.yard-route {
+  stroke: var(--accent);
+  stroke-width: 9;
+  stroke-dasharray: 100;
+  stroke-dashoffset: calc(100 * var(--motion));
+  animation: yard-route 1600ms var(--ease-in-out) 250ms forwards;
+}
+
+.yard-route-bed {
+  stroke: var(--bg-ground);
+  stroke-width: 5;
+}
+
+@keyframes yard-route {
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+.yard-lamp {
+  fill: var(--lamp-off);
+  stroke: var(--bg-ground);
+  stroke-width: 4;
+}
+
+.yard-lamp[data-tone="clear"] {
+  fill: var(--lamp-clear);
+}
+
+.yard-lamp[data-tone="caution"] {
+  fill: var(--lamp-caution);
+}
+
+.yard-lamp[data-tone="stop"] {
+  fill: var(--lamp-stop);
+}
+
+/* ---- Narrow screens: the form takes the page, the yard becomes a strip --- */
+
+@media (max-width: 900px) {
+  .login {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: 132px minmax(0, 1fr);
+  }
+
+  .login-main {
+    grid-row: 2;
+    align-items: flex-start;
+    padding: var(--space-6) var(--space-4) var(--space-8);
+    border-right: 0;
+    border-top: var(--hairline) solid var(--rule);
+  }
+
+  .login-head {
+    margin-top: 0;
+  }
+
+  .yard {
+    inset: 0 0 auto 0;
+    width: 100%;
+    height: 132px;
+  }
+}

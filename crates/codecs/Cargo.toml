@@ -1,0 +1,19 @@
+[package]
+name = "switchyard-codecs"
+description = "Registry of Switchyard's protocol codecs and the cross-protocol test matrix"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+switchyard-core.workspace = true
+switchyard-codec-chat.workspace = true
+switchyard-codec-responses.workspace = true
+switchyard-codec-anthropic.workspace = true
+switchyard-codec-gemini.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

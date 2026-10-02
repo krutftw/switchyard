@@ -1,0 +1,207 @@
+# Switchyard configuration — every setting, with its default.
+#
+# Copy to switchyard.toml and edit, or run `switchyard init` for a minimal file
+# with freshly generated secrets. The gateway reloads this file when it
+# changes; the dashboard edits it in place and keeps your comments.
+#
+# Secrets can be written literally or as a reference to an environment
+# variable: "env:OPENAI_API_KEY" or "${OPENAI_API_KEY}".
+
+# ---------------------------------------------------------------------------
+[server]
+host = "127.0.0.1"        # "0.0.0.0" to accept connections from other machines
+port = 8317
+body_limit_mb = 64        # largest accepted request body
+cors = true               # let browser apps call the API directly
+data_dir = "data"         # usage history and request logs; relative to this file
+
+# Serve HTTPS directly (otherwise put a reverse proxy in front):
+# [server.tls]
+# cert = "cert.pem"
+# key = "key.pem"
+
+# ---------------------------------------------------------------------------
+[admin]
+enabled = true
+# Secret for the dashboard and the admin API. With no secret here and no
+# SWITCHYARD_ADMIN_SECRET in the environment, both are switched off.
+secret = ""
+allow_remote = false      # accept admin requests from non-loopback addresses
+ui = true                 # serve the dashboard at /admin/
+
+# ---------------------------------------------------------------------------
+[auth]
+required = true           # false: accept requests without a key (local use only)
+
+# Keys your clients present (Authorization: Bearer …, x-api-key, x-goog-api-key or ?key=).
+# [[auth.keys]]
+# key = "sy-change-me"
+# name = "laptop"
+# models = ["gpt-*", "claude-*"]   # optional allow-list; empty = every model
+# rate_limit_rpm = 120             # optional requests-per-minute cap
+
+# ---------------------------------------------------------------------------
+[routing]
+strategy = "round-robin"  # round-robin | fill-first | weighted | least-latency
+session_affinity = true   # keep a conversation on one credential (prompt caching)
+session_affinity_ttl_secs = 3600
+force_model_prefix = false
+max_attempts = 3          # upstream attempts per request, across credentials
+max_wait_secs = 0         # wait this long for a cooling credential instead of failing
+
+[routing.cooldown]
+enabled = true
+rate_limit_base_secs = 1  # first 429 cooldown; doubles on each consecutive failure…
+rate_limit_max_secs = 1800  # …up to this cap. An upstream Retry-After always wins.
+transient_secs = 60       # after 5xx / network errors
+auth_secs = 1800          # after the upstream rejects the credential
+quota_secs = 3600         # after an out-of-quota / billing failure
+model_not_found_secs = 43200
+
+# ---------------------------------------------------------------------------
+[streaming]
+keepalive_secs = 15       # SSE comment / WebSocket ping during silence; 0 = off
+bootstrap_retries = 2     # retries on another credential before the first byte
+idle_timeout_secs = 300   # abort a stream after this much upstream silence; 0 = off
+
+# ---------------------------------------------------------------------------
+[upstream]
+proxy = ""                # http://, https://, socks5://, socks5h:// URL, or "direct"
+connect_timeout_secs = 30
+request_timeout_secs = 600
+passthrough_headers = true  # forward upstream rate-limit and request-id headers
+
+# ---------------------------------------------------------------------------
+[logging]
+level = "info"            # trace | debug | info | warn | error
+file = false              # also write rotating log files under <data_dir>/logs
+max_total_size_mb = 200
+request_log = "off"       # off | errors | all — capture request/response bodies
+request_log_max_body_kb = 256
+
+[usage]
+enabled = true
+persist = true            # keep statistics across restarts
+retention_days = 30
+
+# ---------------------------------------------------------------------------
+# Providers. `api_keys` lists one credential per key; requests rotate across
+# them and fail over when one is rate limited.
+
+# [[providers]]
+# name = "openai"
+# kind = "openai"                       # api.openai.com — Responses and Chat Completions
+# api_keys = ["env:OPENAI_API_KEY"]
+
+# [[providers]]
+# name = "anthropic"
+# kind = "anthropic"
+# api_keys = ["env:ANTHROPIC_API_KEY", "env:ANTHROPIC_API_KEY_2"]
+
+# [[providers]]
+# name = "gemini"
+# kind = "gemini"
+# api_keys = ["env:GEMINI_API_KEY"]
+
+# [[providers]]
+# name = "vertex"
+# kind = "vertex"
+# location = "global"
+# [[providers.credentials]]
+# service_account_file = "vertex-sa.json"
+
+# Any OpenAI-compatible server:
+# [[providers]]
+# name = "openrouter"
+# kind = "openai-compat"
+# base_url = "https://openrouter.ai/api/v1"
+# api_keys = ["env:OPENROUTER_API_KEY"]
+# prefix = "or"                          # models become "or/<model>"
+# [[providers.models]]
+# id = "moonshotai/kimi-k2"
+# alias = "kimi"                         # what clients ask for
+
+# A local server needs no key:
+# [[providers]]
+# name = "ollama"
+# kind = "openai-compat"
+# base_url = "http://127.0.0.1:11434/v1"
+
+# Every provider option:
+# [[providers]]
+# name = "example"
+# kind = "openai-compat"
+# enabled = true
+# base_url = "https://example.com/v1"
+# api_keys = ["sk-…"]
+# prefix = ""
+# priority = 0                # higher is tried first; lower only when higher is unavailable
+# proxy = ""                  # overrides [upstream].proxy
+# headers = { "X-Title" = "switchyard" }
+# exclude = ["*-preview"]     # hide models by wildcard
+# discover = true             # ask the provider for its model list when `models` is empty
+# wire_api = "auto"           # auto | chat | responses
+# legacy_max_tokens = true    # send max_tokens instead of max_completion_tokens
+# stream_usage = true         # ask for usage in Chat Completions streams (stream_options)
+# websocket = false           # openai only: relay WebSocket clients over the upstream WebSocket
+#
+# [[providers.credentials]]   # credentials that need more than a key
+# api_key = "sk-another-…"
+# label = "team account"
+# weight = 3                  # share of traffic under strategy = "weighted"
+# priority = 10
+# proxy = "socks5://127.0.0.1:1080"
+# disabled = false
+#
+# [[providers.models]]
+# id = "upstream-model-id"
+# alias = "client-facing-name"
+# display_name = "Nice name"
+# context_window = 200000
+# max_output_tokens = 32000
+# thinking = { levels = ["low", "medium", "high"] }   # or { min = 1024, max = 32000, zero_allowed = true }
+
+# The built-in mock provider needs no key — handy for trying the dashboard:
+# [[providers]]
+# name = "mock"
+# kind = "mock"
+
+# ---------------------------------------------------------------------------
+# Virtual models: one name, several targets tried in order. A target may pin
+# the reasoning effort with a suffix.
+
+# [[aliases]]
+# name = "smart"
+# targets = ["claude-opus-4-5", "gpt-5(high)"]
+
+# Clients can also choose the reasoning effort themselves by appending a
+# suffix to any model name: "gpt-5(high)", "claude-sonnet-4-5(16000)",
+# "gemini-2.5-flash(none)", "…(auto)".
+
+# ---------------------------------------------------------------------------
+# Payload rules patch the JSON sent upstream. Paths are dotted ("a.b.0.c").
+
+# [[payload.default]]         # set only if the client did not
+# models = ["gemini-*"]
+# set = { "generationConfig.thinkingConfig.includeThoughts" = true }
+
+# [[payload.override]]        # always set
+# models = ["gpt-*"]
+# protocol = "openai-responses"
+# set = { "reasoning.summary" = "auto" }
+
+# [[payload.filter]]          # remove
+# models = ["*"]
+# provider = "ollama"
+# remove = ["metadata", "store"]
+
+# ---------------------------------------------------------------------------
+# Prices in USD per million tokens, for the cost estimates in the dashboard.
+# First matching pattern wins.
+
+# [[pricing]]
+# model = "gpt-5*"
+# input = 1.25
+# output = 10.0
+# cache_read = 0.125
+# cache_write = 1.25

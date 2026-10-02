@@ -1,0 +1,21 @@
+[package]
+name = "switchyard-scheduler"
+description = "Model registry, credential pool and selection for Switchyard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+switchyard-core.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+indexmap.workspace = true
+parking_lot.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

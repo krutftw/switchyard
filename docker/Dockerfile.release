@@ -1,0 +1,19 @@
+# Release image: wraps the statically linked musl binaries built by the release
+# workflow. Build context must contain bin/amd64/switchyard and
+# bin/arm64/switchyard.
+
+FROM alpine:3.22
+ARG TARGETARCH
+RUN apk add --no-cache ca-certificates tzdata \
+    && adduser -S -D -u 10001 -h /data switchyard \
+    && mkdir -p /data && chown switchyard /data
+COPY bin/${TARGETARCH}/switchyard /usr/local/bin/switchyard
+RUN chmod +x /usr/local/bin/switchyard
+USER switchyard
+WORKDIR /data
+VOLUME /data
+EXPOSE 8317
+# Inside a container every client is "remote"; the admin secret is still required.
+ENV SWITCHYARD_ADMIN_ALLOW_REMOTE=true
+ENTRYPOINT ["/usr/local/bin/switchyard"]
+CMD ["serve", "--config", "/data/switchyard.toml", "--host", "0.0.0.0"]

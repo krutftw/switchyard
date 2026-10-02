@@ -1,0 +1,22 @@
+[package]
+name = "switchyard-translate"
+description = "Codec-agnostic translation pipeline pieces for Switchyard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+switchyard-core.workspace = true
+serde.workspace = true
+# `float_roundtrip`: without it serde_json parses floats only to within one
+# unit in the last place, so a payload that is parsed and printed again (the
+# passthrough model rewrite's fallback path, payload rules applied to a client
+# body) comes out with slightly different numbers.
+serde_json = { workspace = true, features = ["float_roundtrip"] }
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true

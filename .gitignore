@@ -1,0 +1,17 @@
+/target
+**/*.rs.bk
+.DS_Store
+Thumbs.db
+
+# local runtime state
+/switchyard.toml
+/data/
+*.log
+
+# editor
+.idea/
+.vscode/
+*.swp
+
+# node (only used for optional UI tooling)
+node_modules/

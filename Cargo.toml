@@ -1,0 +1,99 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/krutftw/switchyard"
+authors = ["Switchyard contributors"]
+
+[workspace.dependencies]
+# workspace crates
+switchyard-core = { path = "crates/core", version = "0.1.0" }
+switchyard-codec-chat = { path = "crates/codec-chat", version = "0.1.0" }
+switchyard-codec-responses = { path = "crates/codec-responses", version = "0.1.0" }
+switchyard-codec-anthropic = { path = "crates/codec-anthropic", version = "0.1.0" }
+switchyard-codec-gemini = { path = "crates/codec-gemini", version = "0.1.0" }
+switchyard-codecs = { path = "crates/codecs", version = "0.1.0" }
+switchyard-translate = { path = "crates/translate", version = "0.1.0" }
+switchyard-upstream = { path = "crates/upstream", version = "0.1.0" }
+switchyard-scheduler = { path = "crates/scheduler", version = "0.1.0" }
+switchyard-telemetry = { path = "crates/telemetry", version = "0.1.0" }
+switchyard-config-store = { path = "crates/config-store", version = "0.1.0" }
+switchyard-gateway = { path = "crates/gateway", version = "0.1.0" }
+switchyard-server = { path = "crates/server", version = "0.1.0" }
+switchyard-admin = { path = "crates/admin", version = "0.1.0" }
+
+# async runtime + http
+tokio = { version = "1", features = ["full"] }
+tokio-stream = { version = "0.1", features = ["sync"] }
+tokio-util = { version = "0.7", features = ["io", "codec", "rt"] }
+futures = "0.3"
+async-stream = "0.3"
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+axum = { version = "0.8", features = ["ws", "http2", "macros"] }
+tower = { version = "0.5", features = ["util", "timeout", "limit"] }
+tower-http = { version = "0.6", features = ["cors", "compression-gzip", "compression-br", "decompression-gzip", "decompression-br", "decompression-zstd", "trace", "limit", "catch-panic", "request-id", "set-header"] }
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "http2", "json", "stream", "gzip", "brotli", "zstd", "deflate", "socks", "charset", "system-proxy"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-native-certs = "0.8"
+webpki-roots = "1"
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["connect", "handshake", "rustls-tls-webpki-roots"] }
+url = "2"
+percent-encoding = "2"
+
+# data
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = { version = "1", features = ["preserve_order", "raw_value"] }
+toml = "1"
+toml_edit = { version = "0.25", features = ["serde"] }
+indexmap = { version = "2", features = ["serde"] }
+base64 = "0.22"
+uuid = { version = "1", features = ["v4", "v7", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+regex = "1"
+
+# crypto
+ring = "0.17"
+sha2 = "0.10"
+hmac = "0.12"
+subtle = "2"
+rand = "0.9"
+pem = "3"
+
+# infra
+thiserror = "2"
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+arc-swap = "1"
+parking_lot = "0.12"
+dashmap = "6"
+notify = "8"
+clap = { version = "4", features = ["derive", "env"] }
+rust-embed = { version = "8", features = ["mime-guess", "interpolate-folder-path"] }
+mime_guess = "2"
+hdrhistogram = "7"
+async-trait = "0.1"
+
+# dev
+pretty_assertions = "1"
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+panic = "unwind"
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1

@@ -1,0 +1,25 @@
+[package]
+name = "switchyard-telemetry"
+description = "Event bus, usage statistics and log capture for Switchyard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+switchyard-core.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+chrono.workspace = true
+hdrhistogram.workspace = true
+uuid.workspace = true
+regex.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true

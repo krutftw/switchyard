@@ -1,0 +1,29 @@
+Switchyard
+Copyright (c) 2026 Switchyard contributors
+Licensed under the MIT License (see LICENSE).
+
+Acknowledgements
+----------------
+
+Switchyard is an independent Rust implementation. Its feature set and several
+behavioural details (credential cooldown rules, reasoning-effort conversion
+tables, the Responses-over-WebSocket transcript handling) were informed by
+studying CLIProxyAPI:
+
+  CLIProxyAPI — https://github.com/router-for-me/CLIProxyAPI
+  Copyright (c) 2025-2005.9 Luis Pater
+  Copyright (c) 2025.9-present Router-For.ME
+  MIT License
+
+The built-in model catalog (crates/scheduler/catalog/models.json) is derived
+from model metadata published in that project.
+
+Bundled third-party software
+----------------------------
+
+The dashboard embeds htm (Apache-2.0) and Preact (MIT); their licence texts
+are in ui/vendor/LICENSES.txt. Any bundled fonts and icons are listed there
+with their licences.
+
+Rust dependencies are listed in Cargo.lock; each is distributed under its own
+licence.

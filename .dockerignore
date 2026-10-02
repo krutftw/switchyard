@@ -1,0 +1,7 @@
+target
+.git
+.github
+data
+switchyard.toml
+node_modules
+*.log

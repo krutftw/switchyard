@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en" translate="no" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+    <meta name="color-scheme" content="dark light" />
+    <meta name="theme-color" content="#101316" />
+    <meta name="robots" content="noindex, nofollow" />
+    <meta name="referrer" content="no-referrer" />
+    <title>Switchyard</title>
+
+    <!--
+      Theme bootstrap. Runs before the first paint so the page never flashes
+      the wrong theme: a stored choice wins, otherwise the operating system
+      decides. js/lib/theme.js applies the same rule once the app is running.
+      Everything is local: no fonts, scripts or styles are fetched from
+      another origin, so the dashboard works on an air-gapped host.
+    -->
+    <script>
+      (function () {
+        var root = document.documentElement;
+        var theme = 'dark';
+        try {
+          var stored = localStorage.getItem('sy.theme');
+          if (stored === 'light' || stored === 'dark') theme = stored;
+          else if (window.matchMedia && matchMedia('(prefers-color-scheme: light)').matches) theme = 'light';
+        } catch (e) {
+          /* storage blocked: stay on the default */
+        }
+        root.dataset.theme = theme;
+        var meta = document.querySelector('meta[name="theme-color"]');
+        if (meta) meta.setAttribute('content', theme === 'light' ? '#eff1f4' : '#101316');
+      })();
+    </script>
+
+    <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <link rel="preload" href="fonts/archivo-latin-var.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="preload" href="fonts/jetbrains-mono-latin-var.woff2" as="font" type="font/woff2" crossorigin />
+    <link rel="stylesheet" href="css/tokens.css" />
+    <link rel="stylesheet" href="css/base.css" />
+    <link rel="stylesheet" href="css/components.css" />
+    <link rel="stylesheet" href="css/layout.css" />
+    <link rel="modulepreload" href="vendor/preact-htm.js" />
+    <script type="module" src="js/app.js"></script>
+  </head>
+  <body>
+    <div id="app">
+      <!-- Shown until js/app.js renders; replaced on boot. -->
+      <div class="boot">
+        <div class="boot-inner">
+          <div class="boot-brand">
+            <svg class="logo-mark" width="32" height="32" viewBox="0 0 24 24" fill="none" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M2 16.5h20" stroke="currentColor" stroke-width="2" opacity="0.45" />
+              <path d="M2 16.5h5.5c4.5 0 4.5-9 9-9H19" stroke="var(--accent)" stroke-width="2" />
+              <circle cx="20.5" cy="7.5" r="1.9" fill="var(--accent)" />
+            </svg>
+            <span>Switchyard</span>
+          </div>
+          <noscript>
+            <p>The Switchyard dashboard needs JavaScript. Enable it for this address and reload.</p>
+          </noscript>
+        </div>
+      </div>
+    </div>
+  </body>
+</html>

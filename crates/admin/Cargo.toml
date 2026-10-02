@@ -1,0 +1,36 @@
+[package]
+name = "switchyard-admin"
+description = "Admin API and embedded dashboard for Switchyard"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+switchyard-core.workspace = true
+switchyard-gateway.workspace = true
+switchyard-scheduler.workspace = true
+switchyard-telemetry.workspace = true
+axum.workspace = true
+tower.workspace = true
+tower-http.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+futures.workspace = true
+bytes.workspace = true
+http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rust-embed.workspace = true
+mime_guess.workspace = true
+subtle.workspace = true
+rand.workspace = true
+parking_lot.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+pretty_assertions.workspace = true
+tempfile.workspace = true
+tokio-tungstenite.workspace = true
+reqwest.workspace = true

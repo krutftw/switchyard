@@ -1,0 +1,300 @@
+/*
+ * Switchyard design tokens.
+ *
+ * The visual world is a railway signal box: graphite panels, hairline rules,
+ * enamel-plate controls and four signal lamps. Colour carries meaning only:
+ *
+ *   clear    green       healthy, succeeded, serving
+ *   caution  amber       cooling down, degraded, needs attention soon
+ *   stop     red         failed, blocked, destructive
+ *   accent   lunar blue  informational, selected, in progress, focus
+ *
+ * Nothing else is coloured. Chart series use their own six hues (--series-N),
+ * chosen so they never read as a lamp.
+ *
+ * Every value below was derived in OKLCH (noted on the right) and checked for
+ * WCAG AA contrast against the surfaces it is used on. The series order was
+ * validated for colour-vision-deficiency separation; do not reorder it.
+ *
+ * Dark is the default. <html data-theme="light|dark"> is stamped before first
+ * paint by the inline script in index.html.
+ */
+
+@font-face {
+  font-family: "Archivo";
+  src: url("../fonts/archivo-latin-var.woff2") format("woff2");
+  font-weight: 100 900;
+  font-stretch: 62% 125%;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: "JetBrains Mono";
+  src: url("../fonts/jetbrains-mono-latin-var.woff2") format("woff2");
+  font-weight: 100 800;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  /* ---- Type ------------------------------------------------------------ */
+  --font-sans: "Archivo", "Segoe UI", system-ui, -apple-system, "Helvetica Neue", Arial, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, "Cascadia Mono", "SF Mono", Menlo, Consolas, monospace;
+
+  /* Fixed rem scale, ratio about 1.14. 1rem = 16px. */
+  --text-2xs: 0.6875rem; /* 11  plate labels, axis ticks */
+  --text-xs: 0.75rem;    /* 12  captions, badges, table headers */
+  --text-sm: 0.8125rem;  /* 13  dense data, secondary UI */
+  --text-md: 0.875rem;   /* 14  body and controls */
+  --text-lg: 1rem;       /* 16  panel titles */
+  --text-xl: 1.1875rem;  /* 19  page titles on phones, dialog titles */
+  --text-2xl: 1.4375rem; /* 23  page titles */
+  --text-3xl: 1.875rem;  /* 30  stat readouts */
+
+  --leading-tight: 1.2;
+  --leading-snug: 1.35;
+  --leading-normal: 1.5;
+
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+
+  /* Archivo's width axis. Headings and plate labels run slightly narrow, the
+     way signage does; body text stays at normal width. */
+  --stretch-heading: 88%;
+  --stretch-label: 92%;
+
+  /* ---- Space (4px grid, with 2 and 6 for dense rows) -------------------- */
+  --space-0: 0;
+  --space-px: 1px;
+  --space-0h: 2px;
+  --space-1: 4px;
+  --space-1h: 6px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-14: 56px;
+
+  /* ---- Shape ------------------------------------------------------------ */
+  --radius-xs: 2px;   /* lamps' housings, tags inside inputs */
+  --radius-sm: 4px;   /* controls */
+  --radius-md: 6px;   /* panels, menus */
+  --radius-lg: 10px;  /* dialogs, sheets */
+  --radius-full: 999px;
+
+  --hairline: 1px;
+
+  /* ---- Control metrics -------------------------------------------------- */
+  --control-h-sm: 28px;
+  --control-h-md: 34px;
+  --control-h-lg: 42px;
+  --tap-min: 44px; /* minimum touch target on coarse pointers */
+  --row-h: 40px;        /* table rows, list rows */
+  --row-h-dense: 32px;  /* dense tables (logs, request stream) */
+  --panel-pad: var(--space-4);
+
+  /* ---- Layout ----------------------------------------------------------- */
+  --sidebar-w: 232px;
+  --sidebar-w-rail: 56px;
+  --topbar-h: 52px;
+  --bottombar-h: 58px;
+  --content-max: 1440px;
+  --content-pad: var(--space-6);
+  --measure: 68ch;
+
+  /* ---- Motion ----------------------------------------------------------- */
+  --ease-out: cubic-bezier(0.23, 1, 0.32, 1);
+  --ease-in-out: cubic-bezier(0.77, 0, 0.175, 1);
+  --ease-drawer: cubic-bezier(0.32, 0.72, 0, 1);
+  --dur-press: 110ms;   /* button press */
+  --dur-fast: 150ms;    /* hover, colour, tooltip */
+  --dur-base: 200ms;    /* menus, dialogs, toasts */
+  --dur-slow: 300ms;    /* drawers and sheets entering */
+  --dur-exit: 140ms;    /* everything leaving */
+
+  /* ---- Layers ----------------------------------------------------------- */
+  --z-sticky: 10;
+  --z-nav: 20;
+  --z-overlay: 40;
+  --z-toast: 60;
+  --z-tooltip: 70;
+
+  color-scheme: dark;
+}
+
+/* ======================================================================== */
+/* Dark: the signal box at night.                                           */
+/* ======================================================================== */
+:root,
+[data-theme="dark"] {
+  color-scheme: dark;
+
+  /* Surfaces, darkest to lightest. */
+  --bg-sunken: #0b0e11;   /* oklch(0.160 0.008 250)  sidebar, wells, code */
+  --bg-ground: #101316;   /* oklch(0.185 0.008 250)  page */
+  --bg-surface: #171b1f;  /* oklch(0.220 0.010 250)  panels */
+  --bg-raised: #1f2328;   /* oklch(0.255 0.011 250)  menus, dialogs, toasts */
+  --bg-hover: #262b30;    /* oklch(0.285 0.012 250)  hovered rows and controls */
+  --bg-active: #2d3238;   /* oklch(0.315 0.013 250)  pressed, selected */
+  --bg-field: #0b0e11;    /* inputs: a well cut into the panel */
+
+  /* Rules. */
+  --rule: #292e34;            /* oklch(0.300 0.012 250)  hairlines between things */
+  --rule-strong: #40464c;     /* oklch(0.390 0.014 250)  panel outlines on raised layers */
+  --control-border: #656d75;  /* oklch(0.530 0.016 250)  input outlines, 3:1 on sunken, ground, surface, raised */
+
+  /* Ink. */
+  --text: #eaedf1;        /* oklch(0.945 0.006 250)  14.7:1 on surface */
+  --text-2: #b0b7bd;      /* oklch(0.775 0.012 250)   8.5:1 on surface */
+  --text-3: #959ca4;      /* oklch(0.690 0.014 250)   6.2:1 on surface, 4.7:1 on active */
+  --text-on-plate: #101316;
+
+  /* The accent is the lunar lamp. */
+  --accent: #76c9f8;       /* oklch(0.800 0.105 235)  9.5:1 on surface */
+  --accent-hi: #a4ddff;    /* oklch(0.870 0.075 235)  hover on accent text */
+  --accent-ink: #76c9f8;   /* accent used as text */
+  --on-accent: #101316;
+
+  /* Lamps: the lit colour. */
+  --lamp-clear: #56dc85;    /* oklch(0.800 0.170 152) */
+  --lamp-caution: #f8bd40;  /* oklch(0.830 0.150 82) */
+  --lamp-stop: #ff716b;     /* oklch(0.720 0.175 25) */
+  --lamp-info: var(--accent);
+  --lamp-off: #7a8188;      /* oklch(0.600 0.014 250)  unlit, disabled, unknown */
+
+  /* Lamp colours safe for text (same as the lamp at night). */
+  --clear-ink: #56dc85;     /* 9.9:1 on surface */
+  --caution-ink: #f8bd40;   /* 10.2:1 */
+  --stop-ink: #ff716b;      /* 6.5:1 */
+
+  /* Solid destructive plate. */
+  --stop-solid: #ff716b;
+  --on-stop: #0b0e11;       /* 7.2:1 */
+
+  /* Chart series. Order is fixed; see the header note. */
+  --series-1: #4098e3;  /* blue     oklch(0.66 0.140 248) */
+  --series-2: #bf4a7f;  /* magenta  oklch(0.58 0.160 355) */
+  --series-3: #909a40;  /* olive    oklch(0.66 0.115 115) */
+  --series-4: #8264c8;  /* violet   oklch(0.58 0.150 295) */
+  --series-5: #24a5ab;  /* cyan     oklch(0.66 0.105 200) */
+  --series-6: #af5a21;  /* rust     oklch(0.56 0.130 50) */
+  --series-other: #5c646c;
+  --chart-grid: #23282d;
+  --chart-axis: #40464c;
+
+  /* Code colouring: restrained, two hues and ink. */
+  --code-key: #a4ddff;
+  --code-string: #c9d48a;
+  --code-number: #f0b98a;
+  --code-atom: #d9a4e8;
+  --code-punct: #959ca4;
+
+  /* Elevation. On graphite, depth comes from a lighter surface and a firmer
+     rule; the shadow only anchors the layer. */
+  --shadow-1: 0 1px 2px rgb(0 0 0 / 0.4);
+  --shadow-2: 0 6px 16px -4px rgb(0 0 0 / 0.5), 0 2px 4px rgb(0 0 0 / 0.35);
+  --shadow-3: 0 18px 44px -10px rgb(0 0 0 / 0.65), 0 4px 10px rgb(0 0 0 / 0.4);
+  --scrim: rgb(4 6 8 / 0.62);
+
+  --focus-ring: #a4ddff;
+  --selection-bg: #2b4d63;
+}
+
+/* ======================================================================== */
+/* Light: the same panel in daylight.                                       */
+/* ======================================================================== */
+[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-sunken: #e9ebee;   /* oklch(0.940 0.005 250) */
+  --bg-ground: #eff1f4;   /* oklch(0.958 0.004 250) */
+  --bg-surface: #fcfdff;  /* oklch(0.995 0.002 250) */
+  --bg-raised: #ffffff;
+  --bg-hover: #eaedf1;    /* oklch(0.945 0.006 250) */
+  --bg-active: #dfe3e7;   /* oklch(0.915 0.007 250) */
+  --bg-field: #ffffff;    /* inputs: white paper; a grey well would read as disabled */
+
+  --rule: #d8dbdf;            /* oklch(0.890 0.006 250) */
+  --rule-strong: #bdc1c6;     /* oklch(0.810 0.008 250) */
+  --control-border: #757b81;  /* oklch(0.580 0.012 250)  4.2:1 on surface */
+
+  --text: #191d22;        /* oklch(0.230 0.012 250)  16.6:1 on surface */
+  --text-2: #454b52;      /* oklch(0.410 0.014 250)   8.7:1 */
+  --text-3: #5d646b;      /* oklch(0.500 0.014 250)   5.9:1 on surface, 5.0:1 on sunken */
+  --text-on-plate: #fcfdff;
+
+  --accent: #0260a6;       /* oklch(0.480 0.135 250)  6.4:1 on surface */
+  --accent-hi: #004987;    /* oklch(0.400 0.125 250) */
+  --accent-ink: #0260a6;
+  --on-accent: #fcfdff;
+
+  /* In daylight the lit lamp is brighter than text can be, so fills and ink
+     are separate steps of the same hue. */
+  --lamp-clear: #00a24f;    /* oklch(0.620 0.170 152) */
+  --lamp-caution: #bd8000;  /* oklch(0.640 0.135 80)  3.3:1 on surface: amber dark enough to read on white */
+  --lamp-stop: #e23532;     /* oklch(0.600 0.210 27) */
+  --lamp-info: var(--accent);
+  --lamp-off: #878d93;      /* oklch(0.640 0.012 250) */
+
+  --clear-ink: #00682f;     /* oklch(0.450 0.125 152)  6.8:1 on surface */
+  --caution-ink: #824c01;   /* oklch(0.470 0.105 65)   6.9:1 */
+  --stop-ink: #b7191c;      /* oklch(0.500 0.190 27)   6.5:1 */
+
+  --stop-solid: #b7191c;
+  --on-stop: #fcfdff;
+
+  --series-1: #2b85cf;  /* blue     oklch(0.60 0.140 248) */
+  --series-2: #96225c;  /* magenta  oklch(0.46 0.160 355) */
+  --series-3: #8a943a;  /* olive    oklch(0.64 0.115 115) */
+  --series-4: #6040a1;  /* violet   oklch(0.46 0.150 295) */
+  --series-5: #1a9a9f;  /* cyan     oklch(0.62 0.105 200) */
+  --series-6: #a24e10;  /* rust     oklch(0.52 0.130 50) */
+  --series-other: #a3a9af;
+  --chart-grid: #e4e7ea;
+  --chart-axis: #bdc1c6;
+
+  --code-key: #004987;
+  --code-string: #4d5a00;
+  --code-number: #8a4300;
+  --code-atom: #6b2a86;
+  --code-punct: #5d646b;
+
+  --shadow-1: 0 1px 2px rgb(25 29 34 / 0.08);
+  --shadow-2: 0 6px 16px -4px rgb(25 29 34 / 0.14), 0 2px 4px rgb(25 29 34 / 0.06);
+  --shadow-3: 0 18px 44px -10px rgb(25 29 34 / 0.24), 0 4px 10px rgb(25 29 34 / 0.08);
+  --scrim: rgb(25 29 34 / 0.38);
+
+  --focus-ring: #0260a6;
+  --selection-bg: #c5dcf0;
+}
+
+/* ---- Derived washes: a lamp colour laid thinly over whatever is behind. ----
+   Declared on every theme scope so a nested [data-theme] re-resolves them. */
+:root,
+[data-theme] {
+  --wash-clear: color-mix(in srgb, var(--lamp-clear) 14%, transparent);
+  --wash-caution: color-mix(in srgb, var(--lamp-caution) 16%, transparent);
+  --wash-stop: color-mix(in srgb, var(--lamp-stop) 13%, transparent);
+  --wash-accent: color-mix(in srgb, var(--accent) 13%, transparent);
+  --wash-neutral: color-mix(in srgb, var(--text) 7%, transparent);
+}
+
+/* Phones: tighter page gutters, larger touch controls. */
+@media (max-width: 720px) {
+  :root {
+    --content-pad: var(--space-4);
+  }
+}
+
+@media (pointer: coarse) {
+  :root {
+    --control-h-sm: 34px;
+    --control-h-md: 40px;
+    --control-h-lg: 46px;
+  }
+}
