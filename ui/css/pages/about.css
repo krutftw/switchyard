@@ -1,0 +1,556 @@
+/* About page. */
+
+/* Land below the sticky top bar when jumped to. */
+.about-section {
+  scroll-margin-top: calc(var(--topbar-h) + var(--space-4));
+}
+
+/* A section link moves keyboard focus to the panel it jumped to. The ring
+   follows the panel's own corners. */
+.about-section:focus-visible {
+  border-radius: var(--radius-md);
+}
+
+/* Text from a link or from the gateway that may have no place to break. */
+.about-break {
+  overflow-wrap: anywhere;
+}
+
+/* ---- Section links ------------------------------------------------------- */
+
+.about-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  /* The first link's text lines up with the page heading. */
+  margin: calc(var(--space-2) * -1) 0 0 calc(var(--space-2) * -1);
+}
+
+.about-nav-item {
+  display: inline-flex;
+  align-items: center;
+  height: var(--control-h-sm);
+  padding: 0 var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-decoration: none;
+  white-space: nowrap;
+  transition:
+    background-color var(--dur-fast) ease,
+    color var(--dur-fast) ease;
+}
+
+@media (hover: hover) {
+  .about-nav-item:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+}
+
+/* ---- Layout -------------------------------------------------------------- */
+
+.about-top,
+.about-bottom {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: var(--space-4);
+}
+
+.about-bottom {
+  align-items: start;
+}
+
+@media (max-width: 1040px) {
+  .about-top,
+  .about-bottom {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* A code-shaped placeholder: the well is there before the text is. */
+.about-code-skel {
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--bg-sunken);
+}
+
+/* A lamp label that may run long: let it wrap instead of pushing the panel. */
+.about-status-wrap {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+
+/* ---- Connect a client ---------------------------------------------------- */
+
+.about-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-4) var(--space-6);
+}
+
+.about-controls .field {
+  max-width: 100%;
+}
+
+.about-controls .field-hint {
+  max-width: 36ch;
+}
+
+.about-model {
+  flex: 0 1 320px;
+  min-width: min(100%, 200px);
+}
+
+.about-lead {
+  max-width: var(--measure);
+  color: var(--text-2);
+}
+
+.about-aside {
+  max-width: var(--measure);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-3);
+}
+
+.about-link {
+  color: var(--accent-ink);
+  text-decoration: underline;
+  text-underline-offset: 0.18em;
+}
+
+@media (hover: hover) {
+  .about-link:hover {
+    color: var(--accent-hi);
+  }
+}
+
+.about-blocks {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-3);
+}
+
+/* ---- Endpoints table ------------------------------------------------------ */
+
+.about-endpoints .table td {
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+  vertical-align: top;
+}
+
+.about-path {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.about-path .btn {
+  margin: calc(var(--space-1) * -1) 0;
+}
+
+.about-path-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  min-width: 0;
+  color: var(--text);
+}
+
+/* Paths break at the <wbr> after a slash or a colon, never inside a word. */
+.about-path-text {
+  overflow-wrap: normal;
+  word-break: normal;
+}
+
+/* The API family under the path: shown only where its column is not. */
+.about-path-family {
+  display: none;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-3);
+}
+
+.about-badges {
+  display: inline-flex;
+  flex: none;
+  gap: var(--space-1h);
+  /* GET and POST take the same room, so the paths line up. */
+  min-width: 44px;
+}
+
+.about-cell-text {
+  min-width: 0;
+  color: var(--text-2);
+  text-align: left;
+}
+
+.about-foot-text {
+  line-height: var(--leading-snug);
+}
+
+/* Between the phone layout and a wide window three columns crush the
+   description: the API column goes, and its word moves under the path. */
+@media (min-width: 721px) and (max-width: 1040px) {
+  .about-endpoints .table th:nth-child(2),
+  .about-endpoints .table td:nth-child(2) {
+    display: none;
+  }
+
+  .about-path-family {
+    display: block;
+  }
+}
+
+/* On a phone a table row is a card of label and value lines. */
+@media (max-width: 720px) {
+  .about-endpoints .table[data-collapse] td {
+    padding: 0;
+  }
+
+  /* The sentence explains itself: it goes under the rest, without a label. */
+  .about-endpoints .table[data-collapse] td:last-child {
+    display: block;
+    margin-top: var(--space-1);
+    text-align: left;
+  }
+
+  .about-endpoints .table[data-collapse] td:last-child::before {
+    content: none;
+  }
+
+  /* Method, path, and the copy button at the card's right edge. */
+  .about-path,
+  .about-path-list {
+    flex: 1 1 auto;
+  }
+}
+
+/* ---- Reasoning suffix ----------------------------------------------------- */
+
+.about-suffix-row {
+  display: grid;
+  grid-template-columns: 220px minmax(0, 1fr);
+  gap: var(--space-3) var(--space-6);
+  padding: var(--space-4) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.about-suffix-row:last-child {
+  border-bottom: 0;
+}
+
+.about-suffix-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.about-suffix {
+  font-size: var(--text-md);
+  font-stretch: normal;
+  letter-spacing: 0;
+}
+
+.about-suffix-meaning {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-2);
+}
+
+/* Three provider cells that fold to two and to one as the room runs out. */
+.about-suffix-cells {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 212px), 1fr));
+  gap: var(--space-4) var(--space-5);
+  min-width: 0;
+}
+
+.about-reason {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  min-width: 0;
+}
+
+.about-reason-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* What one kind of model gets: the fields, then which models and why. */
+.about-reason-case {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.about-reason-code {
+  display: block;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.about-reason-note {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-3);
+}
+
+.about-reason-plain {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-2);
+}
+
+.about-pad {
+  padding: var(--panel-pad);
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.about-reason-foot {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 3fr);
+  gap: var(--space-5) var(--space-8);
+}
+
+.about-levels {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.about-levels li {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  padding: var(--space-1) var(--space-2);
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-sm);
+}
+
+.about-levels .num {
+  color: var(--text-2);
+}
+
+.about-rules {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  max-width: var(--measure);
+  padding-left: var(--space-4);
+  list-style: disc;
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-2);
+}
+
+.about-rules li::marker {
+  color: var(--text-3);
+}
+
+@media (max-width: 1040px) {
+  .about-suffix-row,
+  .about-reason-foot {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+/* ---- Keyboard shortcuts -------------------------------------------------- */
+
+.about-shortcuts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+
+.about-shortcut-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.about-shortcut-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.about-shortcut {
+  display: grid;
+  grid-template-columns: 124px minmax(0, 1fr);
+  align-items: baseline;
+  gap: var(--space-3);
+  padding: var(--space-1h) 0;
+  border-bottom: var(--hairline) solid var(--rule);
+  font-size: var(--text-sm);
+}
+
+.about-shortcut:last-child {
+  border-bottom: 0;
+}
+
+.about-shortcut dd {
+  color: var(--text-2);
+  line-height: var(--leading-snug);
+}
+
+.about-keys {
+  display: inline-flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.about-chord {
+  display: inline-flex;
+  gap: var(--space-0h);
+}
+
+.about-keys-or {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+.about-flip {
+  transform: scaleX(-1);
+}
+
+/* ---- Licence -------------------------------------------------------------- */
+
+.about-prose p {
+  max-width: var(--measure);
+  color: var(--text-2);
+}
+
+.about-prose strong {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.about-bundled {
+  display: flex;
+  flex-direction: column;
+  font-size: var(--text-sm);
+}
+
+.about-bundled li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-1h) 0;
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.about-bundled li:last-child {
+  border-bottom: 0;
+}
+
+.about-details-group {
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-md);
+  min-width: 0;
+}
+
+.about-details + .about-details {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.about-summary {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--row-h);
+  padding: 0 var(--space-3);
+  list-style: none;
+  cursor: pointer;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  user-select: none;
+  -webkit-user-select: none;
+  transition: background-color var(--dur-fast) ease;
+}
+
+.about-summary::-webkit-details-marker {
+  display: none;
+}
+
+.about-summary:focus-visible {
+  outline-offset: -2px;
+}
+
+.about-details:first-child > .about-summary {
+  border-radius: calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px) 0 0;
+}
+
+.about-details:last-child:not([open]) > .about-summary {
+  border-radius: 0 0 calc(var(--radius-md) - 1px) calc(var(--radius-md) - 1px);
+}
+
+@media (hover: hover) {
+  .about-summary:hover {
+    background: var(--bg-hover);
+  }
+}
+
+/* The mark turns to point at what opened. Without motion it just points. */
+.about-summary-mark {
+  color: var(--text-3);
+  transition: transform calc(var(--dur-fast) * var(--motion)) var(--ease-out);
+}
+
+.about-details[open] > .about-summary .about-summary-mark {
+  transform: rotate(90deg);
+}
+
+.about-summary-title {
+  flex: none;
+}
+
+.about-summary-hint {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: right;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-3);
+}
+
+.about-details-body {
+  padding: 0 var(--space-3) var(--space-3);
+  min-width: 0;
+}
+
+@media (pointer: coarse) {
+  .about-summary {
+    min-height: var(--tap-min);
+  }
+
+  .about-nav-item {
+    height: var(--control-h-md);
+  }
+}
+
+@media (max-width: 420px) {
+  .about-shortcut {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+}

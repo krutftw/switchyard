@@ -1,0 +1,716 @@
+/* Playground page (#/playground). Classes are prefixed "play-". */
+
+.play {
+  /* Structural sizes of this page. Everything else comes from tokens.css. */
+  --play-settings-w: 288px;
+  --play-insp-min: 380px;
+  --play-frame-at-w: 64px;
+  --play-pair-min: 176px;
+  --play-frames-h: clamp(176px, 32dvh, 340px);
+  /* Height of the work area when the columns sit side by side: the window
+     below the top bar, less the page heading, the transport tabs and the
+     page's own padding. */
+  --play-h: max(520px, calc(100dvh - var(--topbar-h) - 232px));
+}
+
+.play-view {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* ---- Layout: one column, then two, then three ---------------------------- */
+
+.play-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: start;
+}
+
+.play-col {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+/* ---- Request settings ----------------------------------------------------- */
+
+.play-form {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.play-more {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-h-sm);
+  padding-top: var(--space-3);
+  border-top: var(--hairline) solid var(--rule);
+  color: var(--text);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  text-align: left;
+}
+
+.play-more > .icon {
+  color: var(--text-3);
+  transition: transform calc(var(--dur-fast) * var(--motion)) var(--ease-out);
+}
+
+.play-more[aria-expanded="true"] > .icon {
+  transform: rotate(90deg);
+}
+
+.play-more > .faint {
+  margin-left: auto;
+  font-weight: var(--weight-regular);
+}
+
+.play-params {
+  display: none;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+
+.play-params[data-open] {
+  display: flex;
+}
+
+.play-pair {
+  display: grid;
+  /* Side by side where both labels fit on one line, stacked in the narrow column. */
+  grid-template-columns: repeat(auto-fit, minmax(min(var(--play-pair-min), 100%), 1fr));
+  gap: var(--space-3);
+  align-items: start;
+}
+
+.play-pair + .field-hint {
+  margin-top: calc(var(--space-2) * -1);
+}
+
+/* ---- Model combobox ------------------------------------------------------- */
+
+.play-combo-toggle {
+  display: grid;
+  place-items: center;
+  width: var(--space-6);
+  height: var(--space-6);
+  border-radius: var(--radius-sm);
+  color: var(--text-3);
+}
+
+@media (hover: hover) {
+  .play-combo-toggle:hover:not(:disabled) {
+    color: var(--text);
+    background: var(--bg-hover);
+  }
+}
+
+.menu.play-combo-list {
+  min-width: 0;
+  max-width: calc(100vw - var(--space-4));
+  max-height: min(320px, calc(100dvh - var(--space-4)));
+}
+
+.play-combo-item {
+  align-items: flex-start;
+}
+
+.play-combo-item > .icon {
+  margin-top: 3px;
+}
+
+.play-combo-item[aria-selected="true"] .play-combo-value {
+  color: var(--accent-ink);
+}
+
+.play-combo-value {
+  overflow-wrap: anywhere;
+}
+
+.play-combo-state {
+  flex: none;
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+
+.play-combo-hint {
+  flex: 0 1 auto;
+  max-width: 44%;
+  text-align: right;
+  overflow-wrap: anywhere;
+}
+
+.play-combo-note {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+  padding: var(--space-2);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.play-combo-note > .skel-lines {
+  align-self: stretch;
+}
+
+/* ---- Conversation --------------------------------------------------------- */
+
+.play-chat > .panel-body {
+  display: flex;
+  flex-direction: column;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.play-transcript {
+  flex: 1 1 auto;
+  min-height: 220px;
+  max-height: 58dvh;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+/* The socket view has a taller composer under its transcript. */
+.play-grid[data-layout="socket"] .play-transcript {
+  max-height: 44dvh;
+}
+
+.play-transcript:focus-visible {
+  outline-offset: -2px;
+}
+
+.play-transcript[data-empty] {
+  display: grid;
+  place-items: center;
+}
+
+@media (min-width: 1360px) {
+  .play-grid[data-layout="http"] .play-transcript {
+    max-height: none;
+  }
+}
+
+.play-turns {
+  display: flex;
+  flex-direction: column;
+}
+
+.play-turn {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+  min-width: 0;
+}
+
+/* What was sent sits a step lower than what came back. */
+.play-turn[data-role="user"],
+.play-turn[data-role="raw"] {
+  background: var(--bg-ground);
+}
+
+/* A remark between turns: a new socket, which knows nothing of the turns above it. */
+.play-turn[data-role="note"] {
+  background: var(--bg-sunken);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.play-turn-head {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  min-height: var(--space-5);
+}
+
+.play-turn-model {
+  color: var(--text-2);
+  font-size: var(--text-xs);
+  overflow-wrap: anywhere;
+}
+
+.play-turn-head .status {
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+
+.play-turn-wait {
+  max-width: 28ch;
+}
+
+.play-text {
+  max-width: 80ch;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.play-caret {
+  display: inline-block;
+  width: 0.5em;
+  height: 1em;
+  margin-left: 2px;
+  vertical-align: text-bottom;
+  border-radius: 1px;
+  background: var(--accent);
+  animation: play-caret 1000ms steps(2, jump-none) infinite;
+}
+
+@keyframes play-caret {
+  from {
+    opacity: 1;
+  }
+  to {
+    opacity: 0.25;
+  }
+}
+
+.play-turn-foot {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-3);
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+/* Reasoning: a quiet fold under the answer's heading. */
+.play-think {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.play-think-head {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  align-self: flex-start;
+  min-height: var(--control-h-sm);
+  padding: 0 var(--space-2) 0 var(--space-1);
+  margin-left: calc(var(--space-1) * -1);
+  border-radius: var(--radius-sm);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+}
+
+.play-think-head .status {
+  font-size: var(--text-xs);
+}
+
+.play-think-title {
+  font-weight: var(--weight-medium);
+}
+
+.play-think-chevron {
+  color: var(--text-3);
+  transition: transform calc(var(--dur-fast) * var(--motion)) var(--ease-out);
+}
+
+.play-think[data-open] .play-think-chevron {
+  transform: rotate(90deg);
+}
+
+@media (hover: hover) {
+  .play-think-head:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+}
+
+.play-think-body {
+  max-width: 80ch;
+  padding-left: var(--space-5);
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+/* Tool call: the arguments as code, then the result the user supplies. */
+.play-tool {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.play-tool .code-tools .status {
+  margin-right: var(--space-2);
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+
+.play-tool-result {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.play-tool-result pre {
+  color: var(--text-2);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.play-tool-send {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--panel-pad);
+  font-size: var(--text-sm);
+}
+
+p.play-tool-send {
+  display: block;
+  max-width: 80ch;
+  line-height: var(--leading-snug);
+}
+
+/* Errors, in the conversation where they happened. */
+.play-error .notice-text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-2);
+}
+
+.play-error-message {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.play-error-actions {
+  --gap: var(--space-3);
+}
+
+.play-composer {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--panel-pad) var(--panel-pad);
+  border-top: var(--hairline) solid var(--rule);
+  min-width: 0;
+}
+
+.play-composer-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  font-size: var(--text-xs);
+}
+
+.play-composer-actions > :first-child:not(.btn) {
+  margin-right: auto;
+}
+
+/* ---- Inspector ------------------------------------------------------------ */
+
+.play-insp {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.play-insp-tabs {
+  flex: none;
+  padding: var(--space-1) var(--panel-pad) 0;
+  /* The inspector is narrow on a phone and in the three-column layout alike:
+     its tab strip follows its own width, not the window's. */
+  container: play-insp-tabs / inline-size;
+}
+
+.play-insp-tabs .tabs {
+  gap: var(--space-4);
+  border-bottom: 0;
+}
+
+/* Five tabs have to fit without scrolling: the strip hides its scrollbar, so
+   a tab pushed past the edge would be cut off with nothing to say so. */
+@container play-insp-tabs (max-width: 400px) {
+  .play-insp-tabs .tabs {
+    gap: var(--space-3);
+  }
+}
+
+/* The event count is repeated at the top of the Events tab. */
+@container play-insp-tabs (max-width: 340px) {
+  .play-insp-tabs .tab-count {
+    display: none;
+  }
+}
+
+@container play-insp-tabs (max-width: 290px) {
+  .play-insp-tabs .tabs {
+    gap: var(--space-2);
+  }
+}
+
+.play-insp-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  max-height: 72dvh;
+  overflow-y: auto;
+  border-top: var(--hairline) solid var(--rule);
+}
+
+@media (min-width: 1100px) {
+  .play-insp-body {
+    max-height: none;
+  }
+}
+
+.play-insp-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--panel-pad);
+  min-width: 0;
+}
+
+.play-insp-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+}
+
+.play-insp-raw {
+  align-items: center;
+}
+
+.play-insp-raw .switch {
+  margin-top: 0;
+}
+
+.play-insp-path {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  font-size: var(--text-sm);
+  overflow-wrap: anywhere;
+}
+
+.play-insp-path > .faint {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.play-insp-editor textarea.input-el {
+  min-height: 260px;
+  font-size: var(--text-sm);
+  line-height: 1.55;
+  tab-size: 2;
+}
+
+.play-insp-foot {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+/* ---- Events and frames ---------------------------------------------------- */
+
+.play-frames {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.play-frames-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: var(--row-h);
+  padding: 0 var(--space-2) 0 var(--panel-pad);
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+
+.play-frames-list {
+  position: relative;
+  height: var(--play-frames-h);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  border-top: var(--hairline) solid var(--rule);
+  border-bottom: var(--hairline) solid var(--rule);
+  background: var(--bg-sunken);
+}
+
+.play-frames-list:focus-visible {
+  outline-offset: -2px;
+}
+
+.play-frames-space {
+  position: relative;
+}
+
+.play-frame {
+  position: absolute;
+  left: 0;
+  right: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  cursor: default;
+}
+
+.play-frame > .icon {
+  color: var(--text-3);
+}
+
+.play-frame-at {
+  flex: none;
+  width: var(--play-frame-at-w);
+  color: var(--text-3);
+  text-align: right;
+  font-size: inherit;
+}
+
+.play-frame-name {
+  flex: 0 1 auto;
+  max-width: 44%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: inherit;
+}
+
+.play-frame-note {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 60%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-2);
+}
+
+.play-frame[data-tone="stop"] .play-frame-name {
+  color: var(--stop-ink);
+}
+
+.play-frame[data-tone="info"] .play-frame-name {
+  color: var(--text-2);
+}
+
+.play-frame-data {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text-3);
+  font-size: inherit;
+}
+
+.play-frame[aria-selected="true"] {
+  background: var(--bg-active);
+}
+
+.play-frame[aria-selected="true"] .play-frame-data {
+  color: var(--text-2);
+}
+
+@media (hover: hover) {
+  .play-frame:hover:not([aria-selected="true"]) {
+    background: var(--bg-hover);
+  }
+}
+
+.play-frames-detail,
+.play-frames-hint {
+  margin: var(--space-3) var(--panel-pad) var(--panel-pad);
+}
+
+.play-frames-hint {
+  font-size: var(--text-sm);
+}
+
+/* ---- Wider windows: two columns, then three ------------------------------ */
+/* Last in the file, so these win over the base rules above. */
+
+@media (min-width: 1100px) {
+  .play-grid[data-layout="http"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+    grid-template-areas:
+      "settings inspector"
+      "chat inspector";
+  }
+
+  .play-grid[data-layout="socket"] {
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  }
+
+  /* The frames stay in view while the conversation scrolls. */
+  .play-grid[data-layout="socket"] > .play-col:last-child {
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--space-4));
+  }
+
+  .play-settings {
+    grid-area: settings;
+  }
+
+  .play-grid[data-layout="http"] > .play-chat {
+    grid-area: chat;
+  }
+
+  .play-insp {
+    grid-area: inspector;
+    position: sticky;
+    top: calc(var(--topbar-h) + var(--space-4));
+    height: calc(100dvh - var(--topbar-h) - var(--space-8));
+  }
+}
+
+@media (min-width: 1360px) {
+  .play-grid[data-layout="http"] {
+    grid-template-columns: var(--play-settings-w) minmax(0, 1fr) minmax(var(--play-insp-min), 0.9fr);
+    grid-template-areas: "settings chat inspector";
+  }
+
+  .play-grid[data-layout="http"] > .play-chat,
+  .play-insp {
+    position: static;
+    height: var(--play-h);
+  }
+
+  /* The settings scroll inside their column, so the whole work area fits the window. */
+  .play-settings {
+    max-height: var(--play-h);
+  }
+
+  .play-settings > .panel-body {
+    overflow-y: auto;
+    overscroll-behavior: contain;
+  }
+
+  /* With a column of their own the parameters are always in view. */
+  .play-more {
+    display: none;
+  }
+
+  .play-params {
+    display: flex;
+  }
+}

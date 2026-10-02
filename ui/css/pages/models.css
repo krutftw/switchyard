@@ -1,0 +1,766 @@
+/* Models page: model table, detail drawer, alias editor, catalog. */
+
+/* ======================================================================== */
+/* Toolbar above a table                                                    */
+/* ======================================================================== */
+
+.models-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.models-search {
+  flex: 1 1 16rem;
+  max-width: 26rem;
+}
+
+.models-filter {
+  flex: 0 1 13rem;
+}
+
+.models-toolbar-end {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-left: auto;
+  min-width: 0;
+}
+
+.models-count {
+  color: var(--text-3);
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+/* ======================================================================== */
+/* Model table cells                                                        */
+/* ======================================================================== */
+
+/* Rows hold two or three lines (name and display name, several routes). */
+.models-table .table td {
+  padding-top: var(--space-2);
+  padding-bottom: var(--space-2);
+}
+
+.models-name {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  min-width: 0;
+}
+
+.models-name-line {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.models-name-id {
+  max-width: 34ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 0.93em;
+  font-weight: var(--weight-medium);
+}
+
+/* The copy button sits in the row's own height instead of adding to it. */
+.models-name-line .btn {
+  margin: calc(var(--space-1) * -1) 0;
+  flex: none;
+}
+
+.models-name-sub {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1);
+  max-width: 38ch;
+  min-width: 0;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+}
+
+.models-name-sub .icon {
+  flex: none;
+}
+
+.models-kind {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+}
+
+/* Most rows are plain models: only the exceptions (alias, hidden) wear a badge. */
+.models-kind-plain {
+  color: var(--text-2);
+}
+
+.models-routes {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  min-width: 0;
+}
+
+.models-route {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  min-height: 1.35em;
+  white-space: nowrap;
+}
+
+.models-route-text {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  max-width: 34ch;
+  font-size: 0.93em;
+  overflow: hidden;
+}
+
+.models-route-up {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+  color: var(--text-3);
+}
+
+.models-route-up .mono {
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.models-route-count {
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+.models-route-more {
+  padding-left: var(--space-4);
+  font-size: var(--text-xs);
+}
+
+/* Copy buttons appear with the row on devices that hover; touch always shows them. */
+@media (hover: hover) and (pointer: fine) {
+  .models-table tr .models-name-line .btn {
+    opacity: 0;
+    transition: opacity var(--dur-fast) ease;
+  }
+
+  .models-table tr:hover .models-name-line .btn,
+  .models-table tr:focus-visible .models-name-line .btn,
+  .models-table .models-name-line:focus-within .btn {
+    opacity: 1;
+  }
+}
+
+/* ======================================================================== */
+/* Detail drawer                                                            */
+/* ======================================================================== */
+
+.models-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-6);
+  min-width: 0;
+}
+
+.models-detail-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+}
+
+.models-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.models-section-head {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: var(--measure);
+}
+
+.models-section-head p,
+.models-caption {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.models-caption {
+  color: var(--text-3);
+  max-width: var(--measure);
+}
+
+/* The rails are cut out of the panel surface, so the diagram sits on one. */
+.models-track {
+  padding: var(--space-3);
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  min-width: 0;
+}
+
+.models-routelist {
+  display: flex;
+  flex-direction: column;
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.models-routelist-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  padding: var(--space-3) 0;
+  border-bottom: var(--hairline) solid var(--rule);
+  min-width: 0;
+}
+
+.models-routelist-top {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-4);
+  min-width: 0;
+}
+
+.models-routelist-top .status {
+  white-space: normal;
+}
+
+.models-routelist-name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.models-routelist-provider {
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  overflow-wrap: anywhere;
+}
+
+.models-routelist-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-5);
+  font-size: var(--text-xs);
+}
+
+.models-routelist-facts > div {
+  display: flex;
+  gap: var(--space-1h);
+  min-width: 0;
+}
+
+.models-routelist-facts dt {
+  flex: none;
+  color: var(--text-3);
+}
+
+.models-routelist-facts dd {
+  color: var(--text-2);
+  overflow-wrap: anywhere;
+}
+
+.models-targets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.models-targets li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.models-targets-order {
+  flex: none;
+  min-width: 1.5ch;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+.models-link {
+  color: var(--accent-ink);
+  text-align: left;
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, currentColor 40%, transparent);
+  text-underline-offset: 0.18em;
+  overflow-wrap: anywhere;
+  transition: color var(--dur-fast) ease, text-decoration-color var(--dur-fast) ease;
+}
+
+@media (hover: hover) {
+  .models-link:hover {
+    color: var(--accent-hi);
+    text-decoration-color: currentColor;
+  }
+}
+
+.models-facts {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+}
+
+.models-call {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.models-call-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+
+.models-suffixes {
+  display: flex;
+  flex-direction: column;
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.models-suffix {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  padding: var(--space-2) 0 var(--space-3);
+  border-bottom: var(--hairline) solid var(--rule);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+}
+
+.models-suffix-top {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.models-suffix-title {
+  flex: none;
+  width: 9.5em;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+.models-suffix-model {
+  flex: 1 1 0;
+  min-width: 0;
+  color: var(--text);
+  font-size: 0.93em;
+  overflow-wrap: anywhere;
+}
+
+.models-suffix p {
+  padding-left: calc(9.5em * 12 / 13 + var(--space-2));
+  max-width: var(--measure);
+}
+
+/* ======================================================================== */
+/* Combobox (alias target picker)                                           */
+/* ======================================================================== */
+
+.models-combo {
+  display: block;
+  min-width: 0;
+}
+
+.models-combo-list {
+  position: fixed;
+  z-index: var(--z-overlay);
+  max-width: calc(100vw - var(--space-4));
+  max-height: min(20rem, 50dvh);
+  overflow-y: auto;
+  overscroll-behavior: contain;
+  padding: var(--space-1);
+  border: var(--hairline) solid var(--rule-strong);
+  border-radius: var(--radius-md);
+  background: var(--bg-raised);
+  box-shadow: var(--shadow-2);
+}
+
+.models-combo-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: var(--control-h-sm);
+  padding: var(--space-1) var(--space-2);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+
+.models-combo-item[data-active] {
+  background: var(--bg-hover);
+}
+
+.models-combo-value {
+  flex: 1 1 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 0.93em;
+}
+
+.models-combo-hint {
+  flex: none;
+  max-width: 45%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-3);
+  font-size: var(--text-xs);
+}
+
+/* ======================================================================== */
+/* Alias editor                                                             */
+/* ======================================================================== */
+
+.models-alias-list {
+  display: flex;
+  flex-direction: column;
+}
+
+.models-alias {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--panel-pad) var(--space-5);
+  border-bottom: var(--hairline) solid var(--rule);
+  min-width: 0;
+}
+
+.models-alias:last-child {
+  border-bottom: 0;
+}
+
+/* An alias takes focus as a whole when the one before it is deleted. The
+   ring is drawn inside: the panel clips what sticks out. */
+.models-alias:focus-visible {
+  outline-offset: calc(var(--space-0h) * -1);
+  border-radius: 0;
+}
+
+/* Stands in for the status lamp while the model table loads. */
+.models-alias-pending {
+  flex: none;
+  width: 7rem;
+}
+
+.models-alias-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-4);
+  min-height: var(--control-h-sm);
+}
+
+.models-alias-state,
+.models-alias-tools {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+/* Name beside targets where both fit; stacked where they do not (a narrow
+   window with the sidebar open is narrower than a phone in landscape). */
+.models-alias-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-4) var(--space-6);
+}
+
+.models-alias-main,
+.models-alias-targets {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.models-alias-main {
+  flex: 1 1 16rem;
+  max-width: 22rem;
+}
+
+.models-alias-targets {
+  flex: 3 1 22rem;
+  gap: var(--space-2);
+}
+
+.models-target-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.models-target {
+  position: relative;
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.models-target[data-dragging] {
+  opacity: 0.5;
+}
+
+/* Where a dragged target will land. */
+.models-target[data-drop]::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: var(--space-0h);
+  border-radius: var(--radius-full);
+  background: var(--accent);
+  pointer-events: none;
+}
+
+.models-target[data-drop="before"]::before {
+  top: calc(var(--space-1) * -1 - var(--space-px));
+}
+
+.models-target[data-drop="after"]::before {
+  bottom: calc(var(--space-1) * -1 - var(--space-px));
+}
+
+.models-target-grip,
+.models-target-order {
+  display: grid;
+  place-items: center;
+  flex: none;
+  height: var(--control-h-md);
+  color: var(--text-3);
+}
+
+.models-target-grip {
+  width: var(--space-5);
+  margin-left: calc(var(--space-1) * -1);
+  border-radius: var(--radius-sm);
+  cursor: grab;
+  transition: color var(--dur-fast) ease, background-color var(--dur-fast) ease;
+}
+
+.models-target-grip:active {
+  cursor: grabbing;
+}
+
+@media (hover: hover) {
+  .models-target-grip:hover {
+    background: var(--bg-hover);
+    color: var(--text);
+  }
+}
+
+/* Dragging needs a mouse; touch screens reorder with the arrow buttons. */
+@media (pointer: coarse) {
+  .models-target-grip {
+    display: none;
+  }
+}
+
+.models-target-order {
+  min-width: 2ch;
+  font-size: var(--text-xs);
+}
+
+.models-target-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  flex: 1 1 0;
+  min-width: 0;
+}
+
+.models-target-actions {
+  display: flex;
+  align-items: center;
+  flex: none;
+  height: var(--control-h-md);
+}
+
+.models-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-1h);
+  max-width: var(--measure);
+  color: var(--caution-ink);
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+}
+
+.models-warn .icon {
+  flex: none;
+  margin-top: var(--space-px);
+}
+
+/* With unsaved changes the save bar stays in reach while a long list scrolls. */
+.models-aliases .panel-foot {
+  flex-wrap: wrap;
+  padding-top: var(--space-3);
+  padding-bottom: var(--space-3);
+  border-radius: 0 0 var(--radius-md) var(--radius-md);
+  background: var(--bg-surface);
+}
+
+.models-aliases[data-dirty] .panel-foot {
+  position: sticky;
+  bottom: 0;
+  z-index: var(--z-sticky);
+}
+
+.models-savebar-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-left: auto;
+}
+
+.models-aliases-error {
+  padding: var(--panel-pad);
+  border-top: var(--hairline) solid var(--rule);
+}
+
+/* ======================================================================== */
+/* Phones                                                                   */
+/* ======================================================================== */
+
+@media (max-width: 720px) {
+  /* A notice with an action: beside the text the button leaves it a column a
+     few words wide, so here the action goes under the text, in line with it. */
+  .models .notice,
+  .models-detail .notice {
+    flex-wrap: wrap;
+  }
+
+  .models .notice-body,
+  .models-detail .notice-body {
+    flex-basis: calc(100% - var(--space-4) - var(--space-3));
+  }
+
+  .models .notice-body + *,
+  .models-detail .notice-body + * {
+    margin-left: calc(var(--space-4) + var(--space-3));
+  }
+
+  .models-search {
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .models-filter {
+    flex: 1 1 9rem;
+  }
+
+  .models-toolbar-end {
+    flex-basis: 100%;
+    justify-content: space-between;
+  }
+
+  /* In a card the name may take the lines it needs. */
+  .models-name-id {
+    max-width: none;
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .models-name-sub {
+    max-width: none;
+  }
+
+  .models-routes {
+    align-items: flex-end;
+  }
+
+  .models-route-text {
+    max-width: 24ch;
+  }
+
+  .models-kind {
+    justify-content: flex-end;
+  }
+
+  .models-alias-main {
+    max-width: none;
+  }
+
+  .models-target {
+    flex-wrap: wrap;
+  }
+
+  /* No room for a drag handle beside the field: at this width targets are
+     reordered with the arrow buttons, with a mouse as with a finger. The
+     field's width below counts on the handle being gone. */
+  .models-target-grip {
+    display: none;
+  }
+
+  .models-target-field {
+    flex-basis: calc(100% - 2ch - var(--space-2));
+  }
+
+  .models-target-actions {
+    margin-left: auto;
+  }
+
+  .models-suffix-top {
+    flex-wrap: wrap;
+  }
+
+  .models-suffix-title {
+    width: 100%;
+  }
+
+  .models-suffix p {
+    padding-left: 0;
+  }
+
+  .models-aliases[data-dirty] .panel-foot {
+    bottom: calc(var(--bottombar-h) + env(safe-area-inset-bottom));
+  }
+
+  .models-savebar-actions {
+    flex: 1 1 100%;
+  }
+
+  .models-savebar-actions .btn {
+    flex: 1 1 auto;
+  }
+}

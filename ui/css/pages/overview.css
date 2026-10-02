@@ -1,0 +1,753 @@
+/* Overview page. Shared components do most of the drawing; this file lays the
+   sections out and styles the few things that exist only here: the status
+   strip, the lamp clusters of the provider board, the activity feed and the
+   setup steps. */
+
+/* Layout follows the width of the page, not of the window: the sidebar can be
+   wide, a rail, or absent. */
+.overview {
+  container: overview / inline-size;
+}
+
+/* ---- Status strip --------------------------------------------------------- */
+
+/* One instrument plate: the verdict, then the facts, divided by hairlines the
+   way a StatGroup is. */
+.overview-status {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: stretch;
+  min-width: 0;
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--bg-surface);
+  overflow: hidden;
+}
+
+.overview-verdict {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  flex: 1 1 280px;
+  min-width: 0;
+  min-height: 60px;
+  padding: var(--space-3) var(--space-4) var(--space-3) var(--space-5);
+  box-shadow:
+    1px 0 0 var(--rule),
+    0 1px 0 var(--rule);
+}
+
+.overview-verdict-text {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  min-width: 0;
+}
+
+.overview-verdict-label {
+  font-size: var(--text-lg);
+  font-weight: var(--weight-semibold);
+  font-stretch: var(--stretch-heading);
+  line-height: var(--leading-tight);
+}
+
+.overview-verdict-detail {
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-facts {
+  display: flex;
+  flex-wrap: wrap;
+  flex: 4 1 520px;
+  min-width: 0;
+}
+
+.overview-fact {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: var(--space-0h);
+  flex: 1 1 auto;
+  min-width: 96px;
+  padding: var(--space-2) var(--space-4);
+  box-shadow:
+    1px 0 0 var(--rule),
+    0 1px 0 var(--rule);
+}
+
+.overview-fact dd {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  min-height: 26px;
+  font-size: var(--text-md);
+}
+
+.overview-listen {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  min-width: 0;
+}
+
+.overview-listen .mono {
+  overflow-wrap: anywhere;
+}
+
+/* The counts are links to their pages. A lone digit is a small target, so
+   the link is padded out to a size a finger can hit. */
+.overview-fact dd > a {
+  display: inline-flex;
+  align-items: center;
+  min-width: var(--control-h-sm);
+  min-height: var(--control-h-sm);
+}
+
+/* ---- Notices -------------------------------------------------------------- */
+
+.overview-warnings {
+  display: flex;
+  flex-direction: column;
+  margin-top: var(--space-1);
+}
+
+.overview-warnings li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-4);
+  padding: var(--space-1) 0;
+}
+
+.overview-warnings li + li {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.overview-warning-text {
+  flex: 1 1 320px;
+  min-width: 0;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.overview-warning-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  flex: none;
+  white-space: nowrap;
+}
+
+/* A text link next to an icon button: as tall as the button, so it is as easy
+   to hit. */
+.overview-warning-actions a,
+.overview .panel-foot a {
+  display: inline-flex;
+  align-items: center;
+  min-height: var(--control-h-sm);
+}
+
+.overview-warnings-more {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin: var(--space-1) 0 0 calc(var(--space-2) * -1);
+}
+
+/* What the operator put away, and the way to get it back. */
+.overview-hidden {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-5);
+  margin-top: calc(var(--space-3) * -1);
+  font-size: var(--text-sm);
+  color: var(--text-3);
+}
+
+.overview-hidden > span {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+/* ---- Setup steps ---------------------------------------------------------- */
+
+.overview-steps {
+  display: flex;
+  flex-direction: column;
+}
+
+.overview-step {
+  display: grid;
+  grid-template-columns: minmax(168px, 220px) minmax(0, 1fr) auto;
+  align-items: start;
+  gap: var(--space-2) var(--space-5);
+  padding: var(--space-4) 0;
+}
+
+.overview-step:first-child {
+  padding-top: 0;
+}
+
+.overview-step:last-child {
+  padding-bottom: 0;
+}
+
+.overview-step + .overview-step {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.overview-step-head {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1h);
+  min-width: 0;
+}
+
+.overview-step-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+  max-width: 84ch;
+  font-size: var(--text-sm);
+  color: var(--text-2);
+}
+
+.overview-step-action {
+  display: flex;
+  justify-content: flex-end;
+}
+
+/* ---- Sections ------------------------------------------------------------- */
+
+.overview-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.overview-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-1) var(--space-4);
+}
+
+.overview-section-note {
+  font-size: var(--text-sm);
+}
+
+/* The note beside a section title is a sentence: on a phone it wraps. */
+.overview-section-head .status,
+.overview-feed-note .status {
+  flex-wrap: wrap;
+  white-space: normal;
+}
+
+/* The gateway does not answer: the numbers are the last ones heard. They
+   stay readable, and step back. */
+.overview-section[data-stale] .stat-value,
+.overview-section[data-stale] .stat-trend {
+  opacity: 0.55;
+}
+
+/* "Not refreshed since 14:03:27", after a panel's description. */
+.overview-desc-text {
+  margin-right: var(--space-3);
+}
+
+.overview-stale {
+  display: inline-flex;
+  align-items: center;
+  margin-right: var(--space-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+/* Eight vitals: four across, two rows. */
+.stat-group.overview-vitals {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+}
+
+/* ---- Provider board ------------------------------------------------------- */
+
+.overview-provider {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-px);
+  min-width: 0;
+  max-width: 30ch;
+}
+
+.overview-provider-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+.overview-provider-kind {
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-3);
+}
+
+.overview-cred {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1h);
+  /* Wide enough that the sentence wraps by words, not by letters. */
+  min-width: 132px;
+  padding: var(--space-1) 0;
+}
+
+/* The padding keeps the lamps' halos inside the cell. */
+.overview-lamps {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-0h);
+}
+
+.overview-lamps-more {
+  font-family: var(--font-mono);
+  font-size: var(--text-2xs);
+  color: var(--text-3);
+}
+
+.overview-cred-text {
+  color: var(--text-2);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* The credentials that are cooling down or unusable, one per line: which
+   one, when it is back, why. */
+.overview-cred-list {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  max-width: 64ch;
+  font-size: var(--text-xs);
+  color: var(--text-2);
+}
+
+.overview-cred-list li {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+  min-width: 0;
+}
+
+.overview-cred-name {
+  max-width: 24ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+}
+
+.overview-cred-state {
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.overview-cred-rest {
+  color: var(--text-3);
+}
+
+/* The share of attempts that succeeded, with the counts behind it. */
+.overview-ratio {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-px);
+}
+
+.overview-ratio-count {
+  font-size: var(--text-2xs);
+  color: var(--text-3);
+}
+
+/* ---- Traffic, top lists, activity ----------------------------------------- */
+
+.overview-cols {
+  display: grid;
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr);
+  grid-template-rows: auto 1fr;
+  grid-template-areas:
+    "traffic activity"
+    "tops activity";
+  align-items: start;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.overview-traffic {
+  grid-area: traffic;
+}
+
+.overview-tops {
+  grid-area: tops;
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.overview-activity {
+  grid-area: activity;
+}
+
+/* ---- Activity feed -------------------------------------------------------- */
+
+.overview-feed {
+  display: flex;
+  flex-direction: column;
+}
+
+.overview-feed li + li {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.overview-feed-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto;
+  align-items: center;
+  gap: var(--space-3);
+  min-height: 52px;
+  padding: var(--space-2) var(--panel-pad);
+  color: inherit;
+  text-decoration: none;
+  transition: background-color var(--dur-fast) ease;
+}
+
+@media (hover: hover) {
+  .overview-feed-row:hover {
+    background: var(--bg-hover);
+    color: inherit;
+  }
+}
+
+.overview-feed-row:focus-visible {
+  outline-offset: -2px;
+}
+
+/* A request that just arrived flashes once, like a fresh table row. */
+.overview-feed-row[data-fresh] {
+  animation: overview-fresh 1200ms ease-out 1;
+}
+
+@keyframes overview-fresh {
+  from {
+    background: var(--wash-accent);
+  }
+  to {
+    background: transparent;
+  }
+}
+
+.overview-feed-lamp {
+  display: grid;
+  place-items: center;
+  width: var(--space-3);
+}
+
+.overview-feed-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+  min-width: 0;
+}
+
+.overview-feed-model {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-sm);
+  color: var(--text);
+}
+
+/* Provider (or endpoint), a dot, the client key. Each name gets the width it
+   needs; when the row is too narrow the space is shared out equally first,
+   so a short name is shown whole and only the long one is cut. */
+.overview-feed-meta {
+  display: grid;
+  grid-template-columns: minmax(0, max-content) auto minmax(0, max-content);
+  justify-content: start;
+  align-items: baseline;
+  gap: var(--space-1h);
+  min-width: 0;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+.overview-feed-detail .overview-feed-sep {
+  flex: none;
+}
+
+/* Requests in flight that the list cannot show, and a first page that did
+   not load: one quiet line above the rows. */
+.overview-feed-note {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-3);
+  margin: 0;
+  padding: var(--space-2) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+  font-size: var(--text-sm);
+  color: var(--text-2);
+}
+
+.overview-feed-note-text {
+  color: var(--text-3);
+}
+
+.overview-feed-side {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-0h);
+  flex: none;
+  font-size: var(--text-sm);
+}
+
+.overview-feed-result {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+/* Durations line up down the list. */
+.overview-feed-result .num {
+  min-width: 6ch;
+  text-align: right;
+}
+
+.overview-feed-detail {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-1h);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.overview-feed-skel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  justify-content: center;
+  min-height: 52px;
+  padding: var(--space-2) var(--panel-pad);
+}
+
+.overview-feed-skel + .overview-feed-skel {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+/* ---- Narrower pages ------------------------------------------------------- */
+
+@container overview (max-width: 980px) {
+  .overview-cols {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: none;
+    grid-template-areas:
+      "traffic"
+      "activity"
+      "tops";
+  }
+}
+
+@container overview (max-width: 900px) {
+  .overview-provider {
+    max-width: 18ch;
+  }
+}
+
+@container overview (max-width: 860px) {
+  .stat-group.overview-vitals {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .overview-step {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  .overview-step-action {
+    justify-content: flex-start;
+  }
+}
+
+@container overview (max-width: 560px) {
+  .overview-tops {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  /* Version and uptime share a row, the address gets one to itself (it is
+     read whole), the three counts share the last. */
+  .overview-fact {
+    flex-basis: 34%;
+  }
+
+  .overview-fact[data-wide] {
+    flex-basis: 100%;
+  }
+
+  .overview-fact[data-count] {
+    flex-basis: 30%;
+    min-width: 88px;
+  }
+
+  /* Two vitals across leave no room for a trend beside the number: it moves
+     below it. */
+  .overview-vitals .stat-main {
+    flex-wrap: wrap;
+    align-items: flex-start;
+    gap: var(--space-1);
+  }
+
+  .overview-vitals .stat-trend {
+    flex: 1 0 100%;
+    padding-bottom: 0;
+  }
+}
+
+/* Phones: table rows are cards (see components.css), values sit on the right. */
+@media (max-width: 720px) {
+  .overview-provider {
+    max-width: 100%;
+  }
+
+  .overview-cred {
+    align-items: flex-end;
+    padding: 0;
+    text-align: right;
+  }
+
+  .overview-lamps {
+    justify-content: flex-end;
+  }
+
+  .overview-cred-list li {
+    justify-content: flex-end;
+  }
+}
+
+/* A window of tablet width with the sidebar open leaves a page as narrow as a
+   phone's, but the Table only becomes cards by the width of the window. The
+   board would scroll sideways there, so it takes the card layout by the width
+   of the page instead. The rules mirror the phone block of the Table in
+   components.css; they can go when the Table itself follows its container. */
+@media (min-width: 721px) {
+  @container overview (max-width: 700px) {
+    .overview-board .table-wrap {
+      overflow-x: visible;
+    }
+
+    .overview-board .table-sortbar {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      padding: var(--space-2) var(--panel-pad);
+      border-bottom: var(--hairline) solid var(--rule);
+    }
+
+    .overview-board .table,
+    .overview-board .table tbody {
+      display: block;
+    }
+
+    .overview-board .table thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+    }
+
+    .overview-board .table tbody tr {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr);
+      gap: var(--space-1);
+      padding: var(--space-3) var(--panel-pad);
+      border-bottom: var(--hairline) solid var(--rule);
+    }
+
+    .overview-board .table tbody tr:last-child {
+      border-bottom: 0;
+    }
+
+    .overview-board .table td {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: var(--space-4);
+      height: auto;
+      min-height: 22px;
+      padding: 0;
+      border: 0;
+      text-align: right;
+    }
+
+    .overview-board .table td::before {
+      content: attr(data-label);
+      flex: none;
+      font-family: var(--font-sans);
+      font-size: var(--text-xs);
+      color: var(--text-3);
+      text-align: left;
+    }
+
+    .overview-board .table td[data-primary] {
+      order: -1;
+      justify-content: flex-start;
+      margin-bottom: var(--space-1);
+      font-size: var(--text-md);
+      font-weight: var(--weight-semibold);
+      text-align: left;
+    }
+
+    .overview-board .table td[data-primary]::before,
+    .overview-board .table td[data-label=""]::before {
+      content: none;
+    }
+
+    .overview-board .table td.table-state-cell {
+      display: block;
+      text-align: left;
+    }
+
+    .overview-provider {
+      max-width: 100%;
+    }
+
+    .overview-cred {
+      align-items: flex-end;
+      padding: 0;
+      text-align: right;
+    }
+
+    .overview-lamps {
+      justify-content: flex-end;
+    }
+
+    .overview-cred-list li {
+      justify-content: flex-end;
+    }
+  }
+}

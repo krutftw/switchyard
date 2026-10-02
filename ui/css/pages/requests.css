@@ -1,0 +1,751 @@
+/* Requests page: filter bar, the request table, the detail drawer. */
+
+/* ======================================================================== */
+/* Filter bar                                                               */
+/* ======================================================================== */
+
+.req-filters {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+}
+
+.req-filters-search {
+  display: flex;
+  align-items: flex-end;
+  gap: var(--space-2);
+  flex: 1 1 260px;
+  min-width: 0;
+}
+
+.req-search {
+  flex: 1 1 0;
+}
+
+/* The field has its own clear button, in the same place in every browser. */
+.req-search input::-webkit-search-cancel-button {
+  display: none;
+}
+
+.req-filters-selects {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.req-filters-selects > .field {
+  flex: 1 1 148px;
+  width: 168px;
+  max-width: 220px;
+}
+
+.req-filters-clear {
+  flex: none;
+}
+
+@media (max-width: 720px) {
+  .req-filters-selects {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    flex: 1 1 100%;
+  }
+
+  .req-filters-selects > .field {
+    width: auto;
+    max-width: none;
+  }
+
+  .req-filters-clear {
+    grid-column: 1 / -1;
+    justify-self: start;
+  }
+}
+
+/* ======================================================================== */
+/* Panel head                                                               */
+/* ======================================================================== */
+
+.req-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-4);
+}
+
+.req-meta .status {
+  color: var(--text-2);
+  font-size: inherit;
+}
+
+.req-live {
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.req-live .choice-label {
+  font-size: var(--text-sm);
+}
+
+@media (max-width: 720px) {
+  .req-meta .status-detail {
+    display: none;
+  }
+}
+
+/* ======================================================================== */
+/* "N new requests"                                                         */
+/* ======================================================================== */
+
+/* A zero-height sticky row: the button hangs from it, over the table, and
+   follows the reader down the list without moving a single row. */
+.req-top {
+  height: 0;
+  scroll-margin-top: calc(var(--topbar-h) + var(--space-14) + var(--space-10));
+}
+
+.req-new {
+  --req-head-h: var(--row-h-dense);
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: calc(var(--z-sticky) + 1);
+  display: flex;
+  justify-content: center;
+  height: 0;
+  pointer-events: none;
+}
+
+.req-new-button {
+  margin-top: calc(var(--req-head-h) + var(--space-2));
+  border-radius: var(--radius-full);
+  padding: 0 var(--space-3);
+  box-shadow: var(--shadow-2);
+  pointer-events: auto;
+  opacity: 0;
+  transform: translateY(calc(-6px * var(--motion)));
+  transition:
+    opacity var(--dur-exit) ease,
+    transform var(--dur-exit) ease,
+    background-color var(--dur-fast) ease;
+}
+
+.req-new-button[data-state="open"] {
+  opacity: 1;
+  transform: none;
+  transition:
+    opacity var(--dur-base) var(--ease-out),
+    transform var(--dur-base) var(--ease-out),
+    background-color var(--dur-fast) ease;
+}
+
+/* ======================================================================== */
+/* Table                                                                    */
+/* ======================================================================== */
+
+/* The page measures the panel and says how the list is drawn:
+ *
+ *   data-layout="rows"   a row per request, on one grid of columns
+ *     data-fit="full"      every column
+ *     data-fit="tight"     without Client key (6)
+ *   data-layout="cards"  too narrow for columns: each request is a card
+ *     data-fit="cards"     three lines
+ *     data-fit="slim"      four lines (phones)
+ *
+ * Both layouts show every field of a request except that the tight rows
+ * leave the client key to the drawer. It is the panel's width that decides,
+ * not the window's, because the sidebar may be open or folded. A container
+ * query would say the same in CSS alone, but on a list this long it made
+ * every layout pass several times slower.
+ */
+
+.req-panel {
+  /* One line of a cell, and a row of two of them. */
+  --req-line: calc(var(--space-4) + var(--space-0h));
+  --req-row-h: calc(var(--row-h) + var(--space-2));
+  /* Time, Status, Model, Protocol, Provider, Client key, Duration and TTFB,
+     Tokens and cost. The fixed tracks hold their longest content (the clock
+     time, a lamp over "2 attempts", the column headings).
+     Protocol goes from the width of "anthropic -> openai-chat" in a panel
+     about 1000px wide to that of the longest pair, "openai-responses ->
+     openai-chat", from about 1140px. Model, Provider and Client key share
+     what is left; Client key never gets less than its heading needs.
+     No track depends on its content, so every row has the same columns
+     although each row is a grid of its own. */
+  --req-col-protocol: clamp(194px, calc(43% - 245px), 244px);
+  --req-cols: 88px 96px minmax(0, 1.4fr) var(--req-col-protocol) minmax(0, 1fr) minmax(96px, 0.6fr) 122px 118px;
+}
+
+.req-panel[data-fit="tight"] {
+  --req-cols: 88px 96px minmax(0, 1.4fr) var(--req-col-protocol) minmax(0, 1fr) 122px 118px;
+}
+
+/* ---- Cell content -------------------------------------------------------- */
+
+.req-two {
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+  gap: var(--space-0h);
+  min-width: 0;
+  max-width: 100%;
+}
+
+.req-l1,
+.req-l2 {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1h);
+  min-width: 0;
+  max-width: 100%;
+  height: var(--req-line);
+  white-space: nowrap;
+}
+
+.req-l2 {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+.req-l2 .badge {
+  height: var(--req-line);
+}
+
+/* Anything that may be long is cut with an ellipsis; the tooltip and the
+   drawer have it in full. */
+.req-clip {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.req-time {
+  color: var(--text-2);
+}
+
+.req-table .status {
+  font-size: inherit;
+}
+
+.req-attempts,
+.req-arrow,
+.req-how .badge,
+.req-route .badge,
+.req-protocol-client,
+.req-transport,
+.req-unit {
+  flex: none;
+}
+
+.req-arrow {
+  color: var(--text-3);
+}
+
+/* "anthropic -> openai-chat": the client's protocol is never cut; the
+   upstream one gives way when the column is at its narrowest. */
+.req-protocols,
+.req-route {
+  display: flex;
+  align-items: center;
+  gap: var(--space-1h);
+  min-width: 0;
+}
+
+.req-protocols {
+  flex: 0 1 auto;
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.req-nums {
+  align-items: flex-end;
+}
+
+.req-slash {
+  color: var(--text-3);
+}
+
+/* Words inside a numeric cell. */
+.req-word,
+.req-unit {
+  font-family: var(--font-sans);
+}
+
+/* Labels the column headings make unnecessary; the cards show them. */
+.req-unit {
+  display: none;
+  color: var(--text-3);
+}
+
+.req-tip {
+  max-width: min(380px, calc(100vw - var(--space-4)));
+  white-space: pre-line;
+  overflow-wrap: anywhere;
+  font-variant-numeric: tabular-nums;
+}
+
+.req-foot {
+  border-top: var(--hairline) solid var(--rule);
+}
+
+.req-foot-error {
+  padding: var(--space-3) var(--panel-pad) 0;
+  color: var(--stop-ink);
+  font-size: var(--text-sm);
+  text-align: center;
+}
+
+.req-foot-note {
+  max-width: 72ch;
+  margin: 0 auto;
+  padding: 0 var(--panel-pad) var(--space-4);
+  color: var(--text-3);
+  font-size: var(--text-xs);
+  text-align: center;
+  text-wrap: balance;
+}
+
+.req-table .table,
+.req-table .table thead,
+.req-table .table tbody {
+  display: block;
+}
+
+/* Nothing scrolls sideways, so the column headers can stay in view under
+   the top bar while the page scrolls. */
+.req-table.table-wrap {
+  overflow: visible;
+}
+
+.req-table .table[data-sticky] th {
+  position: static;
+}
+
+/* ---- Rows ---------------------------------------------------------------
+ *
+ * Every row is a grid with the same tracks instead of a table row (the
+ * elements keep their table roles). Two reasons:
+ *   - a long model name never pushes the numbers off screen: it is cut
+ *     with an ellipsis inside its own track;
+ *   - a grid row can take content-visibility, a table row cannot. Rows far
+ *     from the screen are then skipped by layout and paint, so a list of a
+ *     thousand requests costs about what the visible ones do.
+ */
+.req-panel[data-layout="rows"] .table tr {
+  display: grid;
+  grid-template-columns: var(--req-cols);
+}
+
+/* Request rows only: the loading, empty and error rows are always drawn. */
+.req-panel[data-layout="rows"] .table tbody tr[data-clickable] {
+  content-visibility: auto;
+  contain-intrinsic-size: auto var(--req-row-h);
+}
+
+.req-panel[data-layout="rows"] .table th,
+.req-panel[data-layout="rows"] .table td {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  overflow: hidden;
+  white-space: nowrap;
+}
+
+.req-panel[data-layout="rows"] .table td {
+  height: var(--req-row-h);
+  padding-top: 0;
+  padding-bottom: 0;
+}
+
+/* The last row has no rule under it; this keeps its text where the other
+   rows have theirs. */
+.req-panel[data-layout="rows"] .table tbody tr:last-child td {
+  padding-bottom: var(--hairline);
+}
+
+.req-panel[data-layout="rows"] .table [data-align="right"] {
+  justify-content: flex-end;
+}
+
+/* A cell with one line keeps it level with the first line of the others. */
+.req-panel[data-layout="rows"] .req-two {
+  min-height: calc(var(--req-line) * 2 + var(--space-0h));
+}
+
+/* The loading, empty and error states span the row. */
+.req-panel[data-layout="rows"] .table td.table-state-cell {
+  display: block;
+  grid-column: 1 / -1;
+  height: auto;
+  overflow: visible;
+  white-space: normal;
+}
+
+.req-panel[data-fit="tight"] .table th:nth-child(6),
+.req-panel[data-fit="tight"] .table td:not(.table-state-cell):nth-child(6) {
+  display: none;
+}
+
+/* The header row sticks as one piece: a cell cannot stick further than its
+   own row once rows are grids. */
+.req-panel[data-layout="rows"] .table thead {
+  position: sticky;
+  top: var(--topbar-h);
+  z-index: var(--z-sticky);
+}
+
+/* ---- Cards ----------------------------------------------------------------
+ *
+ * The same cells, placed on a small grid per request and with their two
+ * lines side by side:
+ *
+ *   model -> upstream model                                     12s ago
+ *   200 [2 attempts]  provider credential                    client key
+ *   client -> upstream [Mode] sse     1.2s first byte 300ms   in / out $
+ *
+ * and on a phone, four lines, without the time to first byte:
+ *
+ *   model -> upstream model               12s ago
+ *   200 [2 attempts]  provider credential    1.2s
+ *   client -> upstream [Mode] sse
+ *   client key                         in / out $
+ */
+.req-panel[data-layout="cards"] .req-new {
+  --req-head-h: 0px;
+}
+
+.req-panel[data-layout="cards"] .table thead {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.req-panel[data-layout="cards"] .table tbody tr {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) auto auto;
+  grid-template-areas:
+    "model  model    model    time"
+    "status provider provider key"
+    "how    how      duration tokens";
+  align-items: center;
+  gap: var(--space-0h) var(--space-3);
+  padding: var(--space-3) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.req-panel[data-layout="cards"] .table tbody tr:last-child {
+  border-bottom: 0;
+}
+
+/* Cards far from the screen are not laid out until they come near; until
+   then their content is taken to be as tall as its lines and the gaps
+   between them. */
+.req-panel[data-layout="cards"] .table tbody tr[data-clickable] {
+  content-visibility: auto;
+  contain-intrinsic-size: auto calc(var(--req-line) * 3 + var(--space-0h) * 2);
+}
+
+.req-panel[data-fit="slim"] .table tbody tr[data-clickable] {
+  contain-intrinsic-size: auto calc(var(--req-line) * 4 + var(--space-0h) * 3);
+}
+
+.req-panel[data-layout="cards"] .table td {
+  display: block;
+  height: auto;
+  min-height: 0;
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  font-size: var(--text-sm);
+  text-align: left;
+}
+
+.req-panel[data-layout="cards"] .table td::before {
+  content: none;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(1) {
+  grid-area: time;
+  justify-self: end;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(2) {
+  grid-area: status;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(3) {
+  grid-area: model;
+  font-weight: var(--weight-semibold);
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(4) {
+  grid-area: how;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(5) {
+  grid-area: provider;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(6) {
+  grid-area: key;
+  justify-self: end;
+  max-width: calc(var(--space-10) * 4);
+  color: var(--text-2);
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(7) {
+  grid-area: duration;
+}
+
+.req-panel[data-layout="cards"] .table td:not(.table-state-cell):nth-child(8) {
+  grid-area: tokens;
+  justify-self: end;
+}
+
+/* The two lines of a cell run on as one. */
+.req-panel[data-layout="cards"] .req-two {
+  flex-direction: row;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.req-panel[data-layout="cards"] .req-l1,
+.req-panel[data-layout="cards"] .req-l2 {
+  flex: 0 1 auto;
+}
+
+.req-panel[data-layout="cards"] .req-model .req-l2 {
+  font-weight: var(--weight-regular);
+}
+
+.req-panel[data-layout="cards"] .req-unit {
+  display: inline;
+}
+
+/* When a line is short of room, the credential gives way before the
+   provider's name, and the upstream protocol before the mode and transport. */
+.req-panel[data-layout="cards"] .req-provider .req-l1,
+.req-panel[data-layout="cards"] .req-model .req-l1 {
+  flex-shrink: 0;
+}
+
+.req-panel[data-layout="cards"] .req-provider .req-l2,
+.req-panel[data-layout="cards"] .req-model .req-l2 {
+  overflow: hidden;
+}
+
+.req-panel[data-layout="cards"] .req-how .req-l2 {
+  flex: none;
+}
+
+/* What the card can do without: the clock time (the drawer has it), a time
+   to first byte that does not exist, and cells with nothing to say. */
+.req-panel[data-layout="cards"] .req-clock,
+.req-panel[data-layout="cards"] .req-absent,
+.req-panel[data-layout="cards"] .table td:has(> .req-none) {
+  display: none;
+}
+
+/* Without tokens beside it, the duration ends the last line. */
+.req-panel[data-layout="cards"] .table tr:has(> td:nth-child(8) > .req-none) td:not(.table-state-cell):nth-child(7) {
+  grid-column: 3 / -1;
+  justify-self: end;
+}
+
+.req-panel[data-layout="cards"] .table td.table-state-cell {
+  grid-column: 1 / -1;
+}
+
+/* On a phone the lines are a wrapping row instead: the last line pairs the
+   client key with the tokens, and a grid would make room for the tokens in
+   every line above it. Model and time fill the first line; the provider
+   and the client key start from nothing and take what their line has left;
+   the protocols have a line to themselves. */
+.req-panel[data-fit="slim"] .table tbody tr {
+  display: flex;
+  flex-wrap: wrap;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell) {
+  flex: none;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(3) {
+  order: 1;
+  flex: 1 1 calc(100% - var(--space-10) * 2);
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(1) {
+  order: 2;
+  margin-left: auto;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(2) {
+  order: 3;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(5) {
+  order: 4;
+  flex: 1 1 0;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(7) {
+  order: 5;
+  margin-left: auto;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(4) {
+  order: 6;
+  flex: 1 1 100%;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(6) {
+  order: 7;
+  flex: 1 1 0;
+  max-width: none;
+}
+
+.req-panel[data-fit="slim"] .table td:not(.table-state-cell):nth-child(8) {
+  order: 8;
+  margin-left: auto;
+}
+
+.req-panel[data-fit="slim"] .table td.table-state-cell {
+  flex: 1 1 100%;
+}
+
+/* The time to first byte is left to the drawer. */
+.req-panel[data-fit="slim"] .table td:nth-child(7) .req-l2 {
+  display: none;
+}
+
+/* ======================================================================== */
+/* Detail drawer                                                            */
+/* ======================================================================== */
+
+.req-detail {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.req-hero {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-2) var(--space-5);
+}
+
+.req-hero-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.req-hero-code {
+  font-size: var(--text-2xl);
+  font-weight: var(--weight-semibold);
+  line-height: var(--leading-tight);
+}
+
+.req-hero-words {
+  font-size: var(--text-lg);
+  color: var(--text-2);
+}
+
+.req-hero-timing {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+}
+
+.req-hero-duration {
+  font-size: var(--text-xl);
+}
+
+.req-error-message {
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.req-error-next {
+  margin-top: var(--space-1);
+}
+
+.req-section {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.req-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: var(--space-3);
+}
+
+.req-section-aside,
+.req-quiet {
+  font-size: var(--text-sm);
+}
+
+.req-attempt {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-0h);
+}
+
+.req-attempt-error {
+  color: var(--stop-ink);
+}
+
+/* Six readouts on one plate, divided by hairlines. */
+.req-usage {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: var(--hairline);
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-md);
+  background: var(--rule);
+  overflow: hidden;
+}
+
+.req-usage-cell {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  min-width: 0;
+  padding: var(--space-3);
+  background: var(--bg-raised);
+}
+
+.req-usage-cell dd {
+  font-size: var(--text-lg);
+  line-height: var(--leading-tight);
+}
+
+.req-usage-note {
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+.req-drawer .kv dd a {
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 520px) {
+  .req-usage {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

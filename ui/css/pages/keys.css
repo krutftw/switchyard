@@ -1,0 +1,464 @@
+/* API keys page (#/keys). Classes are prefixed keys-. Tokens only. */
+
+/* ---- Toolbar above the table --------------------------------------------- */
+
+.keys-toolbar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  padding: var(--space-3) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.keys-search {
+  flex: 1 1 16rem;
+  max-width: 24rem;
+}
+
+.keys-count {
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.keys-range {
+  margin-left: auto;
+  font-size: var(--text-xs);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* Shown while the list is sorted by a column the window has no room for. */
+.keys-sortnote {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-size: var(--text-sm);
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+/* The box the column sets are fitted to (keys.js, useColumnFit). */
+.keys-list {
+  min-width: 0;
+}
+
+/* ---- Table cells ---------------------------------------------------------- */
+
+.keys-name {
+  display: grid;
+  gap: var(--space-0h);
+  /* A floor: the table's automatic layout would otherwise squeeze the one
+     column that can truncate down to its ellipsis. */
+  min-width: 10rem;
+  max-width: clamp(11rem, 24vw, 24rem);
+  padding: var(--space-1) 0;
+}
+
+.keys-name-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: var(--weight-medium);
+  color: var(--text);
+}
+
+/* A switched-off key steps back; the Status column says why. */
+.keys-name-text[data-off] {
+  color: var(--text-3);
+}
+
+.keys-name-sub {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.keys-masked {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  font-variant-ligatures: none;
+  color: var(--text-3);
+}
+
+.keys-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  white-space: nowrap;
+}
+
+.keys-switch .switch {
+  margin-top: 0;
+}
+
+.keys-switch-text {
+  /* Wide enough for "Disabled", so the column does not move when toggled. */
+  min-width: 4.25rem;
+  color: var(--text-2);
+}
+
+.keys-plain {
+  font-family: var(--font-sans);
+}
+
+.keys-unit {
+  margin-left: var(--space-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+/* A rate limit of 0 lets nothing through. */
+.keys-caution {
+  color: var(--caution-ink);
+}
+
+/* Two figures in one cell: the second, smaller, under the first. Used when
+   the window has no room for a column each (failed under requests, tokens
+   under cost, the rate limit under the model patterns). */
+.keys-stack {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-end;
+  gap: var(--space-0h);
+  min-width: 0;
+  vertical-align: middle;
+}
+
+.keys-stack[data-align="start"] {
+  align-items: flex-start;
+}
+
+.keys-sub {
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* Failed requests are a status: the stop ink, and a figure next to it. */
+.keys-errors {
+  color: var(--stop-ink);
+}
+
+.keys-when {
+  color: var(--text-2);
+  white-space: nowrap;
+}
+
+.keys-pattern {
+  display: inline-block;
+  /* With the widest column set this keeps the table inside a 1440px window. */
+  max-width: 10rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.keys-pattern-count {
+  white-space: nowrap;
+  text-decoration: underline dotted;
+  text-decoration-color: var(--rule-strong);
+  text-underline-offset: 0.22em;
+}
+
+.keys-tip {
+  display: grid;
+  gap: var(--space-1h);
+  padding: var(--space-0h) 0;
+}
+
+.keys-tip-list {
+  display: grid;
+  gap: var(--space-0h);
+  font-family: var(--font-mono);
+  font-variant-ligatures: none;
+  overflow-wrap: anywhere;
+}
+
+.keys-tip-foot {
+  padding-top: var(--space-1h);
+  border-top: var(--hairline) solid var(--rule-strong);
+  color: var(--text-2);
+}
+
+/* The row menu sits flush with the panel's edge. */
+.keys-table td:last-child .btn {
+  margin: calc(var(--space-1) * -1) calc(var(--space-2) * -1) calc(var(--space-1) * -1) 0;
+}
+
+/* ---- Allow-list preview and other inline notes ---------------------------- */
+
+.keys-preview {
+  display: grid;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--rule);
+  border-radius: var(--radius-sm);
+  background: var(--wash-neutral);
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-2);
+}
+
+.keys-preview strong {
+  color: var(--text);
+  font-weight: var(--weight-semibold);
+}
+
+.keys-preview-line {
+  display: flex;
+  align-items: flex-start;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.keys-preview-line > .icon {
+  margin-top: var(--space-0h);
+  color: var(--text-3);
+}
+
+.keys-preview-line > span {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+
+.keys-preview[data-tone="caution"] {
+  border-color: color-mix(in srgb, var(--lamp-caution) 50%, transparent);
+  background: var(--wash-caution);
+  color: var(--text);
+}
+
+.keys-preview[data-tone="caution"] .keys-preview-line > .icon,
+.keys-preview-line[data-tone="caution"] > .icon {
+  color: var(--caution-ink);
+}
+
+.keys-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  max-height: 8.5rem;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.keys-chip {
+  max-width: 100%;
+  padding: var(--space-0h) var(--space-1h);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  border-radius: var(--radius-xs);
+  background: var(--bg-active);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-ligatures: none;
+}
+
+.keys-chip-more {
+  padding: var(--space-0h) var(--space-1h);
+  border-radius: var(--radius-xs);
+  color: var(--accent-ink);
+  font-size: var(--text-xs);
+  font-weight: var(--weight-medium);
+}
+
+@media (hover: hover) {
+  .keys-chip-more:hover {
+    background: var(--bg-hover);
+  }
+}
+
+/* ---- A key shown in full --------------------------------------------------- */
+
+.keys-secret {
+  display: block;
+  flex: 1 1 14rem;
+  min-width: 0;
+  padding: var(--space-2) var(--space-3);
+  border: var(--hairline) solid var(--control-border);
+  border-radius: var(--radius-sm);
+  background: var(--bg-field);
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-variant-ligatures: none;
+  line-height: var(--leading-snug);
+  /* A key has no words: break it wherever the line ends, not at its hyphen. */
+  word-break: break-all;
+  cursor: text;
+}
+
+/* In the drawer the key gets the full width; Reveal and Copy sit under it. */
+.keys-reveal .keys-secret {
+  flex-basis: 100%;
+}
+
+.keys-created,
+.keys-reveal {
+  display: flex;
+  align-items: stretch;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+}
+
+.keys-created .btn,
+.keys-reveal .btn {
+  flex: none;
+}
+
+/* ---- Examples ---------------------------------------------------------------- */
+
+.keys-examples {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.keys-examples-bar {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap-reverse;
+  gap: var(--space-2) var(--space-4);
+  min-width: 0;
+}
+
+.keys-examples-bar .tabs {
+  flex: 1 1 16rem;
+  min-width: 0;
+}
+
+/* ---- Drawer --------------------------------------------------------------- */
+
+.keys-drawer {
+  display: grid;
+  gap: var(--space-5);
+  min-width: 0;
+}
+
+.keys-section {
+  display: grid;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Grid and flex items are as wide as their widest word unless told
+   otherwise: one long model pattern would push the whole form past the
+   drawer's edge instead of being cut short in its tag. */
+.keys-drawer > *,
+.keys-section > *,
+.keys-field-wrap {
+  min-width: 0;
+}
+
+.keys-section-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+.keys-section-head a {
+  font-size: var(--text-sm);
+  white-space: nowrap;
+}
+
+/* Delete sits apart from Save, at the start of the footer. */
+.keys-drawer-layer .overlay-foot .keys-foot-start {
+  margin-right: auto;
+}
+
+/* ---- Narrow windows ---------------------------------------------------------- */
+
+/* Column sets for less room (data-tier is set by keys.js from what fits).
+   The switch's position already says on or off: its caption gives way, the
+   pattern is cut shorter, and in the last set the name is too. */
+.keys-list[data-tier="narrow"] .keys-pattern {
+  max-width: 8rem;
+}
+
+.keys-list[data-tier="narrow"] .keys-name {
+  min-width: 8.5rem;
+}
+
+.keys-list[data-tier="narrow"] .keys-switch-text,
+.keys-list[data-tier="tight"] .keys-switch-text {
+  display: none;
+}
+
+.keys-list[data-tier="tight"] .keys-name {
+  min-width: 5rem;
+}
+
+/* ---- Phones ---------------------------------------------------------------- */
+
+@media (max-width: 720px) {
+  .keys-search {
+    flex-basis: 100%;
+    max-width: none;
+  }
+
+  .keys-range {
+    margin-left: 0;
+  }
+
+  /* The card title is the name with the masked key under it; both may wrap. */
+  .keys-name {
+    min-width: 0;
+    max-width: none;
+    padding: 0;
+  }
+
+  .keys-name-text {
+    white-space: normal;
+    overflow-wrap: anywhere;
+  }
+
+  .keys-masked {
+    font-size: var(--text-xs);
+  }
+
+  .keys-table td {
+    align-items: center;
+  }
+
+  .keys-switch {
+    flex-direction: row-reverse;
+  }
+
+  /* The key takes the row; its button goes under it. */
+  .keys-created .keys-secret {
+    flex-basis: 100%;
+  }
+
+  .keys-switch-text {
+    min-width: 0;
+  }
+
+  /* In a card the two figures share the value's line. */
+  .keys-stack {
+    flex-direction: row;
+    align-items: baseline;
+    gap: var(--space-2);
+  }
+
+  .keys-list .keys-pattern {
+    max-width: 12rem;
+  }
+
+  .keys-drawer-layer .overlay-foot .keys-foot-start {
+    margin-right: 0;
+  }
+}

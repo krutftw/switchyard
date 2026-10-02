@@ -1,0 +1,351 @@
+/* Usage page. */
+
+/* ---- Scope controls: range and group-by, above everything they scope ---- */
+
+.usage-controls {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2) var(--space-4);
+  min-width: 0;
+}
+
+.usage-control {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.usage-control-label {
+  font-size: var(--text-sm);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.usage-window {
+  margin-left: auto;
+  font-size: var(--text-sm);
+  color: var(--text-3);
+}
+
+/* On a desk the controls stay in reach while the page scrolls: the range
+   they set scopes everything below, down to the last table. Not on a narrow
+   or short window, where they wrap to three lines or take too much of it. */
+@media (min-width: 961px) and (min-height: 600px) {
+  .usage-controls {
+    position: sticky;
+    top: var(--topbar-h);
+    z-index: var(--z-sticky);
+    margin: calc(var(--space-2) * -1) calc(var(--content-pad) * -1);
+    padding: var(--space-2) var(--content-pad);
+    background: var(--bg-ground);
+    box-shadow: 0 var(--hairline) 0 var(--rule);
+  }
+}
+
+@media (max-width: 720px) {
+  .usage-window {
+    margin-left: 0;
+    flex-basis: 100%;
+  }
+}
+
+/* ---- Header: when the numbers were read ---------------------------------- */
+
+.usage-fresh {
+  font-size: var(--text-sm);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+.usage-fresh .num {
+  color: var(--text-2);
+}
+
+/* On a phone the line sits above the buttons, which then share one row. */
+@media (max-width: 720px) {
+  .usage-fresh {
+    flex-basis: 100%;
+  }
+}
+
+/* ---- Headline numbers ---------------------------------------------------- */
+
+/* Five readouts: one row where they fit, and pairs on a phone, where the
+   shared 200px minimum would stack them into one long column. */
+@media (max-width: 720px) {
+  .usage-stats {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+
+  .usage-stats > .stat {
+    padding: var(--space-3);
+  }
+
+  .usage-stats .stat-value {
+    font-size: var(--text-2xl);
+  }
+
+  .usage-stats > .stat:last-child:nth-child(odd) {
+    grid-column: 1 / -1;
+  }
+}
+
+/* The numbers of the previous range, while the new range loads. */
+.usage-fade {
+  min-width: 0;
+  transition: opacity var(--dur-fast) ease;
+}
+
+.usage-fade[data-stale] {
+  opacity: 0.55;
+  transition-duration: var(--dur-base);
+}
+
+/* ---- Charts -------------------------------------------------------------- */
+
+.usage-split {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: var(--space-4);
+  align-items: stretch;
+}
+
+@media (max-width: 1080px) {
+  .usage-split {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.usage-sub,
+.usage-bars {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+
+.usage-sub {
+  padding-top: var(--space-3);
+  border-top: var(--hairline) solid var(--rule);
+}
+
+/* The heading sits on the line of the chart's table toggle, which is one
+   small control high. */
+.usage-sub > .plate-label {
+  margin-bottom: calc((var(--space-2) + var(--control-h-sm)) * -1);
+  line-height: var(--control-h-sm);
+  pointer-events: none;
+}
+
+.usage-note {
+  font-size: var(--text-xs);
+  line-height: var(--leading-snug);
+  color: var(--text-3);
+}
+
+/* ---- Breakdown tables ---------------------------------------------------- */
+
+/* A table picks its layout from the width of this box (breakdown.js sets
+   data-tier): full, compact, cards. On a phone the shared Table turns into
+   cards by itself (data-tier="phone"). */
+.usage-table {
+  /* Where the column headings stop when the page scrolls under them. */
+  --usage-stick: var(--topbar-h);
+}
+
+/* Same condition as the sticky controls above: the headings stop below them
+   (their height is measured, they can wrap to two lines) and leave their
+   hairline visible. */
+@media (min-width: 961px) and (min-height: 600px) {
+  .usage-table {
+    --usage-stick: calc(var(--topbar-h) + var(--usage-controls-h, 0px) + var(--hairline));
+  }
+}
+
+/* The shared table scrolls sideways in its own box, which also makes that
+   box the thing its sticky headings stick to: in a list longer than the
+   screen they scroll away with the page. Here the layouts are chosen so the
+   table always fits, so the box only clips (the panel's round corners) and
+   the headings stick to the page instead. */
+.usage-table[data-tier="full"] > .table-wrap,
+.usage-table[data-tier="compact"] > .table-wrap {
+  overflow: clip;
+}
+
+.usage-table[data-tier="full"] .table[data-sticky] th,
+.usage-table[data-tier="compact"] .table[data-sticky] th {
+  top: var(--usage-stick);
+}
+
+.usage-name {
+  display: inline-flex;
+  align-items: baseline;
+  gap: var(--space-2);
+  min-width: 0;
+  max-width: 100%;
+  text-align: left;
+}
+
+/* The name, then what a stand-in name means ("no model resolved"), which
+   moves to a line of its own when the two do not fit side by side. */
+.usage-name-body {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 0 var(--space-2);
+  min-width: 0;
+}
+
+/* A long identifier wraps instead of being cut: its end is often the part
+   that tells two models apart, and a touch screen has no tooltip to ask.
+   It may break anywhere, but only once it has run out of line: the cell
+   keeps a width that fits an ordinary name whole. */
+.usage-name-text {
+  min-width: 0;
+  max-width: 44ch;
+  overflow-wrap: anywhere;
+}
+
+.usage-table[data-tier="full"] .usage-name,
+.usage-table[data-tier="compact"] .usage-name {
+  min-width: 20ch;
+}
+
+.usage-table[data-tier="compact"] .usage-name-text {
+  max-width: 100%;
+}
+
+.usage-name-note {
+  flex: none;
+  font-size: var(--text-xs);
+  font-weight: var(--weight-regular);
+  color: var(--text-3);
+  white-space: nowrap;
+}
+
+/* Every share bar is the same length, whatever its percentage reads. */
+.usage-share .meter-value {
+  min-width: 5ch;
+  text-align: right;
+}
+
+.usage-filter {
+  width: min(220px, 42vw);
+}
+
+/* Compact layout: two numbers share a cell. The second one has a fixed
+   width, so both line up down the column. */
+.usage-pair {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: flex-end;
+  gap: var(--space-2);
+}
+
+.usage-pair-rate {
+  min-width: 5ch;
+  color: var(--text-3);
+}
+
+.usage-pair-sep {
+  color: var(--text-3);
+}
+
+.usage-pair-out {
+  min-width: 5ch;
+}
+
+/* Cards layout: the row becomes a card with the name as its title and the
+   numbers as labelled readouts side by side. It is the shared Table's phone
+   layout, driven by the width of the box instead of the viewport (a tablet,
+   or a laptop with the sidebar open, is wider than a phone and still has no
+   room for eight columns). */
+.usage-table[data-tier="cards"] > .table-wrap {
+  overflow-x: visible;
+}
+
+.usage-table[data-tier="cards"] .table-sortbar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.usage-table[data-tier="cards"] .table-sortbar .input {
+  flex: 0 1 28ch;
+}
+
+.usage-table[data-tier="cards"] .table,
+.usage-table[data-tier="cards"] .table tbody {
+  display: block;
+}
+
+.usage-table[data-tier="cards"] .table thead {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip-path: inset(50%);
+}
+
+.usage-table[data-tier="cards"] .table tbody tr {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(12ch, 1fr));
+  gap: var(--space-2) var(--space-4);
+  padding: var(--space-3) var(--panel-pad);
+  border-bottom: var(--hairline) solid var(--rule);
+}
+
+.usage-table[data-tier="cards"] .table tbody tr:last-child {
+  border-bottom: 0;
+}
+
+.usage-table[data-tier="cards"] .table td {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-0h);
+  height: auto;
+  padding: 0;
+  border: 0;
+  text-align: left;
+}
+
+.usage-table[data-tier="cards"] .table td::before {
+  content: attr(data-label);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  color: var(--text-3);
+}
+
+.usage-table[data-tier="cards"] .table td[data-primary] {
+  grid-column: 1 / -1;
+  font-size: var(--text-md);
+  font-weight: var(--weight-semibold);
+}
+
+.usage-table[data-tier="cards"] .table td[data-primary]::before,
+.usage-table[data-tier="cards"] .table td[data-label=""]::before {
+  content: none;
+}
+
+.usage-table[data-tier="cards"] .table td.table-state-cell {
+  display: block;
+  grid-column: 1 / -1;
+}
+
+.usage-table[data-tier="cards"] .usage-name-text,
+.usage-table[data-tier="phone"] .usage-name-text {
+  max-width: 100%;
+}
+
+.usage-table[data-tier="cards"] .usage-share {
+  align-self: stretch;
+}
+
+.usage-table[data-tier="phone"] .usage-share {
+  flex: 0 1 168px;
+}
