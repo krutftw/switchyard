@@ -84,7 +84,8 @@ a secret. Nothing is published while the bus has no subscriber.
 The gateway reacts to `ConfigStore::subscribe()`: whatever the store applies —
 a file change or an admin edit — rebuilds the scheduler (credential state is
 kept), the client-key table (rate-limit counts of unchanged keys are kept),
-reconfigures telemetry, drops cached service-account files, calls the
+reconfigures telemetry, drops cached service-account files, forgets which
+providers and models refused reasoning summaries (see Generation), calls the
 log-level hook, re-runs model discovery in the background and publishes
 `Event::ConfigReloaded { ok: true, .. }` on the telemetry bus.
 
@@ -207,6 +208,74 @@ Responses API's image-input codes (`failed_to_download_image`,
 upstream 400: no failover, nothing rests, and — when nothing had been sent
 yet — a 400 with the upstream's explanation.
 
+**A failed generation in a complete body.** Without streaming, the Responses
+API reports a generation that failed with HTTP `200` and a response object
+whose `status` is `"failed"`. Such a body is a failed attempt — in both
+modes, as `response.failed` at the head of a stream already is — classified
+by the `code` (or `type`) in its `error`: `rate_limit_exceeded` rests the
+model on the credential and fails over (the client is told 429 when nothing
+else works), `insufficient_quota` and every other code the transport treats
+as exhausted quota when it arrives as an HTTP error
+(`billing_hard_limit_reached`, `billing_not_active`, `usage_limit_reached`,
+`credit_balance_exhausted`, the spend-limit codes, …) rest the key as a 429
+— also at the head of a stream and inside one —, `server_error` and unknown
+codes fail over as a 502, and a fault of the request (`invalid_prompt`,
+`context_length_exceeded`, the image codes above, …) ends the request with a
+400 in the client's protocol, the vendor's code and message included,
+without resting anything. This holds **whatever the failed generation had
+produced** before it failed — a reasoning item, a hosted tool call, the first
+words of the answer: without streaming none of it has reached the client, so
+it is never delivered as an empty or truncated `200`, and the scheduler is
+never told the credential succeeded. A Responses client (passthrough) gets
+the error envelope with the failure's status too, not the upstream's `200`
+body. Only `"failed"` is a failure: an `incomplete` response is delivered as
+the answer it is. A body that carries nothing but an `error` without saying
+`failed` is treated the same way.
+
+**Reasoning summaries on Responses upstreams.** A request *translated* for a
+Responses upstream asks for `reasoning.summary` when the client wants
+reasoning text (a Chat Completions client by turning reasoning on, a Gemini
+client with `includeThoughts`, a Messages client with `thinking.display:
+"summarized"`). OpenAI refuses that field to organisations it has not verified
+(`400`, `param: "reasoning.summary"`, "Your organization must be verified to
+generate reasoning summaries"). The gateway then repeats the attempt once on
+the same credential without `reasoning.summary` /
+`reasoning.generate_summary` — streaming or not — and the client gets its
+answer (with the reasoning effort it asked for, without summary text). The
+repeat is not one of `routing.max_attempts`, the refusal is not reported to
+the scheduler, and the request record lists both calls (the first with
+status 400). The refusal is recognised as an HTTP `400`, inside a stream
+before its first event, and in a complete body that reports a failed
+generation (above). A `400` that names another parameter is never taken for
+it, whatever its message quotes from the request.
+
+What is remembered — until the next configuration change, so that later
+translated requests leave the field out from the start — depends on what the
+refusal is about:
+
+* the organisation is not verified (the message says so): the **provider**,
+  by name, for all its models. Only that provider: when the repeat fails for
+  another reason and the request fails over to a different provider, that one
+  is asked for the summary as usual;
+* any other `400` that names `param: "reasoning.summary"` ("'reasoning.summary'
+  is not supported with this model"), when what was refused is the plain
+  `"auto"`: that **upstream model** of the provider. Its other models are
+  still asked;
+* a refused detail level the client chose itself (`"concise"`, `"detailed"`
+  through a Chat client's `reasoning.summary`): **nothing**. The request is
+  healed like the others; the next one — any client, the same model — is
+  asked for a summary as usual.
+
+A refusal met by a request that started under an earlier configuration (in
+flight across the change, answered for the previous key) is not remembered
+either; that request itself is still healed.
+
+A Responses client's own field is never touched —
+neither in passthrough nor when its body is re-encoded because it carries
+another vendor's signature: it gets the upstream's 400 as it is. Translated
+counting requests (`count_tokens`) never carry the field: it has no bearing
+on the count.
+
 **Mock providers.** A mock model that fails on purpose is a failed attempt
 like a real one (record, failover, reply), but it is reported to the
 scheduler only when that rests no more than the failing model itself:
@@ -230,12 +299,18 @@ Captured bodies (`logging.request_log`) always describe one attempt, the
 last: what was sent, and what came back — the upstream's error body included.
 
 **What the client sees of the upstream.** Passthrough forwards the upstream's
-bytes, with two exceptions on streams: a Chat Completions client that did not
+bytes — a complete Responses body that reports a failed generation excepted
+(above) — with two exceptions on streams: a Chat Completions client that did not
 set `stream_options.include_usage` is not sent the usage-only chunk
 (`"choices": []`) that the gateway asks every Chat upstream for; and an
 upstream's description of a failure (an in-stream error event, in either
 mode) is delivered with the upstream credential replaced by `[redacted]`,
-should the upstream have quoted it. Content is never rewritten.
+should the upstream have quoted it. The same goes for a complete `200` body
+that is no response at all (an error envelope sent with the wrong status):
+passthrough hands it on with the credential replaced, and what a translated
+request is told about it ("the upstream response could not be understood:
+…", a 502) does not contain the credential either. Content is never
+rewritten.
 
 ### `FullReply { status, headers, content_type, body, request_id }`
 
@@ -383,12 +458,24 @@ rotation (and a failed one rests the model or the credential like a failed
 request would — except a mock model's scripted `401`, which rests nothing).
 Never fails as a Rust call.
 
+A `2xx` status alone does not pass the test: the answer is read (up to
+`server.body_limit_mb`) and has to be a response a request could be served
+with. A Responses body that reports a failed generation (`status: "failed"`,
+see Generation) fails the test with the class of its error code — a key that
+is out of quota or rate limited rests as it would after a request, and a
+rest a request started is not ended by a test that is answered the same way
+— and a body that is not a response of the provider's protocol (a web page
+behind a mistyped `base_url`, an error envelope sent with a `200`) fails it
+as a 502.
+
 ### `ProviderTest { ok, status, latency_ms, model, credential, error }`
 
 `Serialize`; the body of `POST /providers/{name}/test`. `status` is the
-upstream's HTTP status (`0`: no response). `error` is omitted when `None` and
-is addressed to the operator: it says what the upstream said (credentials
-removed).
+upstream's HTTP status (`0`: no response) — or, for a `2xx` whose body is not
+a usable response, the status that failure amounts to (429 for a failed
+generation that was rate limited, 400 for one that blames the request, 502
+otherwise). `error` is omitted when `None` and is addressed to the operator:
+it says what the upstream said (credentials removed).
 
 ### `Gateway::discover(&self, provider) -> Result<Vec<ModelInfo>, ApiError>` (async)
 

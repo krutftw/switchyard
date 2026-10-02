@@ -472,9 +472,13 @@ impl fmt::Debug for WsOpenRequest {
 /// of the admin API's provider test.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProviderTest {
-    /// Whether the upstream answered the test request successfully.
+    /// Whether the upstream answered the test request with a response a
+    /// request could be served with.
     pub ok: bool,
-    /// Upstream HTTP status; `0` when no response was received.
+    /// Upstream HTTP status; `0` when no response was received. For a
+    /// `2xx` whose body is not a usable response (a generation the upstream
+    /// reports as failed, a body that is no response), the status that
+    /// failure amounts to: `429`, `400` or `502`.
     pub status: u16,
     /// Time the call took.
     pub latency_ms: u64,

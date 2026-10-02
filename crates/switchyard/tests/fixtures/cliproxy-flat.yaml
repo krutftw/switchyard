@@ -1,0 +1,141 @@
+# A CLIProxyAPI configuration in the flat ("legacy") layout.
+# Test fixture: every key below is made up.
+
+host: ""
+port: 8317
+
+remote-management:
+  allow-remote: true
+  secret-key: "flat-management-secret"
+  disable-control-panel: false
+
+auth-dir: "~/.cli-proxy-api"
+
+api-keys:
+  - "sk-client-flat-0001"
+  - "sk-client-flat-0002"
+
+debug: true
+logging-to-file: true
+request-log: true
+usage-statistics-enabled: false
+
+proxy-url: "socks5://127.0.0.1:1080"
+request-retry: 3
+max-retry-interval: 30
+
+routing:
+  strategy: "fill-first"
+
+streaming:
+  keepalive-seconds: 20
+  bootstrap-retries: 1
+
+quota-exceeded:
+  switch-project: true
+  switch-preview-model: false
+
+gemini-api-key:
+  - api-key: "AIzaSyFLAT-gemini-key-000000000001"
+  - api-key: "AIzaSyFLAT-gemini-key-000000000002"
+    weight: 5
+  - api-key: "AIzaSyFLAT-gemini-key-000000000003"
+    base-url: "https://gemini.example.com/"
+    prefix: "/team/"
+    priority: 10
+    proxy-url: "direct"
+    request-retry: 2
+    headers:
+      X-Custom-Header: "custom-value"
+      X-Session: "$Session-Id"
+    models:
+      - name: "gemini-2.5-flash"
+        alias: "gemini-flash"
+        display-name: "Gemini Flash"
+        max-context-length: 1048576
+        is-compat: true
+        thinking:
+          levels: ["high", "medium", "low", "none", "auto"]
+    excluded-models:
+      - "gemini-2.5-pro"
+      - "*-preview"
+    request-scoped-errors:
+      - status: 400
+        match:
+          - "context_length_exceeded"
+        action: "stop"
+
+claude-api-key:
+  - api-key: "sk-ant-flat-000000000000000000001"
+    cloak:
+      mode: "always"
+
+codex-api-key:
+  - api-key: "sk-flat-codex-000000000000000001"
+    base-url: "https://api.openai.com/v1"
+    websockets: true
+  - api-key: "sk-flat-codex-nobase-00000000001"
+
+vertex-api-key:
+  - api-key: "vk-flat-vertex-0000000000000001"
+    base-url: "https://vertex.example.com/api"
+
+openai-compatibility:
+  - name: "OpenRouter"
+    base-url: "https://openrouter.ai/api/v1"
+    prefix: "or"
+    priority: 3
+    headers:
+      X-Title: "switchyard"
+    api-key-entries:
+      - api-key: "sk-or-flat-0000000000000000001"
+        weight: 5
+        proxy-url: "socks5://proxy.example.com:1080"
+      - api-key: "sk-or-flat-0000000000000000002"
+    models:
+      - name: "moonshotai/kimi-k2:free"
+        alias: "kimi-k2"
+      - name: "deepseek-v3.1"
+        alias: "big-pool"
+      - name: "glm-5"
+        alias: "big-pool"
+  - name: "My Local LLM"
+    base-url: "http://127.0.0.1:11434/v1"
+    disabled: true
+
+payload:
+  default:
+    - models:
+        - name: "gemini-*"
+          protocol: "gemini"
+      params:
+        "generationConfig.thinkingConfig.thinkingBudget": 32768
+    - models:
+        - name: "claude-*"
+          protocol: "claude"
+          match:
+            - "metadata.client": "codex"
+      params:
+        "thinking.budget_tokens": 1024
+  override-raw:
+    - models:
+        - name: "gpt-*"
+          protocol: "codex"
+        - name: "o3*"
+      params:
+        "reasoning": "{\"summary\":\"auto\"}"
+  filter:
+    - models:
+        - name: "*"
+      params:
+        - "metadata"
+        - "tools.#(name==\"apply_patch\")"
+
+plugins:
+  enabled: true
+  dir: "plugins"
+
+ampcode:
+  upstream-url: "https://ampcode.com"
+
+some-future-setting: 42

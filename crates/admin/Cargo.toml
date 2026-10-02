@@ -12,25 +12,35 @@ switchyard-core.workspace = true
 switchyard-gateway.workspace = true
 switchyard-scheduler.workspace = true
 switchyard-telemetry.workspace = true
+switchyard-config-store.workspace = true
 axum.workspace = true
-tower.workspace = true
-tower-http.workspace = true
 tokio.workspace = true
-tokio-stream.workspace = true
+tokio-util.workspace = true
 futures.workspace = true
 bytes.workspace = true
 http.workspace = true
+http-body-util.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-rust-embed.workspace = true
+# Names the field a rejected request body failed on (`routing.cooldown.auth_secs`).
+serde_path_to_error = "0.1"
+# `include-exclude` keeps the dashboard's tests and notes out of the binary.
+rust-embed = { workspace = true, features = ["include-exclude"] }
 mime_guess.workspace = true
+# The admin secret is compared as SHA-256 digests in constant time.
+sha2.workspace = true
 subtle.workspace = true
+base64.workspace = true
 rand.workspace = true
 parking_lot.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
 pretty_assertions.workspace = true
+# `test-util`: one WebSocket test runs on a paused clock.
+tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
 tokio-tungstenite.workspace = true
 reqwest.workspace = true
+# reqwest is built without a TLS provider; the tests install ring's.
+rustls.workspace = true

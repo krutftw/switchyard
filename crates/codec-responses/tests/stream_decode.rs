@@ -815,6 +815,27 @@ fn stream_error_shapes_and_status_derivation() {
         json!({"type": "error", "error": {"type": "insufficient_quota", "message": "You exceeded your current quota"}}),
     );
     assert_eq!((quota.status, quota.kind), (429, ErrorKind::RateLimit));
+    // The other ways of saying that the account is out of money.
+    for code in [
+        "usage_limit_reached",
+        "credit_balance_exhausted",
+        "billing_hard_limit_reached",
+        "billing_not_active",
+        "insufficient_balance",
+        "organization_spend_limit_exceeded",
+        "project_spend_limit_exceeded",
+        "enforced_spend_limit_reached",
+    ] {
+        let mut failed_response = response_shell("failed");
+        failed_response["error"] = json!({"code": code, "message": "Out of money."});
+        let spent = error_of(json!({"type": "response.failed", "response": failed_response}));
+        assert_eq!(
+            (spent.status, spent.kind),
+            (429, ErrorKind::RateLimit),
+            "{code}"
+        );
+        assert_eq!(spent.code.as_deref(), Some(code));
+    }
     let unknown = error_of(json!({"type": "error", "message": "something broke"}));
     assert_eq!((unknown.status, unknown.kind), (502, ErrorKind::Upstream));
 

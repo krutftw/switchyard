@@ -3,10 +3,14 @@
 use crate::failover::rests_whole_credential;
 use crate::gateway::{Inner, wants_discovery};
 use crate::prepare::adapt_for_vertex;
-use crate::target::protocol_for;
+use crate::target::{
+    ReadError, bad_gateway, body_limit, declared_failure, failed_response, protocol_for,
+    read_limited, too_large,
+};
 use crate::types::ProviderTest;
 use bytes::Bytes;
 use http::HeaderMap;
+use serde_json::Value;
 use std::time::{Duration, Instant};
 use switchyard_core::codec::UpstreamCtx;
 use switchyard_core::config::{Config, ProviderConfig, ProviderKind};
@@ -14,7 +18,8 @@ use switchyard_core::ir::{Message, Request};
 use switchyard_core::reasoning::ModelThinking;
 use switchyard_core::{ApiError, FailureClass, ModelInfo, Protocol, UpstreamError};
 use switchyard_scheduler::Outcome;
-use switchyard_upstream::{Operation, Timeouts, mock_models, mock_response};
+use switchyard_upstream::{Operation, Target, Timeouts, mock_models, mock_response};
+use tokio_util::sync::CancellationToken;
 
 /// Limits of one model-listing page: discovery must never hold anything up
 /// for long.
@@ -43,6 +48,34 @@ fn admin_error(error: &UpstreamError) -> ApiError {
         );
     }
     api
+}
+
+/// What a 2xx answer to the test request amounts to: `Ok` when it is a
+/// response a request could be served with, otherwise the failure a
+/// generation request answered the same way is charged with — the
+/// generation the upstream itself reports as failed (a Responses body with
+/// `status: "failed"`, classified by its error code: out of quota, rate
+/// limited, …), or a body that is no response at all (the HTML of a web
+/// page behind a mistyped `base_url` arrives with a `200` too).
+fn answered(protocol: Protocol, body: &[u8], target: &Target) -> Result<(), UpstreamError> {
+    let Ok(value) = serde_json::from_slice::<Value>(body) else {
+        return Err(bad_gateway(
+            "the upstream answered with a body that is not valid JSON",
+        ));
+    };
+    if let Some(failure) = declared_failure(protocol, &value, Some(target)) {
+        return Err(failure);
+    }
+    match switchyard_codecs::codec(protocol).decode_response(&value) {
+        Ok(_) => Ok(()),
+        Err(error) => Err(
+            failed_response(protocol, &value, Some(target)).unwrap_or_else(|| {
+                bad_gateway(target.redact(&format!(
+                    "the upstream response could not be understood: {error}"
+                )))
+            }),
+        ),
+    }
 }
 
 /// Fragments of model ids that name something other than a text generation
@@ -303,11 +336,32 @@ impl Inner {
                 .target_for(&config, &entry, &credential, protocol, &model)
                 .await
             {
-                Ok(target) => self
-                    .upstream
-                    .send(&target, &op, body, &HeaderMap::new(), limits)
-                    .await
-                    .map(|response| response.status),
+                Ok(target) => {
+                    let sent = self
+                        .upstream
+                        .send_unbuffered(&target, &op, body, &HeaderMap::new(), limits)
+                        .await;
+                    match sent {
+                        Ok(response) => {
+                            // A 2xx status alone proves little: the answer
+                            // has to be one a request could be served with.
+                            let status = response.status;
+                            let never = CancellationToken::new();
+                            match read_limited(response.body, body_limit(&config), &never).await {
+                                Ok(bytes) => answered(protocol, &bytes, &target).map(|()| status),
+                                Err(ReadError::Upstream(error)) => Err(error),
+                                Err(ReadError::TooLarge) => {
+                                    Err(bad_gateway(too_large(&config).message))
+                                }
+                                // Unreachable: nothing cancels the token.
+                                Err(ReadError::Cancelled) => {
+                                    Err(bad_gateway("the provider test was abandoned"))
+                                }
+                            }
+                        }
+                        Err(error) => Err(error),
+                    }
+                }
                 Err(error) => Err(error),
             }
         };

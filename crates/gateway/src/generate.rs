@@ -15,7 +15,11 @@ use crate::stream::{
     Boot, CanonicalDecoder, Feed, Pump, STREAM_CHANNEL_CAPACITY, asked_for_usage_chunk, bootstrap,
     idle_limit, idle_timeout, is_usage_only_chunk,
 };
-use crate::target::{ReadError, bad_gateway, body_limit, offered_headers, read_limited, too_large};
+use crate::summary::{Refusal, SummaryAsk, summary_refusal};
+use crate::target::{
+    ReadError, bad_gateway, body_limit, declared_failure, failed_response, offered_headers,
+    read_limited, too_large,
+};
 use crate::types::{ClientRequest, FullReply, Reply, StreamReply};
 use bytes::Bytes;
 use http::HeaderMap;
@@ -46,6 +50,11 @@ pub(crate) enum Attempted {
     Stream(Box<Committed>),
     /// The upstream failed: report, and maybe try another credential.
     Failed(Failure),
+    /// A Responses upstream refused the reasoning summary a translated
+    /// request asked it for (see [`crate::summary`]): the same credential
+    /// is asked again without it. Nothing is held against the credential
+    /// and the repeat is not one of `routing.max_attempts`.
+    SummaryRefused(Failure),
     /// The request cannot be served whatever the credential: answer with
     /// this error. The scheduler is not told anything.
     Fatal(ApiError),
@@ -306,6 +315,7 @@ impl Inner {
             scope,
             decoded: None,
             cancel: cancel.clone(),
+            summary_refused_by: Vec::new(),
         };
 
         // 5. The attempt loop.
@@ -318,11 +328,17 @@ impl Inner {
             Limits::from_config(&config),
         );
         let mut last: Option<Box<Lease>> = None;
+        // The credential to ask once more, without the reasoning summary
+        // its upstream just refused.
+        let mut again: Option<Box<Lease>> = None;
         loop {
-            let lease = match failover.next().await {
-                Next::Lease(lease) => lease,
-                Next::Stop => break,
-                Next::Cancelled => return self.cancelled(recorder, client),
+            let lease = match again.take() {
+                Some(lease) => lease,
+                None => match failover.next().await {
+                    Next::Lease(lease) => lease,
+                    Next::Stop => break,
+                    Next::Cancelled => return self.cancelled(recorder, client),
+                },
             };
             let started = Instant::now();
             let protocol_u = crate::target::upstream_protocol(&lease);
@@ -415,6 +431,21 @@ impl Inner {
                     failover.failed(&lease, failure);
                     last = Some(lease);
                 }
+                Attempted::SummaryRefused(failure) => {
+                    // On the record like any attempt, but the scheduler is
+                    // not told and the failover loop does not count it: the
+                    // field was the gateway's idea, and the credential is
+                    // fine. Once per provider — the body built next for
+                    // this one has no summary left to refuse, while another
+                    // provider the request may yet fail over to is asked.
+                    recorder
+                        .builder()
+                        .push_attempt(failed_attempt_record(&lease, &failure, started));
+                    recorder.capture_upstream_failure(&failure.error);
+                    job.summary_refused_by
+                        .push(lease.credential.provider.clone());
+                    again = Some(lease);
+                }
                 Attempted::Fatal(error) => {
                     recorder.builder().push_attempt(
                         attempt_record(&lease, protocol_u, started)
@@ -480,6 +511,7 @@ impl Inner {
             body,
             names,
             reasoning,
+            summary,
         } = prepared;
         let upstream = switchyard_codecs::codec(protocol);
         let stream = job.meta.stream;
@@ -505,7 +537,10 @@ impl Inner {
         };
         let response = match sent {
             Some(Ok(response)) => response,
-            Some(Err(error)) => return Attempted::Failed(Failure::upstream(error, protocol)),
+            Some(Err(error)) => {
+                let failure = Failure::upstream(error, protocol);
+                return self.summary_refused_or_failed(&job.config, lease, summary, failure);
+            }
             None => {
                 return Attempted::Failed(Failure::local(
                     idle_timeout(idle.unwrap_or_default()),
@@ -579,7 +614,8 @@ impl Inner {
                     if let Some(text) = upstream_capture.and_then(CaptureBuf::into_text) {
                         recorder.capture_upstream_response(target.redact(&text).as_bytes());
                     }
-                    Attempted::Failed(Failure::local(error, protocol).after_start())
+                    let failure = Failure::local(error, protocol).after_start();
+                    self.summary_refused_or_failed(&job.config, lease, summary, failure)
                 }
                 Boot::Cancelled => Attempted::Cancelled,
             };
@@ -607,20 +643,55 @@ impl Inner {
             return not_json();
         };
 
+        // A generation the upstream itself declares failed is a failed
+        // attempt in both modes, whatever it had produced before failing (a
+        // reasoning item, the first words of the answer): nothing has
+        // reached the client, so a rate-limited credential rests and the
+        // next one is tried instead of an empty or truncated answer being
+        // handed on as a success. Its error says who is at fault — also
+        // that the fault is the summary the gateway asked for.
+        if let Some(failure) = declared_failure(protocol, &value, Some(&target)) {
+            let failure = Failure::local(failure, protocol);
+            return self.summary_refused_or_failed(&job.config, lease, summary, failure);
+        }
+
         if mode == Mode::Passthrough {
             // Decoded on the side for accounting only: whatever the decoder
             // makes of the body, the client gets the upstream's own bytes.
             let mut usage = Usage::default();
-            if let Ok(decoded) = upstream.decode_response(&value) {
-                usage = decoded.usage;
-                self.reasoning.remember(&decoded, &job.scope);
+            let mut scrubbed: Option<String> = None;
+            match upstream.decode_response(&value) {
+                Ok(decoded) => {
+                    usage = decoded.usage;
+                    self.reasoning.remember(&decoded, &job.scope);
+                }
+                Err(_) => {
+                    // The one exception: a body with nothing in it but an
+                    // error is a failed attempt too, although it does not
+                    // say `failed`.
+                    if let Some(failure) = failed_response(protocol, &value, Some(&target)) {
+                        return Attempted::Failed(Failure::local(failure, protocol));
+                    }
+                    // Anything else that is no response — typically an
+                    // error envelope sent with a `200` — is the upstream
+                    // talking about a failure, not content: it is handed on
+                    // without the credential it may quote, like an error
+                    // event inside a stream.
+                    let clean = target.redact(text);
+                    if clean != text {
+                        scrubbed = Some(clean);
+                    }
+                }
             }
-            let body = if renamed {
+            let rewritten = if renamed {
+                let text = scrubbed.as_deref().unwrap_or(text);
                 rewrite_model_text(upstream, text, &client_model)
-                    .map(Bytes::from)
-                    .unwrap_or(bytes)
             } else {
-                bytes
+                None
+            };
+            let body = match rewritten.or(scrubbed) {
+                Some(changed) => Bytes::from(changed),
+                None => bytes,
             };
             return Attempted::Full(FullDone {
                 body,
@@ -632,10 +703,18 @@ impl Inner {
         let mut decoded = match upstream.decode_response(&value) {
             Ok(decoded) => decoded,
             Err(error) => {
+                // A body with nothing in it but an error says why, and that
+                // decides who is at fault.
+                if let Some(failure) = failed_response(protocol, &value, Some(&target)) {
+                    let failure = Failure::local(failure, protocol);
+                    return self.summary_refused_or_failed(&job.config, lease, summary, failure);
+                }
+                // The decoder's complaint may quote what the body says, and
+                // the body of a careless upstream the credential.
                 return Attempted::Failed(Failure::local(
-                    bad_gateway(format!(
+                    bad_gateway(target.redact(&format!(
                         "the upstream response could not be understood: {error}"
-                    )),
+                    ))),
                     protocol,
                 ));
             }
@@ -659,6 +738,66 @@ impl Inner {
             }),
             Err(error) => Attempted::Fatal(error),
         }
+    }
+
+    /// What a failed attempt amounts to: [`Attempted::SummaryRefused`] when
+    /// the body asked for a reasoning summary (`asked`) and the failure is
+    /// the upstream refusing exactly that, and an ordinary
+    /// [`Attempted::Failed`] otherwise.
+    ///
+    /// What the refusal says beyond this request is remembered, so later
+    /// translated requests do not ask: the provider when its organisation
+    /// may not have summaries at all, the upstream model when it turned
+    /// down the plain `"auto"`. A refused detail level that the client
+    /// chose says nothing about anybody else's request and is not
+    /// remembered — nor is anything a request learns after the
+    /// configuration it runs under (`config`) was replaced.
+    fn summary_refused_or_failed(
+        &self,
+        config: &Arc<Config>,
+        lease: &Lease,
+        asked: SummaryAsk,
+        failure: Failure,
+    ) -> Attempted {
+        let refusal = match asked {
+            SummaryAsk::Nothing => None,
+            SummaryAsk::Auto | SummaryAsk::Chosen => summary_refusal(&failure.error),
+        };
+        let Some(refusal) = refusal else {
+            return Attempted::Failed(failure);
+        };
+        let provider = &lease.credential.provider;
+        let model = &lease.upstream_model;
+        match (refusal, asked) {
+            (Refusal::Organisation, _) => {
+                if self.summary_refusals.remember(config, provider, None) {
+                    tracing::info!(
+                        provider = %provider,
+                        "the upstream does not generate reasoning summaries for this \
+                         organisation; translated requests to this provider leave \
+                         `reasoning.summary` out until the configuration changes"
+                    );
+                }
+            }
+            (Refusal::Parameter, SummaryAsk::Auto) => {
+                if self
+                    .summary_refusals
+                    .remember(config, provider, Some(model))
+                {
+                    tracing::info!(
+                        provider = %provider,
+                        model = %model,
+                        "the upstream does not generate reasoning summaries with this \
+                         model; translated requests for it leave `reasoning.summary` out \
+                         until the configuration changes"
+                    );
+                }
+            }
+            // A detail level this model does not offer: the request goes on
+            // without a summary, and that is all.
+            (Refusal::Parameter, _) => {}
+        }
+        Attempted::SummaryRefused(failure)
     }
 
     /// An attempt served by the built-in mock provider: no network, always

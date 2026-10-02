@@ -2,6 +2,7 @@
 
 use crate::auth::{ClientIdentity, KeyTable};
 use crate::reply::{Served, error_reply};
+use crate::summary::SummaryRefusals;
 use crate::types::{
     ClientRequest, FullReply, GatewayOptions, PresentedCredentials, ProviderTest, RawRequest,
     Reply, StartError, WsOpenRequest,
@@ -56,6 +57,10 @@ pub(crate) struct Inner {
     /// Parsed service-account key files, by resolved path. Cleared when the
     /// configuration changes, so an edited file is read again.
     pub(crate) service_accounts: Mutex<HashMap<PathBuf, Arc<ServiceAccount>>>,
+    /// Providers (and single models of providers) whose upstream refused
+    /// to generate reasoning summaries, under the configuration in effect.
+    /// Started afresh when the configuration changes.
+    pub(crate) summary_refusals: SummaryRefusals,
     log_level_hook: Mutex<Option<LogLevelHook>>,
     started_at: SystemTime,
     shutdown: CancellationToken,
@@ -143,6 +148,7 @@ impl Gateway {
             reasoning,
             keys: ArcSwap::from_pointee(keys),
             service_accounts: Mutex::new(HashMap::new()),
+            summary_refusals: SummaryRefusals::new(Arc::clone(&config)),
             log_level_hook: Mutex::new(None),
             started_at: SystemTime::now(),
             shutdown: CancellationToken::new(),
@@ -326,6 +332,12 @@ impl Gateway {
     /// the provider's first model. The credential is used whatever its
     /// cooldown state, and the outcome is reported to the scheduler. Never
     /// fails as a Rust call: problems are in the result.
+    ///
+    /// The test passes when the upstream answers with a response a request
+    /// could be served with. A `2xx` whose body reports a failed generation
+    /// (a Responses body with `status: "failed"`) or is no response at all
+    /// fails it, and is reported to the scheduler like the same answer to
+    /// a request.
     pub async fn test_provider(&self, provider: &str, model: Option<&str>) -> ProviderTest {
         self.inner.test_provider(provider, model).await
     }
@@ -449,6 +461,11 @@ impl Inner {
         // A service-account file may have been replaced along with the
         // configuration that names it.
         self.service_accounts.lock().clear();
+        // So may a key have been: another organisation may well be allowed
+        // the reasoning summaries the previous one was refused. Requests
+        // still running under an earlier configuration add nothing to what
+        // is known from here on.
+        self.summary_refusals.reset(Arc::clone(&config));
 
         let hook = self.log_level_hook.lock().clone();
         if let Some(hook) = hook {

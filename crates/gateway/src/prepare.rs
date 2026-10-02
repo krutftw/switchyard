@@ -2,6 +2,7 @@
 //! translation (see `docs/DESIGN.md` section 2).
 
 use crate::gateway::Inner;
+use crate::summary::{SummaryAsk, strip_summary, summary_ask};
 use crate::target::upstream_protocol;
 use bytes::Bytes;
 use http::HeaderMap;
@@ -41,6 +42,19 @@ pub(crate) struct Job {
     /// The body decoded with the client's codec; filled on first use.
     pub decoded: Option<Request>,
     pub cancel: CancellationToken,
+    /// The providers that refused this request a reasoning summary:
+    /// translated Responses bodies for them are built without
+    /// `reasoning.summary` from here on (see [`crate::summary`]). Starts
+    /// empty.
+    ///
+    /// By provider: a provider of another organisation that the request
+    /// fails over to is still asked. Kept here besides the gateway-wide
+    /// memory because that one does not remember every refusal (a detail
+    /// level one client chose is nobody else's affair) and nothing a
+    /// request learns once the configuration has changed: the repeat is
+    /// certain to leave the field out — and a request to be repeated once
+    /// per provider at most — whatever is remembered for later requests.
+    pub summary_refused_by: Vec<String>,
 }
 
 impl Job {
@@ -81,6 +95,12 @@ pub(crate) struct Prepared {
     pub names: ToolNames,
     /// Label of the reasoning depth that goes upstream, for the record.
     pub reasoning: Option<&'static str>,
+    /// The reasoning summary a translated Responses request asks for:
+    /// should the upstream refuse exactly that, the attempt is worth
+    /// repeating without it (see [`crate::summary`]). Always
+    /// [`SummaryAsk::Nothing`] for passthrough and for a Responses client,
+    /// where the field is the client's own.
+    pub summary: SummaryAsk,
 }
 
 /// Why no upstream request could be built.
@@ -120,7 +140,8 @@ impl Inner {
     /// * **Translation** — otherwise: the decoded request with the model and
     ///   stream flag set, reasoning fitted, tool names made valid for the
     ///   upstream, remembered reasoning restored, encoded by the upstream's
-    ///   codec, then payload rules.
+    ///   codec, then payload rules. A Responses body for a provider that
+    ///   refuses reasoning summaries is built without `reasoning.summary`.
     pub(crate) async fn prepare_generate(
         &self,
         job: &mut Job,
@@ -142,6 +163,7 @@ impl Inner {
             same_protocol: passthrough,
         };
 
+        let mut summary = SummaryAsk::Nothing;
         let (mut body, names, reasoning) = if passthrough {
             let mut body = (*job.body).clone();
             upstream.set_request_model(&mut body, &lease.upstream_model);
@@ -179,6 +201,26 @@ impl Inner {
                 .encode_request(&request, &ctx)
                 .map_err(|error| PrepareError::Client(ApiError::from(error)))?;
             apply_payload_rules(&job.config.payload, &rules, None, &mut body);
+            // A Responses client's body is re-encoded too when it carries
+            // another vendor's signature; its `reasoning.summary` is its
+            // own and stays, as in passthrough.
+            let gateway_asks = job.client.protocol() != Protocol::OpenaiResponses;
+            if protocol == Protocol::OpenaiResponses && gateway_asks {
+                // The summary request is the gateway's doing, not the
+                // client's: an upstream known to refuse it — the provider,
+                // or this model of it — is not asked (after the payload
+                // rules, which cannot make it accept).
+                let provider = &lease.credential.provider;
+                if job.summary_refused_by.contains(provider)
+                    || self
+                        .summary_refusals
+                        .covers(&job.config, provider, &lease.upstream_model)
+                {
+                    strip_summary(&mut body);
+                } else {
+                    summary = summary_ask(&body);
+                }
+            }
             (body, names, label)
         };
 
@@ -213,6 +255,7 @@ impl Inner {
             body,
             names,
             reasoning,
+            summary,
         })
     }
 }

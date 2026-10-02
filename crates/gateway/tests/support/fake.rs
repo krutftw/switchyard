@@ -129,6 +129,12 @@ pub enum Behaviour {
     SilenceAfter { frames: usize, answer: Answer },
     /// `200` with a body that is not JSON.
     Garbage,
+    /// This status and this JSON body, whatever was asked.
+    Json { status: u16, body: Value },
+    /// An OpenAI organisation that is not verified: a request that asks for
+    /// a reasoning summary (`reasoning.summary` / `reasoning.generate_summary`)
+    /// is refused with the API's `400`, every other request gets the answer.
+    UnverifiedOrg(Answer),
 }
 
 impl Behaviour {
@@ -141,6 +147,20 @@ impl Behaviour {
             status,
             message: message.to_string(),
             retry_after: None,
+        }
+    }
+
+    /// A complete Responses body of a generation that failed (HTTP `200`,
+    /// `status: "failed"`), with the vendor's error code.
+    pub fn failed_response(code: &str, message: &str) -> Self {
+        Behaviour::Json {
+            status: 200,
+            body: json!({
+                "id": "resp_failed1", "object": "response", "created_at": CREATED,
+                "status": "failed", "model": "up-responses", "output": [],
+                "error": {"code": code, "message": message},
+                "usage": null
+            }),
         }
     }
 
@@ -439,6 +459,20 @@ async fn dispatch(
         behaviour = *then;
     }
     let wire_or_openai = wire.unwrap_or(Wire::Chat);
+    if let Behaviour::UnverifiedOrg(answer) = behaviour {
+        let asks_summary = ["summary", "generate_summary"].iter().any(|field| {
+            body.get("reasoning")
+                .and_then(|reasoning| reasoning.get(field))
+                .is_some_and(|value| !value.is_null())
+        });
+        if asks_summary {
+            return json_status(400, summary_refusal());
+        }
+        behaviour = Behaviour::Reply(answer);
+    }
+    if let Behaviour::Json { status, body } = &behaviour {
+        return json_status(*status, body.clone());
+    }
     if let Behaviour::HttpError {
         status,
         message,
@@ -493,6 +527,27 @@ fn json_response(value: Value) -> Response {
         value.to_string(),
     )
         .into_response()
+}
+
+/// A JSON body with a status of the test's choosing.
+fn json_status(status: u16, body: Value) -> Response {
+    (
+        StatusCode::from_u16(status).unwrap(),
+        [(header::CONTENT_TYPE, "application/json")],
+        body.to_string(),
+    )
+        .into_response()
+}
+
+/// What the Responses API answers an organisation that is not verified when
+/// a request asks for a reasoning summary.
+pub fn summary_refusal() -> Value {
+    json!({"error": {
+        "message": "Your organization must be verified to generate reasoning summaries. \n                    Please go to: https://platform.openai.com/settings/organization/general \n                    and click on Verify Organization. If you just verified, it can take up \n                    to 15 minutes for access to propagate.",
+        "type": "invalid_request_error",
+        "param": "reasoning.summary",
+        "code": "unsupported_value"
+    }})
 }
 
 fn http_error(wire: Wire, status: u16, message: &str, retry_after: Option<u64>) -> Response {
@@ -625,9 +680,10 @@ fn generate(
         )
             .into_response(),
         // Unwrapped by the caller.
-        Behaviour::HttpError { .. } | Behaviour::Slow { .. } => {
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
-        }
+        Behaviour::HttpError { .. }
+        | Behaviour::Slow { .. }
+        | Behaviour::Json { .. }
+        | Behaviour::UnverifiedOrg(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
     }
 }
 

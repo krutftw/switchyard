@@ -11,6 +11,7 @@ use crate::prepare::{Job, adapt_for_vertex, upstream_ctx};
 use crate::recorder::Recorder;
 use crate::reply::{JSON, Served, reply_headers};
 use crate::session::session_key;
+use crate::summary::strip_summary;
 use crate::target::{
     ReadError, bad_gateway, body_limit, offered_headers, read_limited, too_large, upstream_protocol,
 };
@@ -22,7 +23,7 @@ use std::time::Instant;
 use switchyard_core::codec::UpstreamCtx;
 use switchyard_core::config::ProviderKind;
 use switchyard_core::util::now_unix_ms;
-use switchyard_core::{ApiError, Codec, UpstreamError};
+use switchyard_core::{ApiError, Codec, Protocol, UpstreamError};
 use switchyard_scheduler::{Lease, Outcome, Resolved};
 use switchyard_telemetry::Mode;
 use switchyard_translate::{
@@ -155,6 +156,7 @@ impl Inner {
             scope,
             decoded: None,
             cancel: cancel.clone(),
+            summary_refused_by: Vec::new(),
         };
 
         let mut failover = Failover::new(
@@ -312,7 +314,16 @@ impl Inner {
             apply_to_request(&mut request, plan);
             sanitize_tool_names(&mut request, protocol);
             match upstream.encode_count_request(&request, &ctx) {
-                Some(body) => body,
+                Some(mut body) => {
+                    if protocol == Protocol::OpenaiResponses {
+                        // Whether reasoning is summarised has no bearing on
+                        // the size of the input, and the field is one that
+                        // organisations OpenAI has not verified are refused
+                        // (see `crate::summary`).
+                        strip_summary(&mut body);
+                    }
+                    body
+                }
                 // The upstream's protocol has no counting endpoint.
                 None => return Counted::Estimate(None),
             }

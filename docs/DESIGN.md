@@ -432,14 +432,17 @@ The gateway keeps a per-connection transcript so that stateless upstreams can
 serve incremental turns:
 
 * first `response.create` needs `model`; `input` defaults to `[]` and must be
-  an array; later messages inherit `model` and `instructions` when absent;
-* follow-up with `previous_response_id` (or `response.append`): upstream input
-  = previous input ++ previous response output ++ new input, de-duplicating
-  items by `id` and tool calls by `call_id`;
-* follow-up **without** `previous_response_id` whose input contains assistant
-  messages or tool calls replaces the transcript;
-* `previous_response_id` on a connection with no history → in-band error
-  status 409 code `previous_response_not_found` (connection stays open);
+  an array; later messages inherit `model` when absent;
+* a continuation — `previous_response_id` naming the latest response of its
+  lane, or `response.append` — gets upstream input = previous input ++
+  previous response output ++ new input, de-duplicating items by `id` and tool
+  calls by `call_id`, and inherits `instructions`;
+* a `response.create` **without** `previous_response_id` is a request of its
+  own, as in the vendor protocol: it starts a fresh transcript and inherits
+  nothing but the model;
+* `previous_response_id` that is not the latest response on the connection
+  (no history, or an older response) → in-band error status 409 code
+  `previous_response_not_found` (connection stays open);
 * `"generate": false` (prewarm) is answered locally with
   `response.created` + `response.completed` (empty output, zero usage,
   synthetic id) and its input becomes the transcript root;
@@ -450,19 +453,15 @@ serve incremental turns:
 
 Validation errors are sent as
 `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?}}`
-and keep the connection open. Upstream failures send the same error frame and
-then close (1011). Ping every `streaming.keepalive_secs` while idle or
-streaming; a client that stops answering is dropped. Message size limit
-= `server.body_limit_mb`.
+and keep the connection open, as do turns the pipeline rejects as the
+request's own fault (400/403/404/409/413/422). Other failed turns send the
+error frame and then close (1011). Ping every `streaming.keepalive_secs`; a
+client that stays silent through two pings during a turn, or for ten minutes
+between turns, is dropped. Message size limit = `server.body_limit_mb`.
 
 Any model can be used over this endpoint: turns run through the normal
-pipeline with client protocol `openai-responses`.
-
-When the serving provider is `openai` with `websocket = true`, the gateway
-instead opens one upstream WebSocket for the connection and relays frames in
-both directions (the upstream then holds conversation state); if the upstream
-socket fails mid-connection the client connection is closed with 1012 so it
-reconnects and replays.
+pipeline with client protocol `openai-responses`, so the upstream is always
+reached over HTTP streaming whatever protocol it speaks.
 
 ### Realtime relay — `GET /v1/realtime?model=…`
 

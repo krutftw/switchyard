@@ -573,7 +573,15 @@ fn failure_status(payload: &Value, code: Option<&str>, kind: Option<&str>, messa
             | "slow_down"
             | "insufficient_quota"
             | "usage_limit_reached"
-            | "credit_balance_exhausted" => Some(429),
+            | "credit_balance_exhausted"
+            // The account is out of money: what the HTTP API answers
+            // with a 429 `insufficient_quota`-style error.
+            | "billing_hard_limit_reached"
+            | "billing_not_active"
+            | "insufficient_balance"
+            | "organization_spend_limit_exceeded"
+            | "project_spend_limit_exceeded"
+            | "enforced_spend_limit_reached" => Some(429),
             "invalid_api_key" | "authentication_error" | "unauthorized" => Some(401),
             "permission_error" | "permission_denied" | "forbidden" => Some(403),
             "model_not_found" | "not_found_error" | "not_found" => Some(404),

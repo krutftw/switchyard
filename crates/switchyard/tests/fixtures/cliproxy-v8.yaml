@@ -1,0 +1,106 @@
+# A CLIProxyAPI configuration in the nested "v8" layout.
+# Test fixture: every key below is made up.
+
+config-version: 8
+
+server:
+  host: "127.0.0.1"
+  port: 9000
+  trusted-proxies: []
+  commercial-mode: false
+  tls:
+    enable: true
+    cert: "cert.pem"
+    key: "key.pem"
+
+management:
+  allow-remote: false
+  # A bcrypt hash: the plaintext cannot be recovered from it.
+  secret-key: "$2a$10$N9qo8uLOickgx2ZMRZoMyeIjZAgcfl7p92ldGxad68LJZdL17lhWy"
+  disable-control-panel: false
+
+access:
+  api-keys:
+    - "sk-client-v8-0001"
+
+routing:
+  strategy: "weighted-round-robin"
+  session-affinity: false
+  session-affinity-ttl: "1h30m"
+  force-model-prefix: true
+  retry:
+    request-retry: 0
+    max-retry-credentials: 0
+    max-retry-interval: 0
+  cooldown:
+    disable-cooling: true
+    transient-error-cooldown-seconds: 15
+
+requests:
+  proxy-url: ""
+  passthrough-headers: false
+  streaming:
+    keepalive-seconds: 0
+    bootstrap-retries: 0
+
+client:
+  codex:
+    identity-confuse: true
+
+api-keys:
+  gemini:
+    - name: gemini-1
+      prefix: "team"
+      proxy-url: "socks5://proxy.example.com:1080"
+      request-retry: 3
+      headers:
+        X-Custom-Header: "custom-value"
+      excluded-models:
+        - "*-preview"
+      keys:
+        - api-key: "AIzaSyV8-gemini-key-00000000000001"
+          weight: 5
+        # Shares the group's endpoint and headers, but not its proxy or exclusions.
+        - api-key: "AIzaSyV8-gemini-key-00000000000002"
+          prefix: null
+          proxy-url: "direct"
+          headers: null
+          excluded-models: []
+          disable-cooling: false
+  claude:
+    - name: claude-1
+      keys:
+        - api-key: "sk-ant-v8-00000000000000000000001"
+          fingerprint-profile: "claude-code-cli"
+  codex:
+    - name: codex-1
+      base-url: "https://codex.example.com/v1/"
+      keys:
+        - api-key: "sk-v8-codex-00000000000000000001"
+  xai:
+    - name: xai-1
+      base-url: "https://api.x.ai/v1"
+      keys:
+        - api-key: "xai-v8-key-000000000000000000001"
+  openai-compatibility:
+    - name: "groq"
+      base-url: "https://api.groq.com/openai/v1"
+      models:
+        - name: "llama-3.3-70b-versatile"
+
+oauth:
+  auth-dir: "~/.cli-proxy-api"
+  providers:
+    codex:
+      client-secret: "v8-oauth-client-secret-000000001"
+
+multimedia:
+  disable-image-generation: "chat"
+
+observability:
+  logs:
+    debug: false
+    logging-to-file: false
+    request-log: false
+  usage:
+    usage-statistics-enabled: true

@@ -7,27 +7,47 @@ rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 
+[lib]
+name = "switchyard"
+path = "src/lib.rs"
+
 [[bin]]
 name = "switchyard"
 path = "src/main.rs"
+# The library target carries the documentation; documenting the binary too
+# would write to the same output path.
+doc = false
 
 [dependencies]
 switchyard-core.workspace = true
+switchyard-config-store.workspace = true
 switchyard-gateway.workspace = true
 switchyard-server.workspace = true
 switchyard-admin.workspace = true
 switchyard-telemetry.workspace = true
 tokio.workspace = true
 clap.workspace = true
-anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+# Reads the real target of events bridged from the `log` crate (already in
+# the tree through tracing-subscriber, which installs the bridge).
+tracing-log = "0.2"
 rustls.workspace = true
 rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 toml.workspace = true
+toml_edit.workspace = true
+indexmap.workspace = true
+# Terminal colour detection (and switching ANSI processing on in the Windows
+# console) without `unsafe` in this crate. Already in the tree through clap.
+anstyle-query = "1.1"
+# YAML reader for `import-cliproxy`: pure Rust, no `unsafe`, maintained.
+yaml-rust2 = { version = "0.13", default-features = false }
 
 [dev-dependencies]
 tempfile.workspace = true
 pretty_assertions.workspace = true
+reqwest.workspace = true
+# To log the way the WebSocket library and the file watcher do, in tests.
+log = "0.4"

@@ -32,6 +32,11 @@
 //!    `streaming.bootstrap_retries`); after it, the failure is delivered
 //!    in-band. When every credential rests and the soonest is back within
 //!    `routing.max_wait_secs`, the request waits for it, once.
+//!    A Responses upstream that refuses the reasoning summary a translated
+//!    request asked it for is asked once more without it, on the same
+//!    credential, and — when the refusal is about the organisation or the
+//!    model, not about a detail level the client chose — not asked again
+//!    until the configuration changes.
 //! 5. Whatever happens, exactly one request record is published.
 //!
 //! # What clients cannot do to each other
@@ -50,6 +55,10 @@
 //!   Both are on the request record.
 //! * A mock model that fails on purpose never rests the mock credential the
 //!   working mock models share.
+//! * A reasoning-summary detail level that one client chose and the
+//!   upstream refused costs nobody else the reasoning text they ask for:
+//!   only a refusal about the organisation (the provider) or about the
+//!   plain default (that model) is remembered.
 //! * The request types' `Debug` output never prints the client's key (or
 //!   any header value that could carry one) or a body.
 //!
@@ -76,6 +85,7 @@ mod recorder;
 mod reply;
 mod session;
 mod stream;
+mod summary;
 mod target;
 mod types;
 mod ws;
