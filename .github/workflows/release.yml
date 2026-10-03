@@ -57,6 +57,18 @@ jobs:
           - { os: macos-15-intel, target: x86_64-apple-darwin }
           - { os: windows-latest, target: x86_64-pc-windows-msvc }
     steps:
+      # Dispatch from the updated workflow branch to validate older release
+      # tags too: their source tree may not contain this smoke helper.
+      - name: Check out release validation tools
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Keep smoke helper outside the release checkout
+        shell: bash
+        run: cp scripts/release-smoke.mjs "$RUNNER_TEMP/switchyard-release-smoke.mjs"
+
       - uses: actions/checkout@v7
         with:
           ref: ${{ needs.validate.outputs.sha }}
@@ -76,6 +88,10 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
+
+      - name: Test native target
+        shell: bash
+        run: cargo test --workspace --locked --target ${{ matrix.target }}
 
       - name: Build
         shell: bash
@@ -110,6 +126,24 @@ jobs:
           fi
           rm -rf "${name}"
           ls -la
+
+      - name: Smoke extracted release archive
+        shell: bash
+        env:
+          TARGET: ${{ matrix.target }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          name="switchyard-${version}-${TARGET}"
+          extracted="$(mktemp -d "$RUNNER_TEMP/switchyard-extract.XXXXXX")"
+          if [[ "$TARGET" == *windows* ]]; then
+            7z x "dist/${name}.zip" "-o${extracted}" > /dev/null
+            bin="${extracted}/${name}/switchyard.exe"
+          else
+            tar -xzf "dist/${name}.tar.gz" -C "$extracted"
+            bin="${extracted}/${name}/switchyard"
+          fi
+          node "$RUNNER_TEMP/switchyard-release-smoke.mjs" "$bin" "$version"
 
       - uses: actions/upload-artifact@v7
         with:
