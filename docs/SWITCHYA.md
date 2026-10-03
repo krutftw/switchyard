@@ -30,7 +30,7 @@ separates builds, source checks and runtime observations.
 |---|---|
 | Windows automated checks | 88 tests passed across the four new packages: agent engine 15, agent tools 13, adapters 22 and app host 38. The 38 host tests passed again after the final lint refactor. All four packages passed all-targets Clippy with warnings denied. This count is not a whole-gateway-workspace test total. |
 | UI checks | The final complete `app-ui/tests/*.test.mjs` run passed all 56 tests. |
-| Browser workflow | A controlled local provider exercised file reads, proposed patches, edit and command approval/denial, recorded command results, saved-session reload and CLI handoff. These are fixture checks, not live-model quality results. |
+| Browser workflow | A controlled local provider exercised file reads, proposed patches, edit approval/denial and command approval, recorded command results, saved-session reload and CLI handoff. These are fixture checks, not live-model quality results. |
 | Native Windows shell | Release version/help and startup checks passed, including a responding window and healthy local host. Interaction inside the native GUI has not been verified; the browser workflow above is a separate check. |
 | Portable release package | The release includes a SHA-256 file and a manifest of every packaged file. Verify the downloaded archive against those files. |
 | Accounts and model quality | Actual account sign-ins and live AI coding quality remain unverified. Account tests use controlled fixtures. Claude subscription quota remains unavailable because its documented status command does not expose it. |
