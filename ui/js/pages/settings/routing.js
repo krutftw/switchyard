@@ -3,7 +3,7 @@
 
 import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { Panel } from '../../components/index.js';
-import { NumberRow, OptionRow, Rows, SecondsRow, SettingsForm, SwitchRow, spellDuration, useEdits, useSettingsSave } from './common.js';
+import { NumberRow, OptionRow, Rows, SecondsRow, SettingsForm, SwitchRow, useEdits, useSettingsSave } from './common.js';
 
 const STRATEGIES = [
   { value: 'round-robin', label: 'Round robin', description: 'Take turns: each request goes to the next ready credential.' },
@@ -12,18 +12,15 @@ const STRATEGIES = [
   { value: 'least-latency', label: 'Least latency', description: 'Prefer the credential that has been answering fastest.' },
 ];
 
-export function RoutingTab({ config }) {
+export function RoutingTab({ config, onDiskInvalid }) {
   const live = config.data.config;
   const base = useMemo(() => ({ routing: live.routing }), [live]);
   const form = useEdits(base);
-  const saver = useSettingsSave({ form, config, name: 'Routing' });
+  const saver = useSettingsSave({ form, config, name: 'Routing', onDiskInvalid });
   const { issues } = saver;
 
   const affinity = !!form.value('routing.session_affinity');
   const cooling = !!form.value('routing.cooldown.enabled');
-  const first = form.value('routing.cooldown.rate_limit_base_secs');
-  const cap = form.value('routing.cooldown.rate_limit_max_secs');
-  const capBelowFirst = typeof first === 'number' && typeof cap === 'number' && cap < first;
   const attempts = form.value('routing.max_attempts');
 
   return html`
@@ -108,8 +105,7 @@ export function RoutingTab({ config }) {
             path="routing.cooldown.rate_limit_max_secs"
             label="Rate limit, cap"
             disabled=${!cooling}
-            hint=${capBelowFirst ? html`<span class="settings-caution">Lower than the first cooldown (${spellDuration(first)}): every rate limit would rest for the cap.</span>` : undefined}
-            description="The doubling stops here."
+            description="The doubling stops here. It cannot be shorter than the first cooldown."
           />
           <${SecondsRow} form=${form} issues=${issues} path="routing.cooldown.transient_secs" label="Server and network errors" disabled=${!cooling} description="After a 5xx answer, a timeout or a connection error." />
           <${SecondsRow} form=${form} issues=${issues} path="routing.cooldown.auth_secs" label="Rejected credential" disabled=${!cooling} description="After the upstream answers 401 or 403: the key is wrong, revoked or lacks access." />
@@ -127,6 +123,3 @@ export function RoutingTab({ config }) {
     <//>
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default RoutingTab;

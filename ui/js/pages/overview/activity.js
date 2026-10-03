@@ -13,7 +13,7 @@
 import { html, useEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Badge, Button, EmptyState, ErrorState, IconButton, Panel, Skeleton, StatusLamp, toneForStatus } from '../../components/index.js';
 import { formatDuration, formatRelativeTime, formatTokens, plural } from '../../lib/format.js';
-import { useLive } from '../../lib/live.js';
+import { useLive, useLiveGap } from '../../lib/live.js';
 import { href } from '../../lib/router.js';
 import { useStore } from '../../lib/store.js';
 import { gauges, useServerNow } from './data.js';
@@ -30,26 +30,44 @@ export const FEED_POLL_MS = 5_000;
 // A row is taken for abandoned (its end was missed) only when it is older than this.
 const SETTLE_MS = 3_000;
 
+// The kinds a request record's error can have (see "A request record" in
+// crates/admin/API.md). A kind that is not here is shown as sent.
 const ERROR_KIND = {
   invalid_request: 'invalid request',
+  permission: 'model not allowed',
   not_found: 'model not found',
+  too_large: 'too large',
   rate_limit: 'rate limited',
   upstream: 'upstream error',
   unavailable: 'no provider available',
   timeout: 'timed out',
-  auth: 'not authorised',
+  internal: 'gateway error',
+  client_disconnect: 'client went away',
+  aborted: 'session aborted',
 };
 
 // Rows in flight when the page was left, for the next visit.
 let carried = [];
 
+/**
+ * Tone of a finished request. `ok` decides, not the status alone: a relayed
+ * WebSocket session ends with status 101 whether it closed in order or broke
+ * off, and a stream that failed after its 200 is not a success.
+ */
+function outcomeTone(record) {
+  if (record.ok) return 'clear';
+  const tone = toneForStatus(record.status);
+  return tone === 'clear' ? 'stop' : tone;
+}
+
 function Row({ record, now, fresh }) {
   const pending = isPending(record);
   const tokens = tokensOf(record);
   const key = record.client?.key_name ?? 'anonymous';
-  const model = record.requested_model ?? record.client_model ?? 'no model';
+  // requested_model is "" for a request refused before a model could be read.
+  const model = record.requested_model || record.client_model || 'no model';
   const lampTitle = pending ? 'In flight' : record.ok ? 'Succeeded' : 'Failed';
-  const tone = pending ? 'info' : record.ok ? 'clear' : toneForStatus(record.status);
+  const tone = pending ? 'info' : outcomeTone(record);
   const kind = record.error?.kind;
   const first = pending ? (record.endpoint ?? record.client_protocol ?? 'Request') : (record.provider ?? 'not routed');
 
@@ -69,7 +87,7 @@ function Row({ record, now, fresh }) {
           <span class="overview-feed-result">
             ${pending
               ? html`<${Badge} tone="info">${record.stream ? 'Streaming' : 'In flight'}<//>`
-              : html`<${Badge} mono tone=${toneForStatus(record.status)}>${record.status}<//><span class="num">${formatDuration(record.duration_ms)}</span>`}
+              : html`<${Badge} mono tone=${tone}>${record.status}<//><span class="num">${formatDuration(record.duration_ms)}</span>`}
           </span>
           <span class="overview-feed-detail">
             ${pending
@@ -88,14 +106,11 @@ function Row({ record, now, fresh }) {
 const asEvent = (row) => ({ type: isPending(row) ? 'started' : 'finished', data: row });
 
 /**
- * recent       /requests?limit=15 (useResource), polled by the page while
- *              the live connection is down
- * liveOpen     the live connection is up
- * reconnected  changes each time frames may have been missed (the connection
- *              came back, the gateway reported dropped frames), so the list
- *              is loaded again
+ * recent    /requests?limit=15 (useResource), polled by the page while the
+ *           live connection is down
+ * liveOpen  the live connection is up
  */
-export default function Activity({ recent, liveOpen, reconnected }) {
+export default function Activity({ recent, liveOpen }) {
   const now = useServerNow(1000);
   const [rows, setRows] = useState(() => (carried.length > 0 ? carried : null));
   const [fresh, setFresh] = useState(() => new Set());
@@ -130,12 +145,9 @@ export default function Activity({ recent, liveOpen, reconnected }) {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [recent.data]);
 
-  const firstConnection = useRef(reconnected);
-  useEffect(() => {
-    if (reconnected === firstConnection.current) return;
-    recent.refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [reconnected]);
+  // Frames may have been missed (the connection came back, the gateway
+  // dropped frames for it): the list is loaded again and merged as above.
+  useLiveGap(() => recent.refresh());
 
   const flush = () => {
     timer.current = null;

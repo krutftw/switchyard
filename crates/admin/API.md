@@ -139,7 +139,10 @@ provider headers whose name looks like a credential (`Authorization`,
 In an update, a secret field that is **empty** or **equal to the mask it was
 shown as** means "keep the stored value"; anything else replaces it. A mask
 that matches no stored secret is refused with `422` (it would otherwise be
-saved as the key). The dashboard can therefore send back what it was shown.
+saved as the key), and so is one that could stand for several stored
+secrets which cannot be told apart (see
+[`PUT /providers/{name}`](#put-providersname)). The dashboard can therefore
+send back what it was shown.
 Two exceptions, both about removing a provider's key:
 
 * an empty row in a provider's `api_keys` list is a *removed* key, not a
@@ -182,6 +185,11 @@ is not refused); `issues` lists what is wrong with the file, by its place in
 the file. A mutation that changes nothing is not refused. Once the file is
 valid again — equal to the configuration in effect, or a new valid one —
 this is announced with `config.reloaded` (`ok: true`) and edits work again.
+A file the gateway has refused (the watcher's verdict, announced with
+`config.reloaded` `ok: false`, or a refused `POST /reload`) is also
+reported by `config_rejected` and `warnings` of [`GET /status`](#get-status)
+and by `config_rejected` of `GET /config`, for as long as it lasts, so a
+page loaded later knows too.
 
 A settings patch while the file ends in a half-typed provider entry:
 
@@ -368,13 +376,15 @@ HTTP/1.1 200 OK
 
 {
   "version": "0.1.0",
-  "started_at": 1790977305176,
-  "uptime_ms": 110,
+  "started_at": 1790985974746,
+  "uptime_ms": 225,
   "config_path": "/etc/switchyard/switchyard.toml",
   "data_dir": "/etc/switchyard/data",
   "listen": "127.0.0.1:8317",
   "tls": false,
   "restart_required": [],
+  "command_line_overrides": [],
+  "config_rejected": null,
   "warnings": [],
   "counts": {
     "providers": 2,
@@ -384,8 +394,8 @@ HTTP/1.1 200 OK
     "client_keys": 1
   },
   "live": {
-    "started_at": 1790977305176,
-    "uptime_ms": 110,
+    "started_at": 1790985974746,
+    "uptime_ms": 225,
     "in_flight": 0,
     "active_streams": 0,
     "ws_connections": 0,
@@ -398,8 +408,8 @@ HTTP/1.1 200 OK
       "output_tokens": 68,
       "reasoning_tokens": 44,
       "cost": 0.00010499999999999999,
-      "duration_ms_sum": 60,
-      "ttfb_ms_sum": 60,
+      "duration_ms_sum": 46,
+      "ttfb_ms_sum": 46,
       "ttfb_count": 2
     }
   },
@@ -418,8 +428,10 @@ HTTP/1.1 200 OK
 | `config_path`, `data_dir` | Absolute paths of the configuration file and the data directory (`null` when there is none). |
 | `listen` | The address the server is really bound to — also when `--host` / `--port` on the command line override the file — or `null` when unknown. It may be a wildcard (`0.0.0.0:8317`). |
 | `tls` | Whether that listener serves HTTPS (`server.tls` was set when it was bound): the scheme to put in front of `listen`. |
-| `restart_required` | Settings that were changed since start and only take effect after a restart: any of `server.host`, `server.port`, `server.tls`, `server.data_dir`. |
-| `warnings` | Problems that do not make the configuration invalid: credentials whose secret cannot be resolved or whose service-account file cannot be used, alias targets that match no model, shadowed names. Plain sentences. |
+| `restart_required` | Settings that were changed since start and only take effect after a restart: any of `server.host`, `server.port`, `server.tls`, `server.data_dir` — except those in `command_line_overrides`, which a restart with the same command line does not apply. |
+| `command_line_overrides` | Settings the command line fixes whatever the file says: `server.host` when the gateway was started with `--host`, `server.port` with `--port`. The file's value of such a setting can be changed and is saved, but neither now nor after a restart with the same command line does it take effect; `listen` says what is in use. `[]` without such flags. |
+| `config_rejected` | `null` while the file on disk is in effect. When the gateway refused the file — a hand edit that does not validate, picked up by the file watcher or by `POST /reload` — `{"at", "message", "issues"}`: when (Unix ms), a sentence that says so and quotes the first issues, and every issue of the file (by its place in the file). It stays set for as long as the file holds that content, also across page loads, and goes back to `null` once the file is valid again (fixed, restored, or replaced with `PUT /config/raw`). Meanwhile the previous configuration stays in effect and every edit that would change the file is refused with `409` (see [Configuration edits](#configuration-edits)). |
+| `warnings` | Problems that need the operator's attention, as plain sentences: first, while `config_rejected` is set, its `message` (it starts with `configuration file:`); then problems that do not make the configuration invalid — credentials whose secret cannot be resolved or whose service-account file cannot be used, alias targets that match no model, shadowed names. |
 | `counts.providers`, `counts.client_keys` | Entries in the configuration (disabled providers included). |
 | `counts.credentials`, `counts.credentials_ready` | Upstream credentials in service, and those of them with status `ready`. The credentials of a provider with `enabled = false` are in neither number. |
 | `counts.models` | Client-facing names a request can be routed by: the entries of [`GET /models`](#get-models) that are not `ignored`. Names hidden from client listings count (they are routable); an alias without a routable target does not. |
@@ -427,6 +439,76 @@ HTTP/1.1 200 OK
 | `admin.allow_remote` | Whether remote peers are admitted (configuration or environment). |
 | `admin.remote` | Whether *this* request counted as remote. |
 | `auth_required` | `auth.required`: whether the client API demands a key. |
+
+The same while the file on disk ends in a provider entry that does not
+validate (refused by `POST /reload` here):
+
+```http
+GET /admin/api/status
+```
+
+```http
+HTTP/1.1 200 OK
+
+{
+  "version": "0.1.0",
+  "started_at": 1790985974746,
+  "uptime_ms": 323,
+  "config_path": "/etc/switchyard/switchyard.toml",
+  "data_dir": "/etc/switchyard/data",
+  "listen": "127.0.0.1:8317",
+  "tls": false,
+  "restart_required": [
+    "server.port"
+  ],
+  "command_line_overrides": [],
+  "config_rejected": {
+    "at": 1790985975069,
+    "message": "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 53, column 8: string values must be quoted, expected literal string",
+    "issues": [
+      {
+        "path": "line 53, column 8",
+        "message": "string values must be quoted, expected literal string"
+      }
+    ]
+  },
+  "warnings": [
+    "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 53, column 8: string values must be quoted, expected literal string"
+  ],
+  "counts": {
+    "providers": 2,
+    "credentials": 3,
+    "credentials_ready": 3,
+    "models": 9,
+    "client_keys": 1
+  },
+  "live": {
+    "started_at": 1790985974746,
+    "uptime_ms": 323,
+    "in_flight": 0,
+    "active_streams": 0,
+    "ws_connections": 0,
+    "totals": {
+      "requests": 3,
+      "errors": 1,
+      "input_tokens": 6,
+      "cache_read_tokens": 0,
+      "cache_write_tokens": 0,
+      "output_tokens": 68,
+      "reasoning_tokens": 44,
+      "cost": 0.00010499999999999999,
+      "duration_ms_sum": 46,
+      "ttfb_ms_sum": 46,
+      "ttfb_count": 2
+    }
+  },
+  "admin": {
+    "allow_remote": false,
+    "remote": false
+  },
+  "auth_required": true
+}
+```
 
 ### `POST /ws-ticket`
 
@@ -444,7 +526,7 @@ POST /admin/api/ws-ticket
 HTTP/1.1 200 OK
 
 {
-  "ticket": "2EhHESQwzPugqyV0Fk5HB3jHLv6R71_x2OLZDGoOuKA",
+  "ticket": "XET_RBfI68agmPsFm_mWZV6bgpnEWm9X_HWznbh91-g",
   "expires_in": 30
 }
 ```
@@ -455,8 +537,11 @@ HTTP/1.1 200 OK
 
 ### `GET /config`
 
-The live configuration with every secret masked, the file's path and the
-settings waiting for a restart. `config` is the configuration schema of
+The live configuration with every secret masked, the file's path, the
+settings waiting for a restart, and — as in [`GET /status`](#get-status) —
+`command_line_overrides` and `config_rejected` (the file on disk, while the
+gateway refuses it). Every mutation that returns the whole configuration
+answers in this shape. `config` is the configuration schema of
 `switchyard.toml` as JSON; sections and fields at their default *are*
 present for the scalar sections (`server` … `usage`), while empty lists
 (`providers`, `aliases`, `pricing`, `auth.keys`), an empty `payload` and
@@ -464,7 +549,10 @@ per-entry defaults are omitted, as in the file.
 
 It is the *file's* configuration: `server.host` and `server.port` are what
 the file says, also while `--host` / `--port` on the command line override
-them. The address in use is `listen` in [`GET /status`](#get-status).
+them. The address in use is `listen` in [`GET /status`](#get-status). Such
+an overridden setting is named in `command_line_overrides`; changing it in
+the file is saved but is not listed in `restart_required`, since a restart
+with the same command line keeps the command line's value.
 
 ```http
 GET /admin/api/config
@@ -574,7 +662,9 @@ HTTP/1.1 200 OK
     ]
   },
   "path": "/etc/switchyard/switchyard.toml",
-  "restart_required": []
+  "restart_required": [],
+  "command_line_overrides": [],
+  "config_rejected": null
 }
 ```
 
@@ -594,7 +684,7 @@ HTTP/1.1 200 OK
 {
   "text": "# Switchyard configuration.\n\n[admin]\nsecret = \"s3cr3t-admin-secret-change-me-0001\"\n\n[upstream]\nproxy = \"direct\"\n\n[logging]\nrequest_log = \"all\"\n\n[[auth.keys]]\nkey = \"sy-Zk3vTq8LmW2xYb7NcR5dHs9JfP4gAe6Uo1iKtQwE\"\nname = \"laptop\"\n\n# The built-in fake models.\n[[providers]]\nname = \"mock\"\nkind = \"mock\"\n\n[[providers]]\nname = \"vendor\"\nkind = \"openai-compat\"\nbase_url = \"http://127.0.0.1:9/v1\"\ndiscover = false\napi_keys = [\"sk-live-4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c\"]\n\n[[providers.credentials]]\napi_key = \"sk-live-0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d\"\nlabel = \"team\"\nweight = 2\n\n[[providers.models]]\nid = \"vendor-large\"\nalias = \"large\"\n\n[[pricing]]\nmodel = \"mock-*\"\ninput = 0.5\noutput = 1.5\n",
   "path": "/etc/switchyard/switchyard.toml",
-  "modified_at": 1790977305172
+  "modified_at": 1790985974739
 }
 ```
 
@@ -694,7 +784,9 @@ HTTP/1.1 200 OK
     ]
   },
   "path": "/etc/switchyard/switchyard.toml",
-  "restart_required": []
+  "restart_required": [],
+  "command_line_overrides": [],
+  "config_rejected": null
 }
 ```
 
@@ -905,7 +997,9 @@ HTTP/1.1 200 OK
   "path": "/etc/switchyard/switchyard.toml",
   "restart_required": [
     "server.port"
-  ]
+  ],
+  "command_line_overrides": [],
+  "config_rejected": null
 }
 ```
 
@@ -1081,7 +1175,9 @@ HTTP/1.1 200 OK
   "path": "/etc/switchyard/switchyard.toml",
   "restart_required": [
     "server.port"
-  ]
+  ],
+  "command_line_overrides": [],
+  "config_rejected": null
 }
 ```
 
@@ -1325,7 +1421,7 @@ HTTP/1.1 200 OK
       "model_cooldowns": [
         {
           "model": "mock-error-500",
-          "until": 1790977365277,
+          "until": 1790986034943,
           "reason": "server"
         }
       ],
@@ -1333,13 +1429,13 @@ HTTP/1.1 200 OK
       "successes": 2,
       "failures": 1,
       "consecutive_failures": 1,
-      "latency_ms": 28,
-      "last_used_at": 1790977305277,
+      "latency_ms": 23,
+      "last_used_at": 1790985974943,
       "last_error": {
         "status": 500,
         "class": "server",
         "message": "Mock upstream failure.",
-        "at": 1790977305277,
+        "at": 1790985974943,
         "model": "mock-error-500"
       },
       "usable": true,
@@ -1442,7 +1538,7 @@ HTTP/1.1 200 OK
         "model_cooldowns": [
           {
             "model": "mock-error-500",
-            "until": 1790977365277,
+            "until": 1790986034943,
             "reason": "server"
           }
         ],
@@ -1450,13 +1546,13 @@ HTTP/1.1 200 OK
         "successes": 2,
         "failures": 1,
         "consecutive_failures": 1,
-        "latency_ms": 28,
-        "last_used_at": 1790977305277,
+        "latency_ms": 23,
+        "last_used_at": 1790985974943,
         "last_error": {
           "status": 500,
           "class": "server",
           "message": "Mock upstream failure.",
-          "at": 1790977305277,
+          "at": 1790985974943,
           "model": "mock-error-500"
         },
         "usable": true,
@@ -1858,6 +1954,17 @@ to its default.
   `api_keys` and `credentials` — new values replace, references stay as
   written. An emptied `credentials[].api_key` keeps the stored key; a blank
   `api_keys` row is dropped.
+* **Keys that mask alike.** Keys of up to 11 characters all show as
+  `••••••••` (and longer ones can share a mask too), so a mask alone does
+  not say which of them it stands for; a `label` does. Without labels:
+  sending back as many such masks as there are stored keys keeps them all,
+  in their stored order — their order cannot be changed by moving masks
+  around, and moving one of them to `credentials` (to give it a label)
+  keeps each key where its row was. Sending back **fewer** (one was
+  deleted) is refused with `422` on those fields ("is masked like several
+  stored secrets that cannot be told apart …"), because which key was
+  deleted cannot be known and guessing could keep the very key that was
+  removed. Send the keys to keep in full (or give the keys labels first).
 * **A credential without a key:** `"api_key": null` in a `credentials[]`
   entry. An empty or absent `api_key` keeps the key stored for the
   credential with the same `service_account_file`, else the same `label`,
@@ -2136,7 +2243,7 @@ HTTP/1.1 200 OK
 {
   "ok": true,
   "status": 200,
-  "latency_ms": 26,
+  "latency_ms": 27,
   "model": "mock-echo",
   "credential": "mock"
 }
@@ -2156,7 +2263,7 @@ HTTP/1.1 200 OK
 {
   "ok": false,
   "status": 401,
-  "latency_ms": 30,
+  "latency_ms": 33,
   "model": "mock-error-401",
   "credential": "mock",
   "error": "Mock credential rejected."
@@ -2885,6 +2992,12 @@ set), `filter` (remove). A rule:
 | `set` | `default` / `override` rules: dotted path → JSON value (`messages.0.role`; `\.` for a literal dot). Required there. |
 | `remove` | `filter` rules: dotted paths to delete. Required there. |
 
+Rules apply to the built-in `mock` provider too, so a rule can be tried out
+before a real provider exists: the mock speaks whatever protocol the client
+speaks, so its "upstream request" is in the client's layout, and the
+captured `upstream_request` of the [request record](#get-requestsid) shows
+the request the mock answered, rules applied.
+
 `PUT` replaces all three lists with the body, an object
 `{default?, override?, filter?}` whose rules may leave out `protocol`,
 `provider`, and whichever of `set` / `remove` does not apply; a list that is
@@ -3182,13 +3295,13 @@ HTTP/1.1 200 OK
       "errors": 1,
       "tokens": 74,
       "cost": 0.00010499999999999999,
-      "last_used_at": 1790977305277
+      "last_used_at": 1790985974943
     }
   },
   {
-    "id": "key_9dc60b88e5ba",
+    "id": "key_cefa9e6910a6",
     "name": "ci",
-    "masked": "sy-Sj1…RA2T",
+    "masked": "sy-8r3…Zq2V",
     "is_reference": false,
     "resolved": true,
     "enabled": true,
@@ -3255,8 +3368,8 @@ POST /admin/api/keys
 HTTP/1.1 201 Created
 
 {
-  "id": "key_9dc60b88e5ba",
-  "key": "sy-Sj1HcwXgsOe9d5G2R421W15gQthNHUnvqsMYRA2T",
+  "id": "key_cefa9e6910a6",
+  "key": "sy-8r3u6iSxrhXpJZO3okGhsRDkVWiAO7Ikbpk6Zq2V",
   "is_reference": false
 }
 ```
@@ -3335,7 +3448,7 @@ unknown field or wrong type; `422` `rate_limit_rpm` of `0` (issue on
 `rate_limit_rpm`).
 
 ```http
-PATCH /admin/api/keys/key_9dc60b88e5ba
+PATCH /admin/api/keys/key_cefa9e6910a6
 
 {
   "name": "ci-runner",
@@ -3348,9 +3461,9 @@ PATCH /admin/api/keys/key_9dc60b88e5ba
 HTTP/1.1 200 OK
 
 {
-  "id": "key_9dc60b88e5ba",
+  "id": "key_cefa9e6910a6",
   "name": "ci-runner",
-  "masked": "sy-Sj1…RA2T",
+  "masked": "sy-8r3…Zq2V",
   "is_reference": false,
   "resolved": true,
   "enabled": false,
@@ -3375,7 +3488,7 @@ reference text (`"env:NAME"`, `is_reference: true`), not the variable's
 value. The body is ignored. `404` unknown id.
 
 ```http
-POST /admin/api/keys/key_9dc60b88e5ba/reveal
+POST /admin/api/keys/key_cefa9e6910a6/reveal
 
 {}
 ```
@@ -3384,7 +3497,7 @@ POST /admin/api/keys/key_9dc60b88e5ba/reveal
 HTTP/1.1 200 OK
 
 {
-  "key": "sy-Sj1HcwXgsOe9d5G2R421W15gQthNHUnvqsMYRA2T",
+  "key": "sy-8r3u6iSxrhXpJZO3okGhsRDkVWiAO7Ikbpk6Zq2V",
   "is_reference": false
 }
 ```
@@ -3394,7 +3507,7 @@ HTTP/1.1 200 OK
 The key stops working at once. `404` unknown id.
 
 ```http
-DELETE /admin/api/keys/key_9dc60b88e5ba
+DELETE /admin/api/keys/key_cefa9e6910a6
 ```
 
 ```http
@@ -3440,8 +3553,8 @@ HTTP/1.1 200 OK
 
 {
   "range": "24h",
-  "from": 1790890920000,
-  "to": 1790977305590,
+  "from": 1790899620000,
+  "to": 1790985975535,
   "totals": {
     "requests": 7,
     "errors": 2,
@@ -3451,18 +3564,18 @@ HTTP/1.1 200 OK
     "output_tokens": 74,
     "reasoning_tokens": 44,
     "cost": 0.000117,
-    "duration_ms_sum": 151,
-    "ttfb_ms_sum": 122,
+    "duration_ms_sum": 137,
+    "ttfb_ms_sum": 108,
     "ttfb_count": 5
   },
   "latency": {
     "window_ms": 86400000,
-    "p50": 28,
-    "p90": 32,
-    "p95": 32,
-    "p99": 32,
-    "ttfb_p50": 30,
-    "ttfb_p95": 32,
+    "p50": 24,
+    "p90": 31,
+    "p95": 31,
+    "p99": 31,
+    "ttfb_p50": 24,
+    "ttfb_p95": 31,
     "samples": 7,
     "ttfb_samples": 5
   },
@@ -3480,8 +3593,8 @@ HTTP/1.1 200 OK
       "output_tokens": 9,
       "reasoning_tokens": 0,
       "cost": 0.000017999999999999997,
-      "duration_ms_sum": 118,
-      "ttfb_ms_sum": 90,
+      "duration_ms_sum": 115,
+      "ttfb_ms_sum": 86,
       "ttfb_count": 4
     },
     {
@@ -3508,8 +3621,8 @@ HTTP/1.1 200 OK
       "output_tokens": 65,
       "reasoning_tokens": 44,
       "cost": 0.000099,
-      "duration_ms_sum": 32,
-      "ttfb_ms_sum": 32,
+      "duration_ms_sum": 22,
+      "ttfb_ms_sum": 22,
       "ttfb_count": 1
     },
     {
@@ -3522,7 +3635,7 @@ HTTP/1.1 200 OK
       "output_tokens": 0,
       "reasoning_tokens": 0,
       "cost": 0.0,
-      "duration_ms_sum": 1,
+      "duration_ms_sum": 0,
       "ttfb_ms_sum": 0,
       "ttfb_count": 0
     }
@@ -3538,8 +3651,8 @@ HTTP/1.1 200 OK
       "output_tokens": 74,
       "reasoning_tokens": 44,
       "cost": 0.000117,
-      "duration_ms_sum": 150,
-      "ttfb_ms_sum": 122,
+      "duration_ms_sum": 137,
+      "ttfb_ms_sum": 108,
       "ttfb_count": 5
     },
     {
@@ -3552,7 +3665,7 @@ HTTP/1.1 200 OK
       "output_tokens": 0,
       "reasoning_tokens": 0,
       "cost": 0.0,
-      "duration_ms_sum": 1,
+      "duration_ms_sum": 0,
       "ttfb_ms_sum": 0,
       "ttfb_count": 0
     }
@@ -3582,8 +3695,8 @@ HTTP/1.1 200 OK
       "output_tokens": 68,
       "reasoning_tokens": 44,
       "cost": 0.00010499999999999999,
-      "duration_ms_sum": 60,
-      "ttfb_ms_sum": 60,
+      "duration_ms_sum": 46,
+      "ttfb_ms_sum": 46,
       "ttfb_count": 2
     }
   ]
@@ -3661,8 +3774,8 @@ HTTP/1.1 200 OK
   "bucket": "minute",
   "bucket_ms": 60000,
   "group_by": "model",
-  "from": 1790973720000,
-  "to": 1790977305591,
+  "from": 1790982420000,
+  "to": 1790985975536,
   "series": [
     "mock-echo",
     "mock-error-500",
@@ -3671,7 +3784,7 @@ HTTP/1.1 200 OK
   ],
   "points": [
     {
-      "t": 1790977200000,
+      "t": 1790985900000,
       "requests": 0,
       "errors": 0,
       "input_tokens": 0,
@@ -3686,7 +3799,7 @@ HTTP/1.1 200 OK
       "groups": {}
     },
     {
-      "t": 1790977260000,
+      "t": 1790985960000,
       "requests": 7,
       "errors": 2,
       "input_tokens": 12,
@@ -3695,8 +3808,8 @@ HTTP/1.1 200 OK
       "output_tokens": 74,
       "reasoning_tokens": 44,
       "cost": 0.000117,
-      "duration_ms_sum": 151,
-      "ttfb_ms_sum": 122,
+      "duration_ms_sum": 137,
+      "ttfb_ms_sum": 108,
       "ttfb_count": 5,
       "groups": {
         "mock-echo": {
@@ -3779,10 +3892,10 @@ HTTP/1.1 200 OK
 {
   "items": [
     {
-      "id": "01a0fe90-ebcf-7741-92e6-c5b2f6c357e4",
-      "started_at": 1790977305552,
-      "finished_at": 1790977305580,
-      "duration_ms": 28,
+      "id": "01a0ff15-36cc-73f3-a3dc-2998421b02b3",
+      "started_at": 1790985975500,
+      "finished_at": 1790985975529,
+      "duration_ms": 29,
       "ttfb_ms": 0,
       "client": {
         "key_id": null,
@@ -3830,11 +3943,11 @@ HTTP/1.1 200 OK
       "has_bodies": true
     },
     {
-      "id": "01a0fe90-ebaf-7200-9fbf-2081288581c6",
-      "started_at": 1790977305519,
-      "finished_at": 1790977305549,
-      "duration_ms": 30,
-      "ttfb_ms": 30,
+      "id": "01a0ff15-36ab-7028-a3b5-3bd3d8b966ca",
+      "started_at": 1790985975467,
+      "finished_at": 1790985975498,
+      "duration_ms": 31,
+      "ttfb_ms": 31,
       "client": {
         "key_id": null,
         "key_name": "dashboard",
@@ -3881,7 +3994,7 @@ HTTP/1.1 200 OK
       "has_bodies": true
     }
   ],
-  "next_before": "1790977305519:01a0fe90-ebaf-7200-9fbf-2081288581c6",
+  "next_before": "1790985975467:01a0ff15-36ab-7028-a3b5-3bd3d8b966ca",
   "has_more": true,
   "total": 5,
   "capacity": 2000
@@ -3935,7 +4048,7 @@ The bodies of a record with `has_bodies: true` can be read as soon as its
 `request.finished` live frame has arrived.
 
 ```http
-GET /admin/api/requests/01a0fe90-eabd-76f8-83d4-6f02751f9fec
+GET /admin/api/requests/01a0ff15-349f-752e-a46b-7282d95e6728
 ```
 
 ```http
@@ -3943,9 +4056,9 @@ HTTP/1.1 200 OK
 
 {
   "record": {
-    "id": "01a0fe90-eabd-76f8-83d4-6f02751f9fec",
-    "started_at": 1790977305277,
-    "finished_at": 1790977305277,
+    "id": "01a0ff15-349f-752e-a46b-7282d95e6728",
+    "started_at": 1790985974943,
+    "finished_at": 1790985974943,
     "duration_ms": 0,
     "ttfb_ms": null,
     "client": {
@@ -4065,7 +4178,7 @@ HTTP/1.1 200 OK
   "lines": [
     {
       "seq": 1,
-      "at": 1790977305285,
+      "at": 1790985974970,
       "level": "info",
       "target": "switchyard_gateway::gateway",
       "message": "configuration applied",
@@ -4075,7 +4188,7 @@ HTTP/1.1 200 OK
     },
     {
       "seq": 2,
-      "at": 1790977305285,
+      "at": 1790985974970,
       "level": "warn",
       "target": "switchyard_gateway::failover",
       "message": "upstream attempt failed",
@@ -4085,7 +4198,7 @@ HTTP/1.1 200 OK
     },
     {
       "seq": 3,
-      "at": 1790977305285,
+      "at": 1790985974970,
       "level": "info",
       "target": "switchyard_gateway::pipeline",
       "message": "request finished",
@@ -4097,7 +4210,7 @@ HTTP/1.1 200 OK
   "next_before": null,
   "has_more": false,
   "last_seq": 3,
-  "started_at": 1790977305176
+  "started_at": 1790985974746
 }
 ```
 
@@ -4168,7 +4281,7 @@ HTTP/1.1 200 OK
 {
   "id": "chatcmpl-mock-4ca8dcc6e4868724",
   "object": "chat.completion",
-  "created": 1790977305,
+  "created": 1790985975,
   "model": "mock-echo",
   "choices": [
     {
@@ -4447,8 +4560,8 @@ again. A client that keeps state from events has to refetch it:
       "config.reloaded",
       "stats"
     ],
-    "server_time": 1790977305677,
-    "started_at": 1790977305176
+    "server_time": 1790985975620,
+    "started_at": 1790985974746
   }
 }
 ```
@@ -4466,17 +4579,17 @@ the [totals](#totals) since start.
 {
   "type": "stats",
   "data": {
-    "at": 1790977305689,
+    "at": 1790985975622,
     "in_flight": 0,
     "active_streams": 0,
     "ws_connections": 0,
     "rpm": 9,
     "tpm": 92,
     "error_rate_1m": 0.3333333333333333,
-    "p50_ms": 28,
-    "p95_ms": 32,
+    "p50_ms": 24,
+    "p95_ms": 31,
     "latency_samples": 9,
-    "uptime_ms": 513,
+    "uptime_ms": 876,
     "totals": {
       "requests": 9,
       "errors": 3,
@@ -4486,8 +4599,8 @@ the [totals](#totals) since start.
       "output_tokens": 77,
       "reasoning_tokens": 44,
       "cost": 0.000123,
-      "duration_ms_sum": 175,
-      "ttfb_ms_sum": 146,
+      "duration_ms_sum": 166,
+      "ttfb_ms_sum": 137,
       "ttfb_count": 6
     }
   }
@@ -4498,8 +4611,8 @@ the [totals](#totals) since start.
 {
   "type": "request.started",
   "data": {
-    "id": "01a0fe90-ec5a-718f-8430-96ab2e05e97d",
-    "started_at": 1790977305690,
+    "id": "01a0ff15-3746-70fd-860f-8684962c185e",
+    "started_at": 1790985975622,
     "client": {
       "key_id": "key_df58088f8694",
       "key_name": "laptop",
@@ -4519,11 +4632,11 @@ the [totals](#totals) since start.
 {
   "type": "request.finished",
   "data": {
-    "id": "01a0fe90-ec5a-718f-8430-96ab2e05e97d",
-    "started_at": 1790977305690,
-    "finished_at": 1790977305720,
-    "duration_ms": 30,
-    "ttfb_ms": 30,
+    "id": "01a0ff15-3746-70fd-860f-8684962c185e",
+    "started_at": 1790985975622,
+    "finished_at": 1790985975653,
+    "duration_ms": 31,
+    "ttfb_ms": 31,
     "client": {
       "key_id": "key_df58088f8694",
       "key_name": "laptop",
@@ -4577,7 +4690,7 @@ the [totals](#totals) since start.
   "type": "log",
   "data": {
     "seq": 4,
-    "at": 1790977305721,
+    "at": 1790985975654,
     "level": "info",
     "target": "switchyard_gateway::pipeline",
     "message": "request finished",
@@ -4603,7 +4716,7 @@ the [totals](#totals) since start.
       "model_cooldowns": [
         {
           "model": "mock-error-429",
-          "until": 1790977307721,
+          "until": 1790985977653,
           "reason": "rate_limit"
         }
       ],
@@ -4612,12 +4725,12 @@ the [totals](#totals) since start.
       "failures": 2,
       "consecutive_failures": 1,
       "latency_ms": 24,
-      "last_used_at": 1790977305721,
+      "last_used_at": 1790985975653,
       "last_error": {
         "status": 429,
         "class": "rate_limit",
         "message": "Mock rate limit reached. Please try again in 2s.",
-        "at": 1790977305721,
+        "at": 1790985975653,
         "model": "mock-error-429"
       },
       "weight": 1,
@@ -4631,7 +4744,7 @@ the [totals](#totals) since start.
 {
   "type": "config.reloaded",
   "data": {
-    "at": 1790977305729,
+    "at": 1790985975663,
     "ok": true,
     "message": "configuration applied"
   }
@@ -4712,7 +4825,7 @@ All under `/admin/api`.
 | `POST` | `/login` | ignored | `{"ok": true}` |
 | `POST` | `/ws-ticket` | ignored | `{"ticket", "expires_in"}` |
 | `GET` | `/ws?ticket=` | – | WebSocket |
-| `GET` | `/config` | – | `{"config", "path", "restart_required"}` |
+| `GET` | `/config` | – | `{"config", "path", "restart_required", "command_line_overrides", "config_rejected"}` |
 | `GET` | `/config/raw` | – | `{"text", "path", "modified_at"}` |
 | `PUT` | `/config/raw` | `{"text"}` | as `GET /config` |
 | `POST` | `/config/validate` | `{"text"}` | `{"ok", "issues"}` |

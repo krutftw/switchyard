@@ -31,15 +31,15 @@ import {
 import { api } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
 import { copyText, loadStyles } from '../lib/dom.js';
-import { DASH, formatCurrency, formatDateTime, formatNumber, formatPercent, formatRelativeTime, formatTime, formatTokens, plural } from '../lib/format.js';
+import { DASH, formatCurrency, formatDateTime, formatNumber, formatPercent, formatRelativeTime, formatTime, formatTokens, plural, sentence } from '../lib/format.js';
 import { useIsPhone, useNow, useResource, useSize } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
-import { href, routeStore, setQuery, useQueryParam } from '../lib/router.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
+import { href, mayLeave, routeStore, setQuery, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import { CreateKeyModal } from './keys/create.js';
 import { KeyDrawer, deleteKey, refusalText } from './keys/edit.js';
-import { mayLeave } from './keys/guard.js';
 import { PatternSummary } from './keys/parts.js';
+import { servedNames } from './keys/util.js';
 
 await loadStyles('pages/keys.css');
 
@@ -80,7 +80,7 @@ function matchesSearch(entry, needle) {
 }
 
 function NameCell({ entry }) {
-  const name = String(entry.name ?? '').trim();
+  const { name } = entry;
   return html`
     <div class="keys-name">
       <span class="keys-name-text" data-off=${entry.enabled ? undefined : ''} title=${name}>${name || 'Unnamed key'}</span>
@@ -94,9 +94,7 @@ function NameCell({ entry }) {
 
 function RateLimit({ rpm }) {
   if (rpm == null) return html`<span class="faint keys-plain">None</span>`;
-  // The gateway takes 0 literally: no request passes.
-  const blocked = rpm === 0;
-  return html`<span class=${blocked ? 'keys-caution' : undefined} title=${blocked ? 'A limit of 0 refuses every request with this key' : undefined}>${formatNumber(rpm)}<span class="keys-unit">rpm</span></span>`;
+  return html`<span>${formatNumber(rpm)}<span class="keys-unit">rpm</span></span>`;
 }
 
 const failedShare = (requests, errors) => (requests > 0 && errors > 0 ? `${formatPercent(errors / requests)} of this key's requests failed` : undefined);
@@ -204,6 +202,7 @@ export default function Keys() {
 
   const authRequired = status.data ? status.data.auth_required !== false : true;
   const listen = status.data?.listen ?? null;
+  const tls = status.data?.tls === true;
 
   // ---- keeping fresh ------------------------------------------------------
 
@@ -224,12 +223,11 @@ export default function Keys() {
   });
   useEffect(() => () => clearTimeout(usageTimer.current), []);
 
-  // Frames sent while the connection was down are gone: refetch when it returns.
-  const wasOpen = useRef(liveOpen);
-  useEffect(() => {
-    if (liveOpen && !wasOpen.current) refreshAll();
-    wasOpen.current = liveOpen;
-  }, [liveOpen]);
+  // Frames sent while the connection was down, or dropped for a connection
+  // that fell behind, are gone: refetch.
+  useLiveGap(() => {
+    refreshAll();
+  });
 
   // #/keys?new=1 (a link, the command palette) opens the dialog once.
   useEffect(() => {
@@ -244,7 +242,7 @@ export default function Keys() {
   // ---- the list -----------------------------------------------------------
 
   const all = keys.data ?? NONE;
-  const modelNames = useMemo(() => (models.data ? models.data.map((model) => model.name) : null), [models.data]);
+  const modelNames = useMemo(() => (models.data ? servedNames(models.data) : null), [models.data]);
 
   const needle = q.trim().toLowerCase();
   const filtered = useMemo(
@@ -302,7 +300,7 @@ export default function Keys() {
 
   const toggle = async (entry, enabled) => {
     if (toggling.has(entry.id)) return;
-    const label = String(entry.name ?? '').trim() || entry.id;
+    const label = entry.name || entry.id;
     setToggling((set) => new Set(set).add(entry.id));
     // The switch moves at once; the gateway's answer confirms or reverts it.
     replaceEntry(entry.id, (current) => ({ ...current, enabled }));
@@ -318,7 +316,7 @@ export default function Keys() {
       }
     } catch (error) {
       replaceEntry(entry.id, (current) => ({ ...current, enabled: entry.enabled }));
-      if (!error.aborted) toast.error(`Could not ${enabled ? 'enable' : 'disable'} ${label}`, { description: error.message });
+      if (!error.aborted) toast.error(`Could not ${enabled ? 'enable' : 'disable'} ${label}`, { description: sentence(error.message) });
       if (error.status === 404) keys.refresh();
     } finally {
       setToggling((set) => {
@@ -335,9 +333,9 @@ export default function Keys() {
       // The full key passes through this function and the clipboard only.
       const value = entry.is_reference ? entry.masked : (await api.post(`/keys/${entry.id}/reveal`)).key;
       if (!(await copyText(value))) throw new Error('The browser did not allow access to the clipboard.');
-      toast.success(`${what} copied`, { description: entry.is_reference ? undefined : `The full key of ${String(entry.name ?? '').trim() || entry.id} is on the clipboard.` });
+      toast.success(`${what} copied`, { description: entry.is_reference ? undefined : `The full key of ${entry.name || entry.id} is on the clipboard.` });
     } catch (error) {
-      if (!error.aborted) toast.error(`Could not copy the ${what.toLowerCase()}`, { description: error.message });
+      if (!error.aborted) toast.error(`Could not copy the ${what.toLowerCase()}`, { description: sentence(error.message) });
     }
   };
 
@@ -347,17 +345,17 @@ export default function Keys() {
   // The row that had the focus (or its menu button, or the drawer opened from
   // it) is gone with the key. Put the focus on the row that took its place,
   // so a keyboard user carries on from there and not from the top of the page.
+  // Once, as soon as the list has rendered without the row: a closing dialog
+  // or drawer leaves a focus the page has placed where it is.
   const focusAfterRemoval = (index) => {
-    const settle = () => {
+    setTimeout(() => {
       const active = document.activeElement;
       const lost = !active || active === document.body || !document.contains(active) || active.closest('[data-state="closed"]');
       if (!lost) return;
       const rowEls = fitBox.current?.querySelectorAll('.table tbody tr[data-clickable]') ?? [];
       const target = rowEls[Math.min(Math.max(index, 0), rowEls.length - 1)] ?? document.querySelector('.keys-search input, .keys-create');
       target?.focus({ preventScroll: false });
-    };
-    // Once now, and again after the dialog and the drawer have let go of it.
-    for (const delay of [0, 160, 360]) setTimeout(settle, delay);
+    }, 0);
   };
 
   const forget = (id) => {
@@ -391,7 +389,7 @@ export default function Keys() {
       header: 'Key',
       primary: true,
       sortable: true,
-      sortValue: (entry) => String(entry.name ?? '').trim() || entry.id,
+      sortValue: (entry) => entry.name || entry.id,
       render: (entry) => html`<${NameCell} entry=${entry} />`,
     },
     {
@@ -404,7 +402,7 @@ export default function Keys() {
           <${Switch}
             checked=${entry.enabled}
             disabled=${toggling.has(entry.id)}
-            aria-label=${`${String(entry.name ?? '').trim() || entry.id}: enabled`}
+            aria-label=${`${entry.name || entry.id}: enabled`}
             onChange=${(on) => toggle(entry, on)}
           />
           <span class="keys-switch-text" aria-hidden="true">${entry.enabled ? 'Enabled' : 'Disabled'}</span>
@@ -498,17 +496,18 @@ export default function Keys() {
       sortValue: (entry) => entry.usage?.last_used_at,
       render: (entry) => {
         const at = entry.usage?.last_used_at;
-        return at ? html`<span class="keys-when" title=${formatDateTime(at)}>${formatRelativeTime(at, now)}</span>` : html`<span class="faint" title="No request of this key is among the recent requests the gateway keeps in memory">${DASH}</span>`;
+        return at ? html`<span class="keys-when" title=${formatDateTime(at)}>${formatRelativeTime(at, now)}</span>` : html`<span class="faint" title="No request with this key on record in the last 30 days">${DASH}</span>`;
       },
     },
     {
       key: 'actions',
-      header: '',
+      header: html`<span class="sr-only">Actions</span>`,
+      label: 'Actions',
       hideOnPhone: true,
       align: 'right',
       render: (entry) => html`
         <${Menu}
-          label=${`Actions for ${String(entry.name ?? '').trim() || entry.id}`}
+          label=${`Actions for ${entry.name || entry.id}`}
           size="sm"
           items=${[
             { label: 'Edit', icon: 'edit', onSelect: () => openKey(entry.id) },
@@ -553,14 +552,36 @@ export default function Keys() {
   const sortShown = columns.some((column) => column.key === sort.key);
 
   const filtering = needle !== '' || show !== 'all';
-  const clearFilters = () => setQuery({ q: null, show: null, page: null });
+  // Some buttons go away with what they undo: "Clear filters" with the empty
+  // list, "Try again" with the error, "Sort by name" with its note. The
+  // keyboard carries on from what took their place, the list (or the header
+  // it is now sorted by), not from the top of the page.
+  const focusList = () => {
+    setTimeout(() => {
+      const active = document.activeElement;
+      if (active && active !== document.body && document.contains(active)) return;
+      (fitBox.current?.querySelector('.table tbody tr[data-clickable]') ?? document.querySelector('.keys-create'))?.focus();
+    }, 0);
+  };
+  const clearFilters = () => {
+    setQuery({ q: null, show: null, page: null });
+    focusList();
+  };
+  const sortByName = () => {
+    setQuery({ sort: null, page: null });
+    fitBox.current?.querySelector('.th-sort')?.focus();
+  };
+  const retry = async () => {
+    await keys.refresh();
+    focusList();
+  };
 
   useCommands(
     () => [
       { id: 'keys:create', label: 'Create client key', group: 'API keys', icon: 'plus', keywords: 'new add api key', run: () => setCreating(true) },
       ...all.slice(0, 100).map((entry) => ({
         id: `keys:${entry.id}`,
-        label: String(entry.name ?? '').trim() || entry.id,
+        label: entry.name || entry.id,
         group: 'API keys',
         icon: 'key',
         hint: entry.masked,
@@ -598,13 +619,13 @@ export default function Keys() {
       ${keys.error &&
       loaded &&
       html`
-        <${Notice} tone="caution" title="Could not refresh the keys" action=${html`<${Button} size="sm" icon="refresh" onClick=${keys.refresh}>Try again<//>`}>
-          ${keys.error.message} The list below is from ${formatTime(keys.updatedAt)}.
+        <${Notice} tone="caution" title="Could not refresh the keys" action=${html`<${Button} size="sm" icon="refresh" onClick=${retry}>Try again<//>`}>
+          ${sentence(keys.error.message)} The list below is from ${formatTime(keys.updatedAt)}.
         <//>
       `}
 
       ${failed
-        ? html`<${Panel} flush><${ErrorState} title="Could not load the keys" error=${keys.error} onRetry=${keys.refresh} /><//>`
+        ? html`<${Panel} flush><${ErrorState} title="Could not load the keys" error=${keys.error} onRetry=${retry} /><//>`
         : none
           ? html`
               <${Panel} flush>
@@ -643,7 +664,7 @@ export default function Keys() {
                   html`
                     <span class="keys-sortnote">
                       Sorted by ${sortColumn.header.toLowerCase()}, ${sort.dir === 'desc' ? 'highest first' : 'lowest first'}
-                      <${Button} size="sm" variant="ghost" onClick=${() => setQuery({ sort: null, page: null })}>Sort by name<//>
+                      <${Button} size="sm" variant="ghost" onClick=${sortByName}>Sort by name<//>
                     </span>
                   `}
                   <span class="keys-range">Usage over the last 30 days</span>
@@ -691,6 +712,7 @@ export default function Keys() {
         keys=${keys}
         models=${models}
         listen=${listen}
+        tls=${tls}
         authRequired=${authRequired}
         toggling=${toggling}
         onToggle=${toggle}
@@ -699,7 +721,7 @@ export default function Keys() {
         onClose=${closeKey}
       />
 
-      <${CreateKeyModal} open=${creating} onClose=${() => setCreating(false)} existing=${keys.data} models=${models} listen=${listen} onCreated=${onCreated} />
+      <${CreateKeyModal} open=${creating} onClose=${() => setCreating(false)} existing=${keys.data} models=${models} listen=${listen} tls=${tls} onCreated=${onCreated} />
     <//>
   `;
 }

@@ -17,9 +17,9 @@ import {
   TagInput,
 } from '../../components/index.js';
 import { api } from '../../lib/api.js';
-import { formatCompact, formatNumber, plural } from '../../lib/format.js';
+import { formatCompact, formatNumber, plural, sentence } from '../../lib/format.js';
 import { useAsync, useIsPhone } from '../../lib/hooks.js';
-import { EFFORT_LEVELS, blankModel, wildcardMatch } from './model.js';
+import { EFFORT_LEVELS, blankModel, hasCatalog, servesNothing, wildcardMatch } from './model.js';
 import { Disclosure, Section, ToggleChips, firstFieldOf, focusAfterRemoval, focusSoon } from './parts.js';
 
 const THINKING_MODES = [
@@ -156,10 +156,28 @@ function ModelRow({ row, index, phone, issues, path, forceOpen, onChange, onRemo
 
 const MAX_SHOWN = 150;
 
-function DiscoverPanel({ providerName, canFetch, dirty, draft, onAdd, onExclude }) {
+/**
+ * What to do about a model list that could not be fetched. The gateway's
+ * statuses for this request: 503 no usable credential to ask with, 504 the
+ * upstream did not answer in time, 502 the upstream failed or refused (its
+ * own words, secrets masked, are in the message).
+ */
+function fetchAdvice(error) {
+  if (error.status === 503) return 'Add a usable credential and save, then try again.';
+  if (error.status === 504) return 'Try again. If it keeps happening, check the base URL.';
+  if (error.status === 502) return 'If the base URL or a key is wrong, correct it and save before trying again.';
+  return 'Try again.';
+}
+
+function DiscoverPanel({ providerName, canFetch, dirty, draft, onAdd, onExclude, onFetched }) {
   const [filter, setFilter] = useState('');
   const fetchList = useAsync(() => api.post(`/providers/${encodeURIComponent(providerName)}/discover`, {}, { timeout: 60_000 }));
   const found = Array.isArray(fetchList.data?.models) ? fetchList.data.models : null;
+  // Either way the outcome is the provider's new model-list state: the page shows it.
+  const fetchNow = async () => {
+    await fetchList.run();
+    onFetched?.();
+  };
 
   const listed = new Set(draft.models.map((m) => m.id.trim()).filter(Boolean));
   const excluded = (id) => draft.exclude.some((pattern) => wildcardMatch(pattern, id));
@@ -183,7 +201,7 @@ function DiscoverPanel({ providerName, canFetch, dirty, draft, onAdd, onExclude 
               : 'Create the provider first. The list is fetched with its saved settings and credentials.'}
           </p>
         </div>
-        <${Button} icon="download" loading=${fetchList.loading} disabled=${!canFetch} onClick=${() => fetchList.run()}>Fetch model list<//>
+        <${Button} icon="download" loading=${fetchList.loading} disabled=${!canFetch} onClick=${fetchNow}>Fetch model list<//>
       </div>
 
       ${canFetch && dirty && !found && !fetchList.error && html`<p class="prov-note">Changes in this form are not used for the fetch until they are saved.</p>`}
@@ -192,8 +210,8 @@ function DiscoverPanel({ providerName, canFetch, dirty, draft, onAdd, onExclude 
       !fetchList.loading &&
       html`
         <${Notice} tone="stop" title="Could not fetch the model list">
-          <span class="prov-break">${fetchList.error.message}</span>
-          <span> ${fetchList.error.status === 503 ? 'Add a usable credential and save, then try again.' : 'Check the base URL and the credentials, save, then try again.'}</span>
+          <span class="prov-break">${sentence(fetchList.error.message)}</span>
+          <span> ${fetchAdvice(fetchList.error)}</span>
         <//>
       `}
 
@@ -254,8 +272,9 @@ function DiscoverPanel({ providerName, canFetch, dirty, draft, onAdd, onExclude 
  * paths                    row uid -> "models[2]" as last sent
  * hasIssueUnder(path)      whether any issue sits at or below a path
  * providerName             the saved name (null for a provider being created)
+ * onModelsFetched()        the upstream was asked for its model list (it answered or failed)
  */
-export default function ModelsSection({ draft, update, issues, paths, hasIssueUnder, providerName, dirty }) {
+export default function ModelsSection({ draft, update, issues, paths, hasIssueUnder, providerName, dirty, onModelsFetched }) {
   const phone = useIsPhone();
   const setModels = (fn) => update((d) => ({ models: fn(d.models) }));
   const changeRow = (uid, patch) => setModels((rows) => rows.map((r) => (r.uid === uid ? { ...r, ...patch } : r)));
@@ -280,6 +299,17 @@ export default function ModelsSection({ draft, update, issues, paths, hasIssueUn
   };
 
   const explicit = draft.models.filter((m) => m.id.trim()).length;
+  const mock = draft.kind === 'mock';
+  const catalog = hasCatalog(draft.kind);
+  const asks = 'Asks the provider for its model list when the gateway starts, when these settings change and on reload.';
+  const discoverHint =
+    explicit > 0
+      ? 'Not used while the explicit list below has entries: only those models are served.'
+      : mock
+        ? 'Not used by the mock provider: its models are built into the gateway.'
+        : catalog
+          ? `${asks} Off: the built-in catalog for the kind is used.`
+          : `${asks} This kind has no built-in catalog: off, only the explicit list below is served.`;
 
   return html`
     <${Section} id="prov-sec-models" title="Models" description="Which models this provider serves, and under which names clients ask for them.">
@@ -288,16 +318,17 @@ export default function ModelsSection({ draft, update, issues, paths, hasIssueUn
         checked=${draft.discover}
         onChange=${(v) => update({ discover: v })}
         error=${issues.at('discover')}
-        hint=${explicit > 0
-          ? 'Not used while the explicit list below has entries: only those models are served.'
-          : 'Asks the provider for its model list at start-up and on reload. Off: the built-in catalog for the kind is used.'}
+        warning=${servesNothing({ kind: draft.kind, discover: draft.discover, explicit })
+          ? 'With discovery off and no explicit models, this provider serves no models: this kind has no built-in catalog. Add the models below, or switch discovery on.'
+          : undefined}
+        hint=${discoverHint}
       />
 
       <div class="prov-list-block">
         <div class="prov-list-head">
           <div class="prov-section-text">
             <h4 class="prov-subtitle">Explicit models</h4>
-            <p class="prov-section-desc">Leave empty to serve what discovery or the catalog gives. An alias is the name clients use instead of the upstream id.</p>
+            <p class="prov-section-desc">${mock ? 'Leave empty to serve the built-in mock models.' : catalog ? 'Leave empty to serve what discovery or the catalog gives.' : 'Leave empty to serve what discovery finds.'} An alias is the name clients use instead of the upstream id.</p>
           </div>
         </div>
         ${draft.models.length > 0 &&
@@ -348,6 +379,7 @@ export default function ModelsSection({ draft, update, issues, paths, hasIssueUn
         draft=${draft}
         onAdd=${addFound}
         onExclude=${(id) => update((d) => ({ exclude: d.exclude.includes(id) ? d.exclude : [...d.exclude, id] }))}
+        onFetched=${onModelsFetched}
       />
     <//>
   `;

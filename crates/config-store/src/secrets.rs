@@ -200,6 +200,69 @@ fn looks_masked(value: &str) -> bool {
 
 const NO_COUNTERPART: &str = "is masked and does not match any stored secret; enter the full value";
 
+const AMBIGUOUS_MASK: &str = "is masked like several stored secrets that cannot be told apart, \
+     and not all of them were sent back, so which one this is cannot be known; enter the full \
+     value of the secret to keep";
+
+/// The masked fields whose stored secret cannot be known: `sent` are the
+/// incoming fields (value, label of the entry), `stored` the stored secrets
+/// they may stand for (secret, label), each in one list across the places a
+/// secret may move between.
+///
+/// Secrets of up to 11 characters all mask alike, and longer ones can too.
+/// Two stored secrets with the same mask are told apart by label only; with
+/// no label to go by, the fields that come back masked only say how many of
+/// them are kept, not which. As many fields as there are such secrets keep
+/// them all (in stored order where it is a question of order). Fewer fields
+/// — one of them was deleted — leave it open which secret went: rather than
+/// guess, and keep the very key the operator removed, every field of that
+/// mask is reported.
+///
+/// A field that came back in full, or masked with a label that names a
+/// stored entry of that mask, takes its secret out of the question first.
+fn ambiguous(sent: &[(&str, &str)], stored: &[(&str, &str)]) -> Vec<usize> {
+    let mut taken = vec![false; stored.len()];
+    let mut open: Vec<usize> = Vec::new();
+    for (i, (value, _)) in sent.iter().enumerate() {
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        if let Some(c) = (0..stored.len()).find(|&c| !taken[c] && same(stored[c].0, value)) {
+            taken[c] = true;
+        } else if looks_masked(value) {
+            open.push(i);
+        }
+    }
+    open.retain(|&i| {
+        let (value, name) = sent[i];
+        if name.trim().is_empty() {
+            return true;
+        }
+        let labelled = (0..stored.len()).find(|&c| {
+            !taken[c] && same(stored[c].1, name) && mask_value(stored[c].0) == value.trim()
+        });
+        if let Some(c) = labelled {
+            taken[c] = true;
+        }
+        labelled.is_none()
+    });
+    open.iter()
+        .copied()
+        .filter(|&i| {
+            let mask = sent[i].0.trim();
+            let fields = open.iter().filter(|&&j| sent[j].0.trim() == mask).count();
+            let mut secrets: Vec<&str> = (0..stored.len())
+                .filter(|&c| !taken[c] && mask_value(stored[c].0) == mask)
+                .map(|c| stored[c].0.trim())
+                .collect();
+            secrets.sort_unstable();
+            secrets.dedup();
+            secrets.len() > fields
+        })
+        .collect()
+}
+
 /// A secret field of the incoming configuration.
 struct Slot<'a> {
     value: &'a mut String,
@@ -240,15 +303,26 @@ fn only(count: usize, matches: impl Fn(usize) -> bool) -> Option<usize> {
 /// to sit where that secret used to be; otherwise deleting or moving an entry
 /// would hand its secret to a neighbour that never had one.
 ///
+/// `claimed` (one flag per entry of `own`) and `other_claimed` (one per entry
+/// of `other`) say which stored secrets are already taken. They are shared
+/// with the restore of the sibling list, so that a secret one list took —
+/// kept in place, or moved over from the sibling — is never handed out a
+/// second time by the other.
+///
 /// Returns the indices of masked slots that matched nothing.
-fn restore(slots: &mut [Slot<'_>], own: &[Candidate<'_>], other: &[&str]) -> Vec<usize> {
+fn restore(
+    slots: &mut [Slot<'_>],
+    own: &[Candidate<'_>],
+    claimed: &mut [bool],
+    other: &[&str],
+    other_claimed: &mut [bool],
+) -> Vec<usize> {
     #[derive(Clone, Copy, PartialEq)]
     enum Need {
         Nothing,
         Empty,
         Masked,
     }
-    let mut claimed = vec![false; own.len()];
     let masks: Vec<String> = own.iter().map(|c| mask_value(c.secret)).collect();
 
     // A secret that came back in full keeps its own entry, so that an empty
@@ -288,14 +362,14 @@ fn restore(slots: &mut [Slot<'_>], own: &[Candidate<'_>], other: &[&str]) -> Vec
             !claimed[c] && same(own[c].name, slot.name) && masks[c] == slot.value.trim()
         });
         if let Some(c) = found {
-            assign(slot, need, c, &mut claimed);
+            assign(slot, need, c, claimed);
         }
     }
 
     // 2. Same position and mask.
     for (i, (slot, need)) in slots.iter_mut().zip(needs.iter_mut()).enumerate() {
         if *need == Need::Masked && i < own.len() && !claimed[i] && masks[i] == slot.value.trim() {
-            assign(slot, need, i, &mut claimed);
+            assign(slot, need, i, claimed);
         }
     }
 
@@ -305,13 +379,12 @@ fn restore(slots: &mut [Slot<'_>], own: &[Candidate<'_>], other: &[&str]) -> Vec
             continue;
         }
         if let Some(c) = (0..own.len()).find(|&c| !claimed[c] && masks[c] == slot.value.trim()) {
-            assign(slot, need, c, &mut claimed);
+            assign(slot, need, c, claimed);
         }
     }
 
     // 4. Same mask in the sibling list: the entry changed its form
     //    (`api_keys` shorthand <-> `credentials` entry).
-    let mut other_claimed = vec![false; other.len()];
     for (slot, need) in slots.iter_mut().zip(needs.iter_mut()) {
         if *need != Need::Masked {
             continue;
@@ -366,7 +439,7 @@ fn restore(slots: &mut [Slot<'_>], own: &[Candidate<'_>], other: &[&str]) -> Vec
             && !claimed[c]
             && same(own[c].anchor, slot.anchor)
         {
-            assign(slot, need, c, &mut claimed);
+            assign(slot, need, c, claimed);
         }
     }
 
@@ -379,7 +452,7 @@ fn restore(slots: &mut [Slot<'_>], own: &[Candidate<'_>], other: &[&str]) -> Vec
         }
         let spoken_for = (0..slots.len()).any(|j| j != i && partners[j] == Some(i));
         if same(own[i].anchor, slots[i].anchor) && !spoken_for {
-            assign(&mut slots[i], &mut needs[i], i, &mut claimed);
+            assign(&mut slots[i], &mut needs[i], i, claimed);
         }
     }
 
@@ -476,12 +549,17 @@ fn stored_credential<'a>(
 /// * a password in a provider's `base_url` — that of the same provider.
 ///
 /// Limits that follow from the protocol: secrets of up to 11 characters all
-/// mask alike, so two short keys in one list can only be told apart by label
-/// or position; and an empty field cannot say "delete this secret" — remove
-/// the entry instead.
+/// mask alike, so two keys of one provider (or two client keys) with the
+/// same mask can only be told apart by label. Without one, sending all of
+/// them back keeps all of them, in stored order — their order cannot be
+/// changed through masks — and sending fewer back than are stored (one was
+/// deleted) is reported, because which one was deleted cannot be known
+/// (see [`ambiguous`]). An empty field cannot say "delete this secret" —
+/// remove the entry instead.
 ///
-/// A masked value that matches no stored secret cannot be resolved; each one
-/// is reported as an issue and `update` should then be discarded.
+/// A masked value that matches no stored secret, or one of several that
+/// cannot be told apart, cannot be resolved; each one is reported as an
+/// issue and `update` should then be discarded.
 pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<ConfigIssue>> {
     let mut issues = Vec::new();
     let mut issue = |path: String| {
@@ -490,6 +568,9 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
             message: NO_COUNTERPART.to_string(),
         });
     };
+    // Masked fields that stand for one of several stored secrets which
+    // cannot be told apart (see [`ambiguous`]).
+    let mut ambiguous_paths: Vec<String> = Vec::new();
 
     if !restore_single(&mut update.admin.secret, Some(&current.admin.secret)) {
         issue("admin.secret".to_string());
@@ -525,7 +606,13 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
                 anchor: "",
             })
             .collect();
-        for i in restore(&mut slots, &own, &[]) {
+        let sent: Vec<(&str, &str)> = slots.iter().map(|s| (&**s.value, s.name)).collect();
+        let kept: Vec<(&str, &str)> = own.iter().map(|c| (c.secret, c.name)).collect();
+        for i in ambiguous(&sent, &kept) {
+            ambiguous_paths.push(format!("auth.keys[{i}].key"));
+        }
+        let mut claimed = vec![false; own.len()];
+        for i in restore(&mut slots, &own, &mut claimed, &[], &mut []) {
             issue(format!("auth.keys[{i}].key"));
         }
     }
@@ -565,6 +652,36 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
         let stored_credential_keys: Vec<&str> =
             stored_credentials.iter().map(|c| c.secret).collect();
 
+        // Both lists at once: a key may have moved from one to the other.
+        {
+            let sent: Vec<(&str, &str)> = provider
+                .api_keys
+                .iter()
+                .map(|k| (k.as_str(), ""))
+                .chain(
+                    provider
+                        .credentials
+                        .iter()
+                        .map(|c| (c.api_key.as_str(), c.label.as_str())),
+                )
+                .collect();
+            let kept: Vec<(&str, &str)> = stored_keys
+                .iter()
+                .map(|k| (*k, ""))
+                .chain(stored_credentials.iter().map(|c| (c.secret, c.name)))
+                .collect();
+            let shorthand = provider.api_keys.len();
+            for slot in ambiguous(&sent, &kept) {
+                ambiguous_paths.push(if slot < shorthand {
+                    format!("providers[{i}].api_keys[{slot}]")
+                } else {
+                    format!("providers[{i}].credentials[{}].api_key", slot - shorthand)
+                });
+            }
+        }
+
+        let mut keys_claimed = vec![false; stored_keys.len()];
+        let mut credentials_claimed = vec![false; stored_credentials.len()];
         {
             let own: Vec<Candidate<'_>> = stored_keys
                 .iter()
@@ -583,7 +700,13 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
                     anchor: "",
                 })
                 .collect();
-            for j in restore(&mut slots, &own, &stored_credential_keys) {
+            for j in restore(
+                &mut slots,
+                &own,
+                &mut keys_claimed,
+                &stored_credential_keys,
+                &mut credentials_claimed,
+            ) {
                 issue(format!("providers[{i}].api_keys[{j}]"));
             }
         }
@@ -597,7 +720,13 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
                     anchor: &c.service_account_file,
                 })
                 .collect();
-            for j in restore(&mut slots, &stored_credentials, &stored_keys) {
+            for j in restore(
+                &mut slots,
+                &stored_credentials,
+                &mut credentials_claimed,
+                &stored_keys,
+                &mut keys_claimed,
+            ) {
                 issue(format!("providers[{i}].credentials[{j}].api_key"));
             }
         }
@@ -642,6 +771,10 @@ pub fn unmask_into(update: &mut Config, current: &Config) -> Result<(), Vec<Conf
         }
     }
 
+    issues.extend(ambiguous_paths.into_iter().map(|path| ConfigIssue {
+        path,
+        message: AMBIGUOUS_MASK.to_string(),
+    }));
     if issues.is_empty() {
         Ok(())
     } else {
@@ -1023,6 +1156,96 @@ mod tests {
         let issues = unmask_into(&mut update, &config).unwrap_err();
         assert_eq!(issues.len(), 1);
         assert_eq!(issues[0].path, "providers[0].api_keys[2]");
+    }
+
+    /// Regression (CFG-1): two short keys both show as `••••••••`. Deleting
+    /// the first one sent back one mask, which was resolved by position to
+    /// the key the operator had removed; and giving the second one a label
+    /// (which moves it to `credentials`) resolved both masks to the first
+    /// key, refused as "the same key is listed twice".
+    #[test]
+    fn keys_with_the_same_mask_are_never_mixed_up() {
+        let stored = |keys: &[&str]| {
+            let mut p = ProviderConfig::new("local-vllm", ProviderKind::OpenaiCompat);
+            p.base_url = "http://127.0.0.1:1/v1".to_string();
+            p.api_keys = keys.iter().map(|k| k.to_string()).collect();
+            Config {
+                providers: vec![p],
+                ..Config::default()
+            }
+        };
+        let config = stored(&["old-leaked", "new-good"]);
+        let masked = mask_config(&config);
+        let mask = masked.providers[0].api_keys[0].clone();
+        assert_eq!(mask, masked.providers[0].api_keys[1]);
+
+        // One of the two deleted: which one cannot be known, so nothing is
+        // guessed.
+        let mut update = masked.clone();
+        update.providers[0].api_keys.remove(0);
+        let issues = unmask_into(&mut update, &config).unwrap_err();
+        assert_eq!(issues.len(), 1, "{issues:?}");
+        assert_eq!(issues[0].path, "providers[0].api_keys[0]");
+        assert_eq!(issues[0].message, AMBIGUOUS_MASK);
+        assert!(!issues[0].message.contains("new-good"));
+        // The key to keep typed in full says it.
+        let mut update = masked.clone();
+        update.providers[0].api_keys = vec!["new-good".to_string()];
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update.providers[0].api_keys, ["new-good"]);
+        // So does keeping one in full and the other masked.
+        let mut update = masked.clone();
+        update.providers[0].api_keys = vec![mask.clone(), "new-good".to_string()];
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update.providers[0].api_keys, ["old-leaked", "new-good"]);
+        // Both deleted: nothing to resolve.
+        let mut update = masked.clone();
+        update.providers[0].api_keys.clear();
+        update.providers[0]
+            .api_keys
+            .push("sk-a-brand-new-one".to_string());
+        unmask_into(&mut update, &config).unwrap();
+
+        // Unchanged, both masks come back: both keys kept, in their order.
+        let mut update = masked.clone();
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update, config);
+
+        // The second key gets a label: it becomes a `credentials` entry and
+        // keeps its own key; the first stays where it was.
+        let config = stored(&["k-one", "k-two"]);
+        let masked = mask_config(&config);
+        let mut update = masked.clone();
+        let second = update.providers[0].api_keys.remove(1);
+        update.providers[0]
+            .credentials
+            .push(credential(&second, "second"));
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update.providers[0].api_keys, ["k-one"]);
+        assert_eq!(update.providers[0].credentials[0].api_key, "k-two");
+        assert!(update.validate().is_empty(), "{:?}", update.validate());
+
+        // Labels tell such keys apart, whatever is deleted or moved.
+        let mut config = stored(&[]);
+        config.providers[0].credentials =
+            vec![credential("lab-a", "first"), credential("lab-b", "second")];
+        let mut update = mask_config(&config);
+        update.providers[0].credentials.remove(0);
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update.providers[0].credentials[0].api_key, "lab-b");
+        let mut update = mask_config(&config);
+        update.providers[0].credentials.swap(0, 1);
+        unmask_into(&mut update, &config).unwrap();
+        assert_eq!(update.providers[0].credentials[0].api_key, "lab-b");
+        assert_eq!(update.providers[0].credentials[1].api_key, "lab-a");
+
+        // Client keys follow the same rule.
+        let mut config = Config::default();
+        config.auth.keys = vec![client("short-1", ""), client("short-2", "")];
+        let mut update = mask_config(&config);
+        update.auth.keys.remove(1);
+        let issues = unmask_into(&mut update, &config).unwrap_err();
+        assert_eq!(issues[0].path, "auth.keys[0].key");
     }
 
     #[test]

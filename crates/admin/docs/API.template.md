@@ -139,7 +139,10 @@ provider headers whose name looks like a credential (`Authorization`,
 In an update, a secret field that is **empty** or **equal to the mask it was
 shown as** means "keep the stored value"; anything else replaces it. A mask
 that matches no stored secret is refused with `422` (it would otherwise be
-saved as the key). The dashboard can therefore send back what it was shown.
+saved as the key), and so is one that could stand for several stored
+secrets which cannot be told apart (see
+[`PUT /providers/{name}`](#put-providersname)). The dashboard can therefore
+send back what it was shown.
 Two exceptions, both about removing a provider's key:
 
 * an empty row in a provider's `api_keys` list is a *removed* key, not a
@@ -182,6 +185,11 @@ is not refused); `issues` lists what is wrong with the file, by its place in
 the file. A mutation that changes nothing is not refused. Once the file is
 valid again — equal to the configuration in effect, or a new valid one —
 this is announced with `config.reloaded` (`ok: true`) and edits work again.
+A file the gateway has refused (the watcher's verdict, announced with
+`config.reloaded` `ok: false`, or a refused `POST /reload`) is also
+reported by `config_rejected` and `warnings` of [`GET /status`](#get-status)
+and by `config_rejected` of `GET /config`, for as long as it lasts, so a
+page loaded later knows too.
 
 A settings patch while the file ends in a half-typed provider entry:
 
@@ -282,8 +290,10 @@ says.
 | `config_path`, `data_dir` | Absolute paths of the configuration file and the data directory (`null` when there is none). |
 | `listen` | The address the server is really bound to — also when `--host` / `--port` on the command line override the file — or `null` when unknown. It may be a wildcard (`0.0.0.0:8317`). |
 | `tls` | Whether that listener serves HTTPS (`server.tls` was set when it was bound): the scheme to put in front of `listen`. |
-| `restart_required` | Settings that were changed since start and only take effect after a restart: any of `server.host`, `server.port`, `server.tls`, `server.data_dir`. |
-| `warnings` | Problems that do not make the configuration invalid: credentials whose secret cannot be resolved or whose service-account file cannot be used, alias targets that match no model, shadowed names. Plain sentences. |
+| `restart_required` | Settings that were changed since start and only take effect after a restart: any of `server.host`, `server.port`, `server.tls`, `server.data_dir` — except those in `command_line_overrides`, which a restart with the same command line does not apply. |
+| `command_line_overrides` | Settings the command line fixes whatever the file says: `server.host` when the gateway was started with `--host`, `server.port` with `--port`. The file's value of such a setting can be changed and is saved, but neither now nor after a restart with the same command line does it take effect; `listen` says what is in use. `[]` without such flags. |
+| `config_rejected` | `null` while the file on disk is in effect. When the gateway refused the file — a hand edit that does not validate, picked up by the file watcher or by `POST /reload` — `{"at", "message", "issues"}`: when (Unix ms), a sentence that says so and quotes the first issues, and every issue of the file (by its place in the file). It stays set for as long as the file holds that content, also across page loads, and goes back to `null` once the file is valid again (fixed, restored, or replaced with `PUT /config/raw`). Meanwhile the previous configuration stays in effect and every edit that would change the file is refused with `409` (see [Configuration edits](#configuration-edits)). |
+| `warnings` | Problems that need the operator's attention, as plain sentences: first, while `config_rejected` is set, its `message` (it starts with `configuration file:`); then problems that do not make the configuration invalid — credentials whose secret cannot be resolved or whose service-account file cannot be used, alias targets that match no model, shadowed names. |
 | `counts.providers`, `counts.client_keys` | Entries in the configuration (disabled providers included). |
 | `counts.credentials`, `counts.credentials_ready` | Upstream credentials in service, and those of them with status `ready`. The credentials of a provider with `enabled = false` are in neither number. |
 | `counts.models` | Client-facing names a request can be routed by: the entries of [`GET /models`](#get-models) that are not `ignored`. Names hidden from client listings count (they are routable); an alias without a routable target does not. |
@@ -291,6 +301,11 @@ says.
 | `admin.allow_remote` | Whether remote peers are admitted (configuration or environment). |
 | `admin.remote` | Whether *this* request counted as remote. |
 | `auth_required` | `auth.required`: whether the client API demands a key. |
+
+The same while the file on disk ends in a provider entry that does not
+validate (refused by `POST /reload` here):
+
+{{example:status_file_refused}}
 
 ### `POST /ws-ticket`
 
@@ -306,8 +321,11 @@ outstanding; beyond that the one closest to expiry is dropped.
 
 ### `GET /config`
 
-The live configuration with every secret masked, the file's path and the
-settings waiting for a restart. `config` is the configuration schema of
+The live configuration with every secret masked, the file's path, the
+settings waiting for a restart, and — as in [`GET /status`](#get-status) —
+`command_line_overrides` and `config_rejected` (the file on disk, while the
+gateway refuses it). Every mutation that returns the whole configuration
+answers in this shape. `config` is the configuration schema of
 `switchyard.toml` as JSON; sections and fields at their default *are*
 present for the scalar sections (`server` … `usage`), while empty lists
 (`providers`, `aliases`, `pricing`, `auth.keys`), an empty `payload` and
@@ -315,7 +333,10 @@ per-entry defaults are omitted, as in the file.
 
 It is the *file's* configuration: `server.host` and `server.port` are what
 the file says, also while `--host` / `--port` on the command line override
-them. The address in use is `listen` in [`GET /status`](#get-status).
+them. The address in use is `listen` in [`GET /status`](#get-status). Such
+an overridden setting is named in `command_line_overrides`; changing it in
+the file is saved but is not listed in `restart_required`, since a restart
+with the same command line keeps the command line's value.
 
 {{example:config_get}}
 
@@ -547,6 +568,17 @@ to its default.
   `api_keys` and `credentials` — new values replace, references stay as
   written. An emptied `credentials[].api_key` keeps the stored key; a blank
   `api_keys` row is dropped.
+* **Keys that mask alike.** Keys of up to 11 characters all show as
+  `••••••••` (and longer ones can share a mask too), so a mask alone does
+  not say which of them it stands for; a `label` does. Without labels:
+  sending back as many such masks as there are stored keys keeps them all,
+  in their stored order — their order cannot be changed by moving masks
+  around, and moving one of them to `credentials` (to give it a label)
+  keeps each key where its row was. Sending back **fewer** (one was
+  deleted) is refused with `422` on those fields ("is masked like several
+  stored secrets that cannot be told apart …"), because which key was
+  deleted cannot be known and guessing could keep the very key that was
+  removed. Send the keys to keep in full (or give the keys labels first).
 * **A credential without a key:** `"api_key": null` in a `credentials[]`
   entry. An empty or absent `api_key` keeps the key stored for the
   credential with the same `service_account_file`, else the same `label`,
@@ -770,6 +802,12 @@ set), `filter` (remove). A rule:
 | `provider` | Only for this provider; `""` for any. |
 | `set` | `default` / `override` rules: dotted path → JSON value (`messages.0.role`; `\.` for a literal dot). Required there. |
 | `remove` | `filter` rules: dotted paths to delete. Required there. |
+
+Rules apply to the built-in `mock` provider too, so a rule can be tried out
+before a real provider exists: the mock speaks whatever protocol the client
+speaks, so its "upstream request" is in the client's layout, and the
+captured `upstream_request` of the [request record](#get-requestsid) shows
+the request the mock answered, rules applied.
 
 `PUT` replaces all three lists with the body, an object
 `{default?, override?, filter?}` whose rules may leave out `protocol`,
@@ -1336,7 +1374,7 @@ All under `/admin/api`.
 | `POST` | `/login` | ignored | `{"ok": true}` |
 | `POST` | `/ws-ticket` | ignored | `{"ticket", "expires_in"}` |
 | `GET` | `/ws?ticket=` | – | WebSocket |
-| `GET` | `/config` | – | `{"config", "path", "restart_required"}` |
+| `GET` | `/config` | – | `{"config", "path", "restart_required", "command_line_overrides", "config_rejected"}` |
 | `GET` | `/config/raw` | – | `{"text", "path", "modified_at"}` |
 | `PUT` | `/config/raw` | `{"text"}` | as `GET /config` |
 | `POST` | `/config/validate` | `{"text"}` | `{"ok", "issues"}` |

@@ -4,7 +4,7 @@
 import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { BarChart, ErrorState, KeyValue, LatencyBars, Panel, Skeleton } from '../../components/index.js';
 import { formatCompact, formatCurrency, formatDuration, formatNumber, formatTokens } from '../../lib/format.js';
-import { alignedFormats, bucketAxis, bucketWords, countAxisMax, errorSeries, groupSeries, stackMax, tokenSeries } from './data.js';
+import { alignedFormats, bucketAxis, bucketWords, errorSeries, groupSeries, stackMax, tokenSeries } from './data.js';
 
 const REQUESTS_HEIGHT = 240;
 const ERRORS_HEIGHT = 120;
@@ -90,8 +90,8 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
   const words = bucketWords(timeseries.bucket);
 
   const shaped = useMemo(() => {
-    // Day buckets are UTC days and are labelled as such; see bucketAxis.
-    const { x, xFormat } = bucketAxis(timeseries);
+    // Day buckets are UTC days and are printed as such; see bucketAxis.
+    const axis = bucketAxis(timeseries);
     const requests = groupSeries(points, slots, 'requests', rest);
     const errors = errorSeries(points);
     const tokens = tokenSeries(points);
@@ -101,18 +101,15 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
       { max: requestsMax, height: REQUESTS_HEIGHT, format: formatCompact },
       { max: errorsMax, height: ERRORS_HEIGHT, format: formatCompact },
     ]);
+    // Requests, failures and tokens are whole things: their charts are drawn
+    // with `integer`, so no axis reads "0.5".
     return {
-      x,
-      xFormat,
+      axis,
       requests,
       errors,
       requestsAxis,
       errorsAxis,
-      // Requests and tokens are whole things: no "0.5" on their axes.
-      requestsTop: countAxisMax(requestsMax, REQUESTS_HEIGHT),
-      errorsTop: countAxisMax(errorsMax, ERRORS_HEIGHT),
       tokens,
-      tokensTop: countAxisMax(stackMax(tokens), SIDE_HEIGHT),
       cost: showCost ? groupSeries(points, slots, 'cost', rest) : [],
     };
   }, [timeseries, slots, rest, showCost]);
@@ -125,11 +122,10 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
       <${Panel} title="Requests over time" description=${`Stacked ${by}, ${words.per}`}>
         <div class="stack" style="--gap:var(--space-4)">
           <${BarChart}
-            x=${shaped.x}
-            xFormat=${shaped.xFormat}
+            ...${shaped.axis}
             series=${shaped.requests}
             height=${REQUESTS_HEIGHT}
-            yMax=${shaped.requestsTop}
+            integer
             yFormat=${shaped.requestsAxis}
             valueFormat=${formatNumber}
             xLabel=${words.column}
@@ -140,11 +136,10 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
           <div class="usage-sub">
             <h3 class="plate-label">Failed requests</h3>
             <${BarChart}
-              x=${shaped.x}
-              xFormat=${shaped.xFormat}
+              ...${shaped.axis}
               series=${shaped.errors}
               height=${ERRORS_HEIGHT}
-              yMax=${shaped.errorsTop}
+              integer
               yFormat=${shaped.errorsAxis}
               valueFormat=${formatNumber}
               xLabel=${words.column}
@@ -160,11 +155,10 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
     <div class=${showCost ? 'grid-2' : 'stack'}>
       <${Panel} title="Tokens over time" description=${`Stacked by kind, ${words.per}`}>
         <${BarChart}
-          x=${shaped.x}
-          xFormat=${shaped.xFormat}
+          ...${shaped.axis}
           series=${shaped.tokens}
           height=${SIDE_HEIGHT}
-          yMax=${shaped.tokensTop}
+          integer
           yFormat=${formatTokens}
           valueFormat=${formatNumber}
           xLabel=${words.column}
@@ -177,8 +171,7 @@ export default function UsageCharts({ timeseries, group, slots, rest, range, sho
       html`
         <${Panel} title="Estimated cost over time" description=${`Stacked ${by}, ${words.per}`}>
           <${BarChart}
-            x=${shaped.x}
-            xFormat=${shaped.xFormat}
+            ...${shaped.axis}
             series=${shaped.cost}
             height=${SIDE_HEIGHT}
             yFormat=${formatCurrency}

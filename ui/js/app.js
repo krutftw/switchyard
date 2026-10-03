@@ -7,7 +7,7 @@
 // The auth store lives in lib/api.js; any request that gets a 401 flips it
 // back to "anonymous", which brings the sign-in page back with a reason.
 
-import { html, render, useEffect, useState } from '../vendor/preact-htm.js';
+import { html, render, useEffect, useRef, useState } from '../vendor/preact-htm.js';
 import { Button, Spinner } from './components/button.js';
 import { LogoMark } from './components/icons.js';
 import { Notice } from './components/surface.js';
@@ -64,6 +64,11 @@ function App() {
   const { status } = useStore(auth);
   const [bootError, setBootError] = useState(null);
   const [attempt, setAttempt] = useState(0);
+  // Something the user could work in (the sign-in form, the boot error with
+  // its buttons) has been on screen: when the shell replaces it, the focused
+  // control goes with it, and the shell takes the focus.
+  const handOff = useRef(false);
+  if (status === 'anonymous' || bootError) handOff.current = true;
 
   // A stored secret is checked once at start. A gateway that cannot be
   // reached is not a reason to throw the secret away: offer a retry.
@@ -73,7 +78,7 @@ function App() {
     api.resume().catch((error) => setBootError(error));
   }, [attempt]);
 
-  if (status === 'authenticated') return html`<${Shell} />`;
+  if (status === 'authenticated') return html`<${Shell} takeFocus=${handOff.current} />`;
   if (status === 'anonymous') return html`<${SignIn} />`;
 
   if (bootError) {
@@ -84,7 +89,7 @@ function App() {
         <//>
         <div class="btn-group">
           <${Button} variant="primary" icon="refresh" onClick=${() => setAttempt((n) => n + 1)}>Try again<//>
-          <${Button} onClick=${() => api.logout()}>Use a different secret<//>
+          <${Button} onClick=${() => api.logout({ allTabs: false })}>Use a different secret<//>
         </div>
       <//>
     `;

@@ -67,6 +67,30 @@ export const EFFORTS = ['default', 'none', 'low', 'medium', 'high'];
 /** Token budgets the gateway itself uses for the named efforts. */
 export const EFFORT_BUDGET = { low: 1024, medium: 8192, high: 24576 };
 
+/** "model(high)" -> ["model", "high"]: the reasoning suffix the gateway splits off a model name. */
+export const splitSuffix = (name) => /^(.+)\(([^()]*)\)$/.exec(String(name ?? ''))?.slice(1) ?? null;
+
+const SUFFIX_LEVELS = ['minimal', 'low', 'medium', 'high', 'xhigh', 'max'];
+
+/**
+ * What the gateway makes of the text in a reasoning suffix, the way
+ * crates/core/src/reasoning.rs reads it (case and surrounding spaces do not
+ * matter): 'level' (an effort name), 'off' (none, off, disabled, 0), 'auto'
+ * (auto, dynamic, -1), 'budget' (a positive number of tokens), or null when
+ * it is none of these: the gateway then drops the suffix and applies nothing.
+ */
+export function suffixKind(raw) {
+  const word = String(raw ?? '').trim().toLowerCase();
+  if (SUFFIX_LEVELS.includes(word)) return 'level';
+  if (word === 'none' || word === 'off' || word === 'disabled') return 'off';
+  if (word === 'auto' || word === 'dynamic') return 'auto';
+  if (!/^[+-]?\d+$/.test(word)) return null;
+  const budget = Number(word);
+  if (budget === 0) return 'off';
+  if (budget === -1) return 'auto';
+  return budget > 0 ? 'budget' : null;
+}
+
 /** Anthropic requires max_tokens; this is what is sent when the field is empty. */
 export function anthropicMaxTokens(settings) {
   if (settings.maxTokens != null) return settings.maxTokens;
@@ -547,10 +571,14 @@ export function readUsage(protocol, usage) {
 /**
  * The error inside any of the bodies the playground can get back: the four
  * protocols' own shapes, their in-stream error frames, and the admin API's
- * envelope. Returns { message, type, code, status, issues }.
+ * envelope. Returns { message, type, code, status, issues, retryAfter }.
+ *
+ * `retryAfter` (seconds, or null) is read from `error.headers`, where the
+ * Responses WebSocket puts a retry-after it has no response header for. An
+ * HTTP answer carries it as a real header instead (see run.js).
  */
 export function readError(json, status = 0) {
-  const out = { message: '', type: null, code: null, status: status || 0, issues: [] };
+  const out = { message: '', type: null, code: null, status: status || 0, issues: [], retryAfter: null };
   if (typeof json === 'string') {
     out.message = json;
     return out;
@@ -563,9 +591,17 @@ export function readError(json, status = 0) {
     else if (typeof err.status === 'string') out.type = err.status;
     if (typeof err.code === 'string') out.code = err.code;
     else if (typeof err.code === 'number' && !out.status) out.status = err.code;
+    // Gemini's code is the HTTP status; the reason is in details (ErrorInfo): MODEL_NOT_FOUND, MODEL_COOLDOWN.
+    if (!out.code && Array.isArray(err.details)) {
+      const reason = err.details.find((d) => isObject(d) && typeof d.reason === 'string' && d.reason !== '')?.reason;
+      if (reason) out.code = reason;
+    }
     if (Array.isArray(err.issues)) {
       out.issues = err.issues.filter((i) => i && typeof i.message === 'string').map((i) => ({ path: typeof i.path === 'string' ? i.path : '', message: i.message }));
     }
+    // A header value: a string of seconds ("7"). Anything else is not a wait.
+    const wait = isObject(err.headers) ? err.headers['retry-after'] : undefined;
+    if ((typeof wait === 'string' && /^\s*\d+(\.\d+)?\s*$/.test(wait)) || (typeof wait === 'number' && Number.isFinite(wait) && wait >= 0)) out.retryAfter = Number(wait);
   } else if (typeof json.error === 'string') {
     out.message = json.error;
   } else {
@@ -576,20 +612,48 @@ export function readError(json, status = 0) {
   return out;
 }
 
+/**
+ * The gateway's refusals that are about its own credential at the provider
+ * (crates/gateway/src/failover.rs). Chat and Responses carry the code,
+ * Gemini carries it upper case as the reason in error.details, and an
+ * Anthropic error has no code at all: there only the gateway's own wording
+ * tells them apart from any other upstream failure.
+ */
+const UPSTREAM_CREDENTIAL = {
+  upstream_auth_error: /^the upstream provider rejected the gateway's credential/i,
+  upstream_permission_denied: /^the upstream provider does not let the gateway's credential serve this request/i,
+};
+
+function credentialRefusal({ code, message }) {
+  const named = typeof code === 'string' ? code.toLowerCase() : null;
+  if (named && named in UPSTREAM_CREDENTIAL) return named;
+  const text = typeof message === 'string' ? message.trim() : '';
+  return Object.keys(UPSTREAM_CREDENTIAL).find((name) => UPSTREAM_CREDENTIAL[name].test(text)) ?? null;
+}
+
 /** What to do about an error, in one sentence. */
 export function adviceFor(error) {
   const { status, code } = error;
+  // On the WebSocket there is no inspector and no "send again": the turn is
+  // one frame in the frame list, and the request log has its record.
+  const socket = error.via === 'socket';
   if (error.kind === 'network') return 'Check that Switchyard is running and that this device can reach it, then send again.';
+  if (code === 'previous_response_not_found') {
+    return 'A socket can only be continued from its latest response, and this one does not have the response that was named. The next turn is sent without previous_response_id and starts a new conversation.';
+  }
+  if (code === 'websocket_queue_full') return 'Wait for the response in progress to finish, then send the turn again.';
   if (code === 'model_not_found' || code === 'MODEL_NOT_FOUND') return 'Choose a model from the list, or add a provider that serves this one.';
-  if (code === 'model_cooldown' || /cooling down/.test(error.message ?? '')) return 'Every credential for this model is resting. Wait for the cooldown, or reset it on the Providers page.';
-  if (code === 'upstream_auth_error') return "The provider did not accept the gateway's credential. Check the provider's API key on the Providers page.";
-  if (status === 429) return 'The upstream rate limit was reached. Wait, then send again.';
+  if (code === 'model_cooldown' || code === 'MODEL_COOLDOWN' || /cooling down/.test(error.message ?? '')) return 'Every credential for this model is resting. Wait for the cooldown, or reset it on the Providers page.';
+  const credential = credentialRefusal(error);
+  if (credential === 'upstream_auth_error') return "The provider did not accept the gateway's credential. Check the provider's API key on the Providers page.";
+  if (credential === 'upstream_permission_denied') return "The provider's credential is not allowed to serve this request. Check the provider's API key and its access to this model on the Providers page.";
+  if (status === 429) return socket ? 'The upstream rate limit was reached. Wait, then connect and send the turn again.' : 'The upstream rate limit was reached. Wait, then send again.';
   if (status === 413) return 'The body is larger than server.body_limit_mb allows. Shorten it, or raise the limit in Settings.';
-  if (status === 400 || status === 422) return 'Check the request body in the inspector, then send again.';
-  if (status === 404) return 'Check the model name and the protocol, then send again.';
-  if (status === 401 || status === 403) return 'The gateway refused the dashboard session. Sign in again.';
-  if (status >= 500) return 'The upstream provider failed. Open the request to see every attempt, or send again.';
-  return 'Open the request for the details, or send again.';
+  if (status === 400 || status === 422) return socket ? 'Check the frame that was sent, in the frame list, then send the turn again.' : 'Check the request body in the inspector, then send again.';
+  if (status === 404) return socket ? 'Check the model name, then send the turn again.' : 'Check the model name and the protocol, then send again.';
+  if (status === 401 || status === 403) return socket ? 'The gateway refused the client key for this model. Check what the key allows on the API keys page.' : 'The gateway refused the dashboard session. Sign in again.';
+  if (status >= 500) return socket ? 'The upstream provider failed. The request log shows every attempt.' : 'The upstream provider failed. Open the request to see every attempt, or send again.';
+  return socket ? 'The request log has the details.' : 'Open the request for the details, or send again.';
 }
 
 // ---------------------------------------------------------------------------

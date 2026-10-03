@@ -7,6 +7,7 @@ use http::{Method, StatusCode};
 use pretty_assertions::assert_eq;
 use serde_json::{Value, json};
 use support::{App, BASE, CLIENT_KEY, SECRET, read};
+use switchyard_admin::AdminOptions;
 use switchyard_gateway::Gateway;
 
 fn issue_paths(body: &Value) -> Vec<String> {
@@ -97,6 +98,102 @@ async fn status_reports_warnings_and_pending_restarts() {
     assert_eq!(body["restart_required"], json!(["server.port"]));
     let status = app.get_ok("/status").await;
     assert_eq!(status["restart_required"], json!(["server.port"]));
+    assert_eq!(status["command_line_overrides"], json!([]));
+}
+
+/// Regression (SU-5): with `--port` on the command line a changed
+/// `server.port` was reported as waiting for a restart, which does not apply
+/// it: the command line wins again.
+#[tokio::test]
+async fn a_setting_the_command_line_fixes_is_never_waiting_for_a_restart() {
+    let app = App::start_with(
+        BASE,
+        AdminOptions {
+            command_line: vec!["server.port".into()],
+            ..AdminOptions::default()
+        },
+    )
+    .await;
+    let (code, body) = app
+        .patch(
+            "/settings",
+            json!({"server": {"port": 9999, "data_dir": "elsewhere"}}),
+        )
+        .await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    // Saved to the file, but not pending: only `data_dir` is.
+    assert_eq!(body["config"]["server"]["port"], 9999);
+    assert_eq!(body["restart_required"], json!(["server.data_dir"]));
+    assert_eq!(body["command_line_overrides"], json!(["server.port"]));
+    let status = app.get_ok("/status").await;
+    assert_eq!(status["restart_required"], json!(["server.data_dir"]));
+    assert_eq!(status["command_line_overrides"], json!(["server.port"]));
+    let view = app.get_ok("/config").await;
+    assert_eq!(view["restart_required"], json!(["server.data_dir"]));
+    assert_eq!(view["command_line_overrides"], json!(["server.port"]));
+}
+
+/// Regression (QA-ONB-03, BE-1): a hand edit the gateway refused was only
+/// announced by a live frame, so a page loaded afterwards showed nothing:
+/// `warnings` was empty and `GET /config` had no trace of it.
+#[tokio::test]
+async fn a_refused_file_is_reported_by_status_and_config_until_it_is_fixed() {
+    let app = App::start().await;
+    let status = app.get_ok("/status").await;
+    assert_eq!(status["config_rejected"], Value::Null);
+    assert_eq!(app.get_ok("/config").await["config_rejected"], Value::Null);
+
+    let path = app.gateway.config_store().path().to_path_buf();
+    let broken = format!("{BASE}\n[[providers]]\nname = \"Lab Bad!\"\nkind = \"mock\"\n");
+    std::fs::write(&path, &broken).unwrap();
+    let (code, body) = app.post("/reload", json!({})).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+
+    // Any page loaded from now on can tell.
+    for _ in 0..2 {
+        let status = app.get_ok("/status").await;
+        let rejected = &status["config_rejected"];
+        assert_eq!(
+            rejected["issues"][0]["path"], "providers[1].name",
+            "{status}"
+        );
+        assert!(rejected["at"].as_i64().unwrap() > 1_600_000_000_000);
+        let message = rejected["message"].as_str().unwrap();
+        assert!(message.contains("refused"), "{message}");
+        assert!(message.contains("providers[1].name"), "{message}");
+        assert_eq!(status["warnings"], json!([message]));
+        // The configuration in effect is still the previous one.
+        assert_eq!(status["counts"]["providers"], 1);
+        let view = app.get_ok("/config").await;
+        assert_eq!(view["config_rejected"], *rejected);
+    }
+
+    // A refused edit (409) says the same; the time stays that of the
+    // refusal.
+    let at = app.get_ok("/status").await["config_rejected"]["at"].clone();
+    let (code, body) = app
+        .patch("/settings", json!({"logging": {"level": "debug"}}))
+        .await;
+    assert_eq!(code, StatusCode::CONFLICT, "{body}");
+    assert_eq!(app.get_ok("/status").await["config_rejected"]["at"], at);
+
+    // Fixed by hand and taken up: gone.
+    std::fs::write(&path, BASE).unwrap();
+    let (code, body) = app.post("/reload", json!({})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(body["config_rejected"], Value::Null);
+    let status = app.get_ok("/status").await;
+    assert_eq!(status["config_rejected"], Value::Null);
+    assert_eq!(status["warnings"], json!([]));
+
+    // Replacing the whole file ends it as well.
+    std::fs::write(&path, &broken).unwrap();
+    let (code, _) = app.post("/reload", json!({})).await;
+    assert_eq!(code, StatusCode::UNPROCESSABLE_ENTITY);
+    assert_ne!(app.get_ok("/status").await["config_rejected"], Value::Null);
+    let (code, body) = app.put("/config/raw", json!({"text": BASE})).await;
+    assert_eq!(code, StatusCode::OK, "{body}");
+    assert_eq!(app.get_ok("/status").await["config_rejected"], Value::Null);
 }
 
 // ---------------------------------------------------------------------------

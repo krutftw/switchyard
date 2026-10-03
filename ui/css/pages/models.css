@@ -151,6 +151,12 @@
   font-size: var(--text-xs);
 }
 
+/* The gateway's own words in an empty state (why a model list could not be
+   fetched): they may hold an address or a path with no place to break. */
+.models-said {
+  overflow-wrap: anywhere;
+}
+
 /* Copy buttons appear with the row on devices that hover; touch always shows them. */
 @media (hover: hover) and (pointer: fine) {
   .models-table tr .models-name-line .btn {
@@ -209,8 +215,11 @@
   max-width: var(--measure);
 }
 
-/* The rails are cut out of the panel surface, so the diagram sits on one. */
+/* The diagram sits in a well of the panel colour inside the drawer. The bed
+   between its rails is painted in --surface-bg, which the drawer sets to its
+   own, lighter colour: the well says what it is drawn on. */
 .models-track {
+  --surface-bg: var(--bg-surface);
   padding: var(--space-3);
   border: var(--hairline) solid var(--rule);
   border-radius: var(--radius-md);
@@ -392,6 +401,12 @@
 .models-combo {
   display: block;
   min-width: 0;
+}
+
+/* The field's hint line exists only to keep the field mounted in one place
+   (see combobox.js); it holds nothing and takes no room. */
+.models-combo .field-hint:empty {
+  display: none;
 }
 
 .models-combo-list {
@@ -616,19 +631,9 @@
   height: var(--control-h-md);
 }
 
-.models-warn {
-  display: flex;
-  align-items: flex-start;
-  gap: var(--space-1h);
+/* A caution under a target is a sentence or two: keep it to a readable line. */
+.models-target-field .field-warning {
   max-width: var(--measure);
-  color: var(--caution-ink);
-  font-size: var(--text-xs);
-  line-height: var(--leading-snug);
-}
-
-.models-warn .icon {
-  flex: none;
-  margin-top: var(--space-px);
 }
 
 /* With unsaved changes the save bar stays in reach while a long list scrolls. */
@@ -663,23 +668,6 @@
 /* ======================================================================== */
 
 @media (max-width: 720px) {
-  /* A notice with an action: beside the text the button leaves it a column a
-     few words wide, so here the action goes under the text, in line with it. */
-  .models .notice,
-  .models-detail .notice {
-    flex-wrap: wrap;
-  }
-
-  .models .notice-body,
-  .models-detail .notice-body {
-    flex-basis: calc(100% - var(--space-4) - var(--space-3));
-  }
-
-  .models .notice-body + *,
-  .models-detail .notice-body + * {
-    margin-left: calc(var(--space-4) + var(--space-3));
-  }
-
   .models-search {
     flex-basis: 100%;
     max-width: none;

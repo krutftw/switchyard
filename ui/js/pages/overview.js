@@ -5,7 +5,8 @@
 //
 // Data: /status, /providers, /usage/timeseries, /usage/summary and /requests
 // through useResource; the live topics stats, request.started,
-// request.finished, credential, config.reloaded and lagged on top of them.
+// request.finished, credential and config.reloaded on top of them, and a
+// reload of all of it when frames may have been missed (useLiveGap).
 // Without the live connection every resource falls back to polling, and when
 // the gateway stops answering altogether the page says so instead of showing
 // its last state as the current one.
@@ -18,7 +19,7 @@ import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
 import { ErrorState, Page, Panel } from '../components/index.js';
 import { loadStyles } from '../lib/dom.js';
 import { useLocalStorage, useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import Activity, { FEED_CAP, FEED_POLL_MS } from './overview/activity.js';
@@ -56,7 +57,7 @@ function patchCredentials(providers, patches) {
         const patch = mine.get(cred.id);
         if (!patch) return cred;
         // Frames omit values that are absent; in the view those are null.
-        return { ...cred, cooldown_until: null, cooldown_reason: null, unusable_reason: null, ...patch };
+        return { ...cred, cooldown_until: null, cooldown_reason: null, unusable_reason: null, disabled_by: null, ...patch };
       }),
     };
   });
@@ -179,29 +180,21 @@ export default function Overview() {
   // ---- Configuration changes, reconnects, dropped frames ---------------------
   useLive('config.reloaded', refreshAll);
 
-  // Frames sent while the connection was down are gone: load again when it
-  // comes back. The first connection after the page opened needs nothing.
-  // When it goes down, ask for the status at once: whether the gateway still
-  // answers is the first thing the page has to know.
-  const [connections, setConnections] = useState(0);
-  const wasOpen = useRef(liveOpen);
-  const everOpen = useRef(liveOpen);
-  const catchUp = () => {
+  // Frames sent while the connection was down are gone, and so are those the
+  // gateway dropped for a connection that fell behind: load again. (The
+  // activity feed reloads its own list the same way.)
+  useLiveGap(() => {
     refreshAll();
     records.refresh();
-    setConnections((n) => n + 1);
-  };
+  });
+  // When the connection goes down, ask for the status at once: whether the
+  // gateway still answers is the first thing the page has to know.
+  const wasOpen = useRef(liveOpen);
   useEffect(() => {
-    if (liveOpen && !wasOpen.current) {
-      if (everOpen.current) catchUp();
-      everOpen.current = true;
-    }
     if (!liveOpen && wasOpen.current) status.refresh();
     wasOpen.current = liveOpen;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [liveOpen]);
-  // The gateway dropped frames for this connection: the same remedy.
-  useLive('lagged', catchUp);
 
   // ---- Render ----------------------------------------------------------------
   const description = 'Whether the gateway is healthy, what it is doing right now, and what needs attention.';
@@ -246,12 +239,12 @@ export default function Overview() {
       <${Notices} status=${status} down=${down} sections=${sections} onRetry=${retry} dismissed=${dismissed} setDismissed=${setDismissed} />
       ${setup.show && !setupHidden && html`<${FirstRun} status=${status} providers=${providers} onHide=${() => setSetupHidden(true)} />`}
       <${PutAway} warnings=${hiddenWarnings} setup=${setup.show && setupHidden} onWarnings=${() => setDismissed([])} onSetup=${() => setSetupHidden(false)} />
-      <${Vitals} status=${status} liveStatus=${live.status} down=${down} hour=${hour} />
+      <${Vitals} status=${status} liveStatus=${live.status} down=${down} />
       <${ProviderBoard} providers=${providers} recent=${records} onExpire=${providers.refresh} />
       <div class="overview-cols">
         <${Traffic} series=${range === '24h' ? day : hour} range=${range} onRange=${setRange} />
         <${TopLists} summary=${top} />
-        <${Activity} recent=${feed} liveOpen=${liveOpen} reconnected=${connections} />
+        <${Activity} recent=${feed} liveOpen=${liveOpen} />
       </div>
     <//>
   `;

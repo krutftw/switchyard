@@ -2,14 +2,16 @@
 // page (and of GET /requests), so a link reproduces the view.
 
 import { html, useEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
-import { Badge, Button, IconButton, Input, Select } from '../../components/index.js';
+import { Badge, Button, Input, Select } from '../../components/index.js';
 import { useDebounced, useHotkey, useIsPhone } from '../../lib/hooks.js';
+import { NO_MODEL, NO_MODEL_FILTER, NO_PROVIDER_FILTER } from './record.js';
 
 const STATUS_OPTIONS = [
   { value: 'ok', label: 'Succeeded' },
   { value: 'error', label: 'Failed' },
   { value: '4xx', label: '4xx, refused by the gateway' },
   { value: '5xx', label: '5xx, gateway or upstream failed' },
+  { value: '101', label: '101 WebSocket session' },
   { value: '400', label: '400 Bad request' },
   { value: '401', label: '401 Unauthorized' },
   { value: '403', label: '403 Forbidden' },
@@ -56,6 +58,23 @@ function keyOptionsOf(keys) {
   return [...byName.values()];
 }
 
+// The requests the gateway files under "unknown" for want of a name: the
+// ones refused before a model could be read (`model=unknown`) and the ones
+// that failed before routing (`provider=unknown`). Shown in the words the
+// table uses for them.
+const NO_MODEL_OPTION = { value: NO_MODEL_FILTER, label: NO_MODEL };
+const NO_PROVIDER_OPTION = { value: NO_PROVIDER_FILTER, label: 'Not routed' };
+
+/**
+ * One option per name, and the `nameless` one after them when it is on
+ * `offer` or is the filter in force (`current`, from the URL).
+ */
+function nameOptions(names, nameless, offer, current) {
+  const options = (names ?? []).map((name) => ({ value: name, label: name }));
+  if ((offer || current.toLowerCase() === nameless.value) && !optionFor(options, nameless.value)) options.push(nameless);
+  return options;
+}
+
 /** Options for a select, with the value from the URL added when the list lacks it. */
 function withCurrent(options, value) {
   if (!value || optionFor(options, value)) return options;
@@ -73,11 +92,13 @@ function selected(options, value) {
  * onChange  (patch) => void: writes the changed filters to the URL
  * onClear   () => void: removes every filter
  * models, providers  names to offer; undefined while they load
+ * noModel   the gateway has requests without a model: offer "No model"
  * keys      [{ id, name }] client keys to offer; undefined while they load
  */
-export default function FilterBar({ filters, onChange, onClear, models, providers, keys }) {
+export default function FilterBar({ filters, onChange, onClear, models, noModel, providers, keys }) {
   const phone = useIsPhone();
   const input = useRef(null);
+  const selects = useRef(null);
 
   // The search box keeps its own text and writes it to the URL once typing
   // pauses. `written` is the last value this box put there: a different
@@ -110,9 +131,21 @@ export default function FilterBar({ filters, onChange, onClear, models, provider
 
   useHotkey('/', () => input.current?.focus());
 
+  // "Clear filters" removes itself with the filters. The keyboard stays
+  // where it was in the bar: on the control before the button.
+  const clearAll = () => {
+    setDraft('');
+    written.current = '';
+    onClear();
+    const fields = selects.current?.querySelectorAll('select');
+    fields?.[fields.length - 1]?.focus();
+  };
+
   const statusOptions = useMemo(() => withCurrent(STATUS_OPTIONS, filters.status), [filters.status]);
-  const modelOptions = useMemo(() => withCurrent((models ?? []).map((name) => ({ value: name, label: name })), filters.model), [models, filters.model]);
-  const providerOptions = useMemo(() => withCurrent((providers ?? []).map((name) => ({ value: name, label: name })), filters.provider), [providers, filters.provider]);
+  // "No model" is on offer while the gateway has such requests; "Not routed"
+  // only names the filter when a link brought it (the Usage page's rows).
+  const modelOptions = useMemo(() => withCurrent(nameOptions(models, NO_MODEL_OPTION, noModel, filters.model), filters.model), [models, noModel, filters.model]);
+  const providerOptions = useMemo(() => withCurrent(nameOptions(providers, NO_PROVIDER_OPTION, false, filters.provider), filters.provider), [providers, filters.provider]);
   const keyOptions = useMemo(() => withCurrent(keyOptionsOf(keys), filters.key), [keys, filters.key]);
 
   const active = [filters.status, filters.model, filters.provider, filters.key].filter(Boolean).length;
@@ -132,8 +165,9 @@ export default function FilterBar({ filters, onChange, onClear, models, provider
           onChange=${setDraft}
           onEnter=${(event) => write(event.target.value)}
           inputRef=${input}
+          onClear=${() => write('')}
+          clearLabel="Clear search"
           placeholder="Request id, model, provider, key, endpoint or error text"
-          actions=${text ? html`<${IconButton} icon="x" label="Clear search" size="sm" onClick=${() => { setDraft(''); write(''); input.current?.focus(); }} />` : null}
         />
         ${phone &&
         html`
@@ -145,7 +179,7 @@ export default function FilterBar({ filters, onChange, onClear, models, provider
       </div>
       ${showSelects &&
       html`
-        <div class="req-filters-selects" id="req-filter-selects">
+        <div class="req-filters-selects" id="req-filter-selects" ref=${selects}>
           <${Select}
             label="Status"
             size="sm"
@@ -179,7 +213,7 @@ export default function FilterBar({ filters, onChange, onClear, models, provider
             onChange=${(key) => onChange({ key })}
           />
           ${(active > 0 || filters.q) &&
-          html`<${Button} class="req-filters-clear" variant="ghost" size="sm" icon="x" onClick=${() => { setDraft(''); written.current = ''; onClear(); }}>Clear filters<//>`}
+          html`<${Button} class="req-filters-clear" variant="ghost" size="sm" icon="x" onClick=${clearAll}>Clear filters<//>`}
         </div>
       `}
     </div>

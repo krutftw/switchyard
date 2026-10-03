@@ -634,6 +634,11 @@ async fn scenario() -> Recorder {
             Trim::NONE,
         )
         .await;
+        // Refused (here by a manual reload; normally the watcher looks):
+        // every page loaded from now on can tell.
+        let (refused, _) = r.app.post("/reload", json!({})).await;
+        assert_eq!(refused, StatusCode::UNPROCESSABLE_ENTITY);
+        r.get("status_file_refused", "/status", Trim::NONE).await;
         std::fs::write(&r.app.config_path, good).expect("the configuration file is writable");
     }
     r.call(

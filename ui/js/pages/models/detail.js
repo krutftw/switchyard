@@ -21,7 +21,7 @@ import {
 import { formatDate, formatNumber, plural } from '../../lib/format.js';
 import { useLocalStorage } from '../../lib/hooks.js';
 import { href } from '../../lib/router.js';
-import { PROTOCOLS, curlFor, gatewayBase, litRoutes, lookup, parseSuffix, pinsOwnModel, reasoningDetail, routePriorities, routesByTarget, suffixExamples } from './logic.js';
+import { PROTOCOLS, curlFor, depthPhrase, gatewayBase, litRoutes, lookup, parseSuffix, protocolFamily, reasoningDetail, suffixExamples, suffixPins, targetsOwnName } from './logic.js';
 import { BackIn, KindBadges } from './table.js';
 
 /** Beyond this many routes the diagram is a wall of rails; the list alone reads better. */
@@ -81,12 +81,13 @@ function AvailabilityNotice({ row, onEditAliases, onRetry }) {
 }
 
 /** The routes as a list: what the diagram cannot hold (reasons, counts, links). */
-function RouteList({ row, routes, tierOf, lit, targetOf }) {
+function RouteList({ routes, tierOf, lit }) {
   const numbered = routes.length > 1;
   return html`
     <ol class="models-routelist">
       ${routes.map((route) => {
-        const target = targetOf.has(route.index) ? row.aliasTargets[targetOf.get(route.index)] : null;
+        // On an alias's route: the target it belongs to, as written.
+        const target = route.target ?? null;
         return html`
           <li class="models-routelist-item" key=${route.index} data-lit=${lit.has(route.index) ? '' : undefined}>
             <div class="models-routelist-top">
@@ -114,23 +115,20 @@ function RouteList({ row, routes, tierOf, lit, targetOf }) {
   `;
 }
 
-function Routes({ row, rowsByName, providers }) {
-  const { diagram, lit, targetOf, ordered, tierOf } = useMemo(() => {
-    const targets = routesByTarget(row, rowsByName);
-    // The gateway tiers by credential priority, which a credential may set for itself.
-    const priority = routePriorities(row, providers);
-    const litSet = litRoutes(row, priority, targets);
+function Routes({ row }) {
+  const { diagram, lit, ordered, tierOf } = useMemo(() => {
+    const litSet = litRoutes(row);
     // Routes of one tier share an order number: the gateway spreads requests
     // across them and only moves to the next tier when this one cannot serve.
-    // Alias target first, then priority, highest first.
-    const tierOfRoute = (r) => [targets.get(r.index) ?? 0, -(priority.get(r.index) ?? 0)];
+    // Alias target first, then priority (the tier GET /models gives each
+    // route), highest first.
+    const tierOfRoute = (r) => [r.targetIndex ?? 0, -(r.priority ?? 0)];
     const byTier = (a, b) => a[0] - b[0] || a[1] - b[1];
     const tiers = [...new Map(row.routes.map((r) => [tierOfRoute(r).join(':'), tierOfRoute(r)])).values()].sort(byTier).map((t) => t.join(':'));
     const tier = new Map(row.routes.map((r) => [r.index, tiers.indexOf(tierOfRoute(r).join(':')) + 1]));
     // Preferred routes first; within a tier, the order the gateway lists them in.
     const sorted = [...row.routes].sort((a, b) => tier.get(a.index) - tier.get(b.index) || a.index - b.index);
     return {
-      targetOf: targets,
       lit: litSet,
       ordered: sorted,
       tierOf: tier,
@@ -145,7 +143,7 @@ function Routes({ row, rowsByName, providers }) {
         routes: sorted.map((r) => ({ model: row.name, provider: `route-${r.index}`, order: tier.get(r.index), state: r.state, lit: litSet.has(r.index) })),
       },
     };
-  }, [row, rowsByName, providers]);
+  }, [row]);
 
   if (row.routes.length === 0) {
     return html`<p class="muted">No provider serves ${row.isAlias ? 'any target of this alias' : 'this model'} at the moment.</p>`;
@@ -153,7 +151,7 @@ function Routes({ row, rowsByName, providers }) {
   if (row.routes.length > DIAGRAM_MAX_ROUTES) {
     return html`
       <p class="models-caption">${plural(row.routes.length, 'route')}, too many to draw as tracks. They are listed in order of preference; ${plural(lit.size, 'route')} ${lit.size === 1 ? 'takes' : 'take'} requests now.</p>
-      <${RouteList} row=${row} routes=${ordered} tierOf=${tierOf} lit=${lit} targetOf=${targetOf} />
+      <${RouteList} routes=${ordered} tierOf=${tierOf} lit=${lit} />
     `;
   }
   return html`
@@ -162,7 +160,7 @@ function Routes({ row, rowsByName, providers }) {
     </div>
     ${row.routes.length > 1 &&
     html`<p class="models-caption">Lit rails take requests now. Routes with the same number share them by the routing strategy; a higher number takes over only when the ones before it cannot serve.</p>`}
-    <${RouteList} row=${row} routes=${ordered} tierOf=${tierOf} lit=${lit} targetOf=${targetOf} />
+    <${RouteList} routes=${ordered} tierOf=${tierOf} lit=${lit} />
   `;
 }
 
@@ -170,21 +168,25 @@ function Details({ row, rowsByName, aliases, onOpen }) {
   const info = row.info;
   const hiddenBy = (aliases ?? []).filter((a) => a.hide_targets && (a.targets ?? []).some((t) => parseSuffix(t).base.toLowerCase() === row.name.toLowerCase() || t.toLowerCase() === row.name.toLowerCase())).map((a) => a.name);
   const reasoning = reasoningDetail(info);
-  // A target that names the alias itself is the provider's model of that name when there is one, and a dead end when not.
-  const ownModel = row.isAlias && pinsOwnModel(row, rowsByName);
   const targets =
     row.isAlias &&
     html`
       <ol class="models-targets">
         ${row.aliasTargets.map((target, index) => {
-          const entry = lookup(rowsByName, parseSuffix(target).base) ?? lookup(rowsByName, target);
-          const self = entry && entry.name === row.name;
+          // Whether a target routes is said by GET /models: the alias's
+          // routes each name their target. The entry to link to is looked
+          // up by name, as the gateway would find it.
+          const routed = row.routes.some((route) => route.targetIndex === index);
+          // A target that names the alias itself is the provider's model of
+          // that name when there is one, and a dead end when not.
+          const self = targetsOwnName(row, target);
+          const entry = self ? null : (lookup(rowsByName, parseSuffix(target).base) ?? lookup(rowsByName, target));
           return html`
             <li key=${`${index}-${target}`}>
               <span class="models-targets-order num">${index + 1}</span>
-              ${entry && !self ? html`<button type="button" class="models-link mono" onClick=${() => onOpen(entry.name)}>${target}</button>` : html`<span class="mono">${target}</span>`}
-              ${!entry && html`<span class="faint">matches no model</span>`}
-              ${self && html`<span class="faint">${ownModel ? 'the provider’s model of the same name' : 'leads back to this alias, ignored'}</span>`}
+              ${entry ? html`<button type="button" class="models-link mono" onClick=${() => onOpen(entry.name)}>${target}</button>` : html`<span class="mono">${target}</span>`}
+              ${self && html`<span class="faint">${routed ? 'the provider’s model of the same name' : 'leads back to this alias, ignored'}</span>`}
+              ${!self && !routed && html`<span class="faint">${entry ? 'has no route, skipped' : 'matches no model'}</span>`}
             </li>
           `;
         })}
@@ -213,14 +215,14 @@ function Details({ row, rowsByName, aliases, onOpen }) {
         },
         {
           label: 'Listed to clients',
-          // The gateway leaves an alias without a routable target out of the lists, and a name nothing serves with it.
-          value: row.hidden
-            ? `No. Hidden by ${hiddenBy.length ? `alias ${hiddenBy.join(', ')}` : 'an alias'}; requests that name it still work.`
-            : row.routes.length === 0
-              ? row.isAlias
-                ? 'No. The gateway ignores an alias that has no routable target.'
-                : 'No. No provider serves it.'
-              : 'Yes',
+          // The gateway leaves an alias it ignores out of the lists, and a name nothing serves with it.
+          value: row.ignored
+            ? 'No. The gateway ignores an alias that has no routable target.'
+            : row.hidden
+              ? `No. Hidden by ${hiddenBy.length ? `alias ${hiddenBy.join(', ')}` : 'an alias'}; requests that name it still work.`
+              : row.routes.length === 0
+                ? 'No. No provider serves it.'
+                : 'Yes',
         },
       ]}
     />
@@ -232,7 +234,7 @@ function CallIt({ row, status }) {
   const [stream, setStream] = useLocalStorage('models.stream', false);
   const current = PROTOCOLS.find((p) => p.id === protocol) ?? PROTOCOLS[0];
   const auth = status?.auth_required !== false;
-  const base = gatewayBase(status?.listen, typeof location === 'undefined' ? null : location);
+  const base = gatewayBase(status?.listen, typeof location === 'undefined' ? null : location, status?.tls === true);
   const command = curlFor(current.id, { base, model: row.name, stream: !!stream, auth });
   return html`
     <div class="models-call">
@@ -252,13 +254,52 @@ function CallIt({ row, status }) {
   `;
 }
 
-function ReasoningSuffix({ row }) {
-  const examples = useMemo(() => suffixExamples(row.name, row.info.thinking), [row.name, row.info.thinking]);
-  // A depth pinned on an alias target beats the suffix in the request.
-  const pinned = row.isAlias ? row.aliasTargets.filter((target) => parseSuffix(target).depth !== null) : [];
+/** Targets in running text, each in mono: "a", "a and b", "a, b and c" (or "or"). */
+const joinTargets = (names, conjunction = 'and') =>
+  names.map((name, i) => html`<span key=${`${i}-${name}`}>${i === 0 ? '' : i === names.length - 1 ? ` ${conjunction} ` : ', '}<span class="mono">${name}</span></span>`);
+
+/**
+ * When the target an alias tries first fixes the depth, a suffix in the
+ * request does nothing there (the pin wins), so the examples would promise
+ * what the gateway does not do: say what happens instead.
+ */
+function PinnedSuffix({ pins }) {
+  const later = pins.open;
+  const tail =
+    later.length > 0
+      ? html`<span>${` A suffix only counts when ${later.length === 1 ? 'the later target' : 'one of the later targets'} `}</span>${joinTargets(later, 'or')}<span>${`, which ${later.length === 1 ? 'fixes' : 'fix'} no depth, serves the request instead.`}</span>`
+      : html`<span> No target of this alias leaves the depth open, so a suffix never changes how it reasons. To change the depth, edit the alias.</span>`;
+  // One line: htm drops the spaces around a line break inside running text.
+  return html`
+    <p class="models-caption"><span>Requests go to its first target, </span><span class="mono">${pins.first}</span><span>, and that fixes the depth at ${depthPhrase(pins.firstPin)}. A suffix in the request has no effect there.</span>${tail}</p>
+  `;
+}
+
+function ReasoningSuffix({ row, providers, pins }) {
+  if (pins?.firstPin) return html`<${PinnedSuffix} pins=${pins} />`;
+  return html`<${SuffixExamples} row=${row} providers=${providers} pinned=${pins?.pinned ?? []} />`;
+}
+
+function SuffixExamples({ row, providers, pinned }) {
+  // What "automatic" becomes depends on the API the upstream is spoken to
+  // in: the families of the protocols its providers take (GET /providers
+  // `protocols`). Every family while that is not known.
+  const families = useMemo(() => {
+    const byName = new Map((providers ?? []).map((p) => [p.name, p]));
+    const found = new Set();
+    for (const route of row.routes) {
+      const protocols = byName.get(route.provider)?.protocols;
+      if (!protocols?.length) return undefined;
+      for (const protocol of protocols) found.add(protocolFamily(protocol));
+    }
+    found.delete(null);
+    return found.size > 0 ? [...found] : undefined;
+  }, [row.routes, providers]);
+  const examples = useMemo(() => suffixExamples(row.name, row.info.thinking, families), [row.name, row.info.thinking, families]);
+  // A depth pinned on a later alias target beats the suffix when that target serves.
   return html`
     ${row.isAlias &&
-    html`<p class="models-caption">The limits below are those of the alias's first target; a request served by another target is fitted to that one.${pinned.length > 0 ? ` ${pinned.length === 1 ? 'The target' : 'The targets'} ${pinned.join(', ')} ${pinned.length === 1 ? 'pins its' : 'pin their'} depth in the alias, and that wins over a suffix in the request.` : ''}</p>`}
+    html`<p class="models-caption"><span>The limits below are those of the alias's first target; a request served by another target is fitted to that one.</span>${pinned.length > 0 && html`<span> ${pinned.length === 1 ? 'The target' : 'The targets'} </span>${joinTargets(pinned)}<span>${` ${pinned.length === 1 ? 'fixes its' : 'fix their'} depth in the alias, and that wins over a suffix in the request when ${pinned.length === 1 ? 'it serves' : 'they serve'}.`}</span>`}</p>`}
     <ul class="models-suffixes">
       ${examples.map(
         (example) => html`
@@ -293,6 +334,8 @@ export default function ModelDrawer({ name, row, rowsByName, providers, aliases,
   const shownName = name || last.current.name;
   const shown = name ? row : last.current.row;
 
+  const pins = useMemo(() => suffixPins(shown, rowsByName), [shown, rowsByName]);
+
   let body;
   if (shown) {
     body = html`
@@ -307,7 +350,7 @@ export default function ModelDrawer({ name, row, rowsByName, providers, aliases,
           <${KindBadges} row=${shown} />
         </div>
         <${AvailabilityNotice} row=${shown} onEditAliases=${onEditAliases} onRetry=${onRetry} />
-        <${Section} title="Routes"><${Routes} row=${shown} rowsByName=${rowsByName} providers=${providers} /><//>
+        <${Section} title="Routes"><${Routes} row=${shown} /><//>
         <${Section} title="Details"><${Details} row=${shown} rowsByName=${rowsByName} aliases=${aliases} onOpen=${onOpen} /><//>
         <${Section} title="Call it" description="The same model answers in every protocol the gateway speaks. Use the name exactly as written.">
           <${CallIt} row=${shown} status=${status} />
@@ -316,9 +359,11 @@ export default function ModelDrawer({ name, row, rowsByName, providers, aliases,
         html`
           <${Section}
             title="Reasoning suffix"
-            description="Add a depth in parentheses to the name to set how hard the model reasons for one request. It wins over reasoning settings in the request body and works in every protocol. An alias target can carry the same suffix."
+            description=${pins?.firstPin
+              ? 'A depth in parentheses after a name sets how hard the model reasons for one request, but this alias sets the depth itself.'
+              : 'Add a depth in parentheses to the name to set how hard the model reasons for one request. It wins over reasoning settings in the request body and works in every protocol. An alias target can carry the same suffix.'}
           >
-            <${ReasoningSuffix} row=${shown} />
+            <${ReasoningSuffix} row=${shown} providers=${providers} pins=${pins} />
           <//>
         `}
       </div>

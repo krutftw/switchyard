@@ -44,9 +44,11 @@ export function rankOptions(text, options) {
  *              uses it to offer reasoning suffixes for the typed model)
  * label        accessible name (the field has no visible label of its own)
  * error        message under the field; marks it invalid
+ * warning      message under the field in the caution colour: the value is
+ *              allowed, with a caveat (an error takes its place)
  * placeholder, disabled, and any other prop go to the <input>
  */
-export default function Combobox({ value, onChange, options = [], more, label, error, placeholder, disabled = false, ...rest }) {
+export default function Combobox({ value, onChange, options = [], more, label, error, warning, placeholder, disabled = false, ...rest }) {
   const anchor = useRef(null);
   const list = useRef(null);
   const listId = useUid('combo');
@@ -64,7 +66,7 @@ export default function Combobox({ value, onChange, options = [], more, label, e
 
   const place = () => {
     if (!anchor.current || !list.current) return;
-    // The field itself, not the error line that may sit under it.
+    // The field itself, not the error or warning line that may sit under it.
     const rect = (anchor.current.querySelector('.input') ?? anchor.current).getBoundingClientRect();
     const width = Math.max(rect.width, 260);
     const next = placeFloating(rect, { width, height: list.current.offsetHeight }, { side: 'bottom', align: 'start', gap: 4 });
@@ -153,6 +155,12 @@ export default function Combobox({ value, onChange, options = [], more, label, e
     }
   };
 
+  // The empty `hint` keeps the field in one place in the tree. An Input
+  // without a label is a bare box until it has a message and is put inside a
+  // Field when it gets one, which mounts the <input> anew: a warning that
+  // comes or goes with a keystroke (it does here) would take the focus and
+  // the caret with it. With a hint, even an empty one, the Field is always
+  // there; models.css hides the empty line.
   return html`
     <span ref=${anchor} class="models-combo">
       <${Input}
@@ -161,6 +169,8 @@ export default function Combobox({ value, onChange, options = [], more, label, e
         placeholder=${placeholder}
         disabled=${disabled}
         error=${error}
+        warning=${warning}
+        hint=""
         role="combobox"
         aria-label=${label}
         aria-autocomplete="list"

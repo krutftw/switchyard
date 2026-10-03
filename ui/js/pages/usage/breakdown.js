@@ -15,7 +15,7 @@
 // so a link reproduces the table and the CSV export can write the same rows.
 
 import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
-import { Button, Input, Meter, Panel, Table, toast } from '../../components/index.js';
+import { Button, Input, Meter, Panel, Table } from '../../components/index.js';
 import { DASH, formatCompact, formatCurrency, formatNumber, formatPercent, formatTokens, plural } from '../../lib/format.js';
 import { useIsPhone, useSize } from '../../lib/hooks.js';
 import { navigate, useQueryParam } from '../../lib/router.js';
@@ -183,6 +183,13 @@ export default function Breakdown({ group, rows, range, slots, loading, stale, s
   const shown = showAll ? sorted : sorted.slice(0, PAGE);
   const hidden = sorted.length - shown.length;
   const filtering = String(query ?? '').trim() !== '';
+  // "Clear filter" sits in the empty state and leaves with it: the focus goes
+  // to the filter box instead of nowhere.
+  const filterBox = useRef(null);
+  const clearFilter = () => {
+    setQuery('');
+    filterBox.current?.focus();
+  };
 
   // In the compact layout two columns each stand for two sort keys. The
   // heading lights up for either, so an order chosen in the full layout (or
@@ -195,20 +202,9 @@ export default function Breakdown({ group, rows, range, slots, loading, stale, s
     return setSort(`${key}-${next.dir}`);
   };
 
-  const open = (row) => {
-    const unlisted = group.unlisted[row.name];
-    if (!unlisted) {
-      navigate('/requests', { query: { [group.param]: row.name } });
-      return;
-    }
-    // The request list has no filter that selects this row. Say so, and
-    // offer the nearest view, instead of opening an empty list.
-    toast.info(unlisted.title, {
-      id: `usage-unlisted-${group.value}`,
-      description: unlisted.description,
-      action: { label: unlisted.action, onClick: () => navigate('/requests', { query: unlisted.near }) },
-    });
-  };
+  // Every row is a filter of the request list, the stand-in names included
+  // ("unknown", "anonymous": see GROUPS in data.js).
+  const open = (row) => navigate('/requests', { query: { [group.param]: row.name } });
 
   const description = loading && !rows ? null : `${plural(all.length, group.noun, group.plural)} in ${range.phrase}. Select a row to see its requests.`;
 
@@ -218,7 +214,7 @@ export default function Breakdown({ group, rows, range, slots, loading, stale, s
       title=${`By ${group.noun}`}
       description=${description}
       actions=${all.length >= FILTER_FROM || filtering
-        ? html`<${Input} class="usage-filter" size="sm" type="search" icon="search" value=${query} onChange=${setQuery} placeholder="Filter by name" aria-label=${`Filter ${group.plural} by name`} />`
+        ? html`<${Input} class="usage-filter" size="sm" type="search" icon="search" value=${query} onChange=${setQuery} inputRef=${filterBox} clearLabel="Clear filter" placeholder="Filter by name" aria-label=${`Filter ${group.plural} by name`} />`
         : null}
       footer=${hidden > 0 || (showAll && sorted.length > PAGE)
         ? html`
@@ -244,7 +240,7 @@ export default function Breakdown({ group, rows, range, slots, loading, stale, s
                 icon: 'search',
                 title: `No ${group.noun} matches "${String(query).trim()}"`,
                 description: `${plural(all.length, group.noun, group.plural)} had traffic in ${range.phrase}.`,
-                action: html`<${Button} size="sm" onClick=${() => setQuery('')}>Clear filter<//>`,
+                action: html`<${Button} size="sm" onClick=${clearFilter}>Clear filter<//>`,
               }
             : { icon: 'usage', title: `No ${group.plural} with traffic`, description: `Nothing was requested in ${range.phrase}.` }}
         />

@@ -135,6 +135,12 @@
   min-width: 0;
 }
 
+/* A control without a hint is given an empty one, so that it sits in its
+   field wrapper from the start (see NO_HINT in settings/common.js). */
+.settings-row-control .field-hint:empty {
+  display: none;
+}
+
 /* A switch sits on the first line of its row, level with the label. */
 .settings-row[data-kind="switch"] .settings-row-control {
   display: flex;
@@ -314,25 +320,9 @@
   }
 }
 
-/* Toasts come up in the corner the bar's buttons are in and are drawn above
-   everything, so the toast that confirms a save would cover Save and Discard
-   while it shows. While the bar is up, the stack stands on top of it: the
-   bar measures how far that is (useToastClearance in settings/common.js). */
-body:has(.settings) .toasts {
-  transition: transform var(--dur-base) var(--ease-out);
-}
-
-/* The lift is only set while the bar has something to save; it is gone, and
-   the stack back in its corner, by the time the bar fades out. */
-body:has(.settings-savebar) .toasts {
-  transform: translateY(calc(var(--settings-toast-lift, 0px) * -1));
-}
-
-@media (prefers-reduced-motion: reduce) {
-  body:has(.settings) .toasts {
-    transition: none;
-  }
-}
+/* Toasts come up in the corner the bar's buttons are in. While the bar is
+   up it raises them clear of itself with --toast-lift (useToastLift in
+   settings/common.js); nothing to style here. */
 
 /* ---- Payload rules ------------------------------------------------------- */
 

@@ -28,11 +28,11 @@ function ProxyForms() {
   `;
 }
 
-export function StreamingTab({ config }) {
+export function StreamingTab({ config, onDiskInvalid }) {
   const live = config.data.config;
   const base = useMemo(() => ({ streaming: live.streaming, upstream: live.upstream }), [live]);
   const form = useEdits(base);
-  const saver = useSettingsSave({ form, config, name: 'Streaming and upstream' });
+  const saver = useSettingsSave({ form, config, name: 'Streaming and upstream', onDiskInvalid });
   const { issues } = saver;
 
   const proxy = String(form.value('upstream.proxy') ?? '');
@@ -110,6 +110,3 @@ export function StreamingTab({ config }) {
     <//>
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default StreamingTab;

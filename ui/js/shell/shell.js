@@ -307,7 +307,15 @@ function NotFound({ route }) {
 // Shell
 // ---------------------------------------------------------------------------
 
-export function Shell() {
+/**
+ * takeFocus  the shell replaces something the user was working in (the
+ *            sign-in form, the "Try again" of the boot screen), whose focused
+ *            control is gone with it: the focus goes to the page's main
+ *            region, as after in-app navigation, instead of being left on
+ *            <body>. Not on a plain load, where the first Tab should still
+ *            reach "Skip to content".
+ */
+export function Shell({ takeFocus = false } = {}) {
   const route = useRoute();
   const isPhone = useIsPhone();
   const [rail, setRail] = useLocalStorage('nav.rail', false);
@@ -333,6 +341,10 @@ export function Shell() {
   useEffect(() => {
     if (firstPage.current) {
       firstPage.current = false;
+      // Unless something has taken the focus meanwhile (a page that focuses
+      // its own field), it was dropped with the sign-in form.
+      const at = document.activeElement;
+      if (takeFocus && (!at || at === document.body || !document.contains(at))) main.current?.focus({ preventScroll: true });
       return;
     }
     window.scrollTo(0, 0);
@@ -364,7 +376,8 @@ export function Shell() {
 
   const commands = useMemo(
     () => [
-      ...ROUTES.map((item) => ({
+      // Pages for page authors (the component kit) are opened by address.
+      ...ROUTES.filter((item) => !item.dev).map((item) => ({
         id: `page:${item.path}`,
         label: item.title,
         group: 'Pages',

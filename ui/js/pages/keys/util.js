@@ -2,11 +2,11 @@
 // so the module loads under Node for ui/tests/check.mjs.
 //
 //   wildcardMatch(pattern, text)      the gateway's own model-pattern matching
+//   servedNames(models)               the names a request can be routed by
 //   matchModels(patterns, names)      which current models an allow-list admits
-//   gatewayAddresses(listen)          base URLs a client can be pointed at
+//   gatewayAddresses(listen, tls)     base URLs a client can be pointed at
 //   buildExamples({ ... })            ready-to-paste snippets for a key
 //   referenceName(key)                "TEAM_KEY" for "env:TEAM_KEY" / "${TEAM_KEY}"
-//   cleanPatterns(list)               an allow-list without blanks and repeats
 
 import { API_BASE } from '../../lib/api.js';
 
@@ -48,10 +48,19 @@ export function allowsModel(patterns, name) {
 }
 
 /**
+ * The client-facing names the gateway serves: the entries of GET /models
+ * without the ignored ones (an alias with no routable target, under which
+ * no request can be served). The same set `counts.models` of /status counts.
+ */
+export function servedNames(models) {
+  return (models ?? []).filter((model) => !model.ignored).map((model) => model.name);
+}
+
+/**
  * What an allow-list admits out of the models the gateway serves right now.
  *
  * @param {string[]} patterns  the key's patterns; [] means every model
- * @param {string[]} names     client-facing model names (GET /models)
+ * @param {string[]} names     client-facing model names (servedNames)
  * @returns {{ matched: string[], unmatched: string[], total: number, all: boolean }}
  *          `matched`: names the key may use; `unmatched`: patterns that match
  *          no current model (they may match one added later).
@@ -73,24 +82,6 @@ export function matchModels(patterns, names) {
   return { matched, unmatched: list.filter((pattern) => !used.has(pattern)), total: names.length, all: false };
 }
 
-/**
- * An allow-list as the gateway's own writes would store it: trimmed, without
- * empty entries, without repeats (case is ignored). A hand-edited
- * configuration file can hold all three, and GET /keys passes them through.
- */
-export function cleanPatterns(patterns) {
-  const seen = new Set();
-  const out = [];
-  for (const raw of patterns ?? []) {
-    const pattern = String(raw ?? '').trim();
-    const key = pattern.toLowerCase();
-    if (!pattern || seen.has(key)) continue;
-    seen.add(key);
-    out.push(pattern);
-  }
-  return out;
-}
-
 /** Same patterns in the same order. */
 export function sameList(a, b) {
   return a.length === b.length && a.every((value, index) => value === b[index]);
@@ -108,14 +99,6 @@ export function referenceName(key) {
 /** True for a reference that names no variable: "env:" or "${}". */
 export function emptyReference(key) {
   return /^(env:\s*|\$\{\s*\})$/.test(String(key ?? '').trim());
-}
-
-/** "a client key named `ci` already exists" -> "A client key named ci already exists." */
-export function sentence(message) {
-  const text = String(message ?? '').trim().replace(/`/g, '');
-  if (!text) return '';
-  const first = text[0].toUpperCase() + text.slice(1);
-  return /[.!?]$/.test(first) ? first : `${first}.`;
 }
 
 // ---------------------------------------------------------------------------
@@ -142,12 +125,13 @@ export function parseListen(listen) {
  * gateway's network would use.
  *
  * @param {string | null | undefined} listen  status.listen
+ * @param {boolean} tls  status.tls: the gateway's own listener serves HTTPS
  * @param {{ origin: string, protocol: string, hostname: string, port: string }} [loc]
  * @returns {{ page: string, listen: string | null, wildcard: string | null }}
  *          `wildcard`: the bind address when the gateway listens on every
  *          interface while the page was opened on loopback.
  */
-export function gatewayAddresses(listen, loc = typeof location === 'undefined' ? null : location) {
+export function gatewayAddresses(listen, tls = false, loc = typeof location === 'undefined' ? null : location) {
   const prefix = API_BASE.replace(/\/admin\/api$/, '');
   const page = loc ? `${loc.origin}${prefix}` : `http://127.0.0.1:8317${prefix}`;
   const bound = parseListen(listen);
@@ -160,11 +144,7 @@ export function gatewayAddresses(listen, loc = typeof location === 'undefined' ?
   }
   const sameHost = bound.host.toLowerCase() === loc.hostname.toLowerCase() || (LOOPBACK.test(bound.host) && pageLoopback);
   if (sameHost && bound.port === pagePort) return { page, listen: null, wildcard: null };
-  // The scheme of the bound socket is not in /status. On the page's own port
-  // it is the page's; on another port the page went through something else,
-  // and plain HTTP is what a default configuration serves.
-  const scheme = bound.port === pagePort ? loc.protocol : 'http:';
-  return { page, listen: `${scheme}//${bound.host}:${bound.port}`, wildcard: null };
+  return { page, listen: `${tls ? 'https' : 'http'}://${bound.host}:${bound.port}`, wildcard: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -196,7 +176,7 @@ function envBlock(shell, pairs) {
  * use that has a credential able to serve it now.
  */
 export function exampleModel(patterns, models) {
-  const allowed = (models ?? []).filter((model) => allowsModel(patterns, model.name));
+  const allowed = (models ?? []).filter((model) => !model.ignored && allowsModel(patterns, model.name));
   const serving = (model) => (model.routes ?? []).some((route) => route.credentials_available > 0);
   // The mock provider's "mock-error-*" models fail on purpose.
   const usable = allowed.filter((model) => serving(model) && !/(^|\/)mock-(error|slow)/.test(model.name));
@@ -278,6 +258,3 @@ export function buildExamples({ base, key, model, shell }) {
     },
   ];
 }
-
-// Every module under js/pages/ has a default export (ui/tests/check.mjs).
-export default wildcardMatch;

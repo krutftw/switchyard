@@ -149,34 +149,18 @@
 
 /* A table picks its layout from the width of this box (breakdown.js sets
    data-tier): full, compact, cards. On a phone the shared Table turns into
-   cards by itself (data-tier="phone"). */
-.usage-table {
-  /* Where the column headings stop when the page scrolls under them. */
-  --usage-stick: var(--topbar-h);
-}
+   cards by itself (data-tier="phone").
 
-/* Same condition as the sticky controls above: the headings stop below them
-   (their height is measured, they can wrap to two lines) and leave their
-   hairline visible. */
+   --sticky-top (see the shared Table) is where the column headings stop
+   when the page scrolls under them, and what a row that takes the keyboard
+   focus keeps clear of. Same condition as the sticky controls above: the
+   headings stop below them (their height is measured, they can wrap to two
+   lines) and leave their hairline visible. Elsewhere the controls scroll
+   away and the shared default, the top bar, is right. */
 @media (min-width: 961px) and (min-height: 600px) {
   .usage-table {
-    --usage-stick: calc(var(--topbar-h) + var(--usage-controls-h, 0px) + var(--hairline));
+    --sticky-top: calc(var(--topbar-h) + var(--usage-controls-h, 0px) + var(--hairline));
   }
-}
-
-/* The shared table scrolls sideways in its own box, which also makes that
-   box the thing its sticky headings stick to: in a list longer than the
-   screen they scroll away with the page. Here the layouts are chosen so the
-   table always fits, so the box only clips (the panel's round corners) and
-   the headings stick to the page instead. */
-.usage-table[data-tier="full"] > .table-wrap,
-.usage-table[data-tier="compact"] > .table-wrap {
-  overflow: clip;
-}
-
-.usage-table[data-tier="full"] .table[data-sticky] th,
-.usage-table[data-tier="compact"] .table[data-sticky] th {
-  top: var(--usage-stick);
 }
 
 .usage-name {
@@ -217,12 +201,15 @@
   max-width: 100%;
 }
 
+/* A note that does not fit beside the name takes a line of its own (the
+   wrap above) and, where even that is too narrow, wraps between words. */
 .usage-name-note {
-  flex: none;
+  flex: 0 1 auto;
+  min-width: 0;
   font-size: var(--text-xs);
   font-weight: var(--weight-regular);
+  line-height: var(--leading-snug);
   color: var(--text-3);
-  white-space: nowrap;
 }
 
 /* Every share bar is the same length, whatever its percentage reads. */

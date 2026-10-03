@@ -2,11 +2,11 @@
 // cost estimates. GET /pricing loads the list; PUT /pricing replaces it.
 
 import { Component, html, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
-import { Button, EmptyState, ErrorState, Form, FormError, Icon, IconButton, Input, Notice, NumberInput, Panel, Skeleton, StatusLamp, confirm, toast, useIssues } from '../../components/index.js';
+import { Button, EmptyState, ErrorState, Form, Icon, IconButton, Input, Notice, NumberInput, Panel, Skeleton, StatusLamp, confirm, toast } from '../../components/index.js';
 import { ApiError } from '../../lib/api.js';
-import { formatCurrency, plural } from '../../lib/format.js';
+import { formatCurrency, plural, sentence } from '../../lib/format.js';
 import { useDebounced, useUid } from '../../lib/hooks.js';
-import { ConflictNotice, SaveBar, focusMoved, focusSoon, moveItem, rowId, sentence, useListDraft, useRevealProblem, useSaveHotkey, useUnsavedGuard, wildcardMatch, withStop } from './common.js';
+import { ConflictNotice, SaveBar, SaveError, focusMoved, focusSoon, moveItem, rowId, useDiskInvalid, useFieldIssues, useListDraft, useRevealProblem, useSaveHotkey, useUnsavedGuard, wildcardMatch } from './common.js';
 
 const PRICE_FIELDS = [
   { key: 'input', label: 'Input', required: true },
@@ -138,6 +138,9 @@ class PriceRow extends Component {
 
 // The messages a refused save left on one row, as an object that keeps its
 // identity while the messages stay the same (so the row is not redrawn).
+// The body of PUT /pricing is the list itself, so an issue's path starts at
+// the row: "[2].model", or "[2]" for the row as a whole (a price that is
+// negative or not a number).
 function useRowErrors(issues, rows) {
   const cache = useRef(new Map());
   if (issues.all.length === 0) {
@@ -147,8 +150,8 @@ function useRowErrors(issues, rows) {
   // Every row asks for its issues, so FormError lists only what no row shows.
   const next = new Map();
   rows.forEach((row, index) => {
-    const found = { row: issues.at(`pricing[${index}]`), model: issues.at(`pricing[${index}].model`) };
-    for (const field of PRICE_FIELDS) found[field.key] = issues.at(`pricing[${index}].${field.key}`);
+    const found = { row: issues.at(`[${index}]`), model: issues.at(`[${index}].model`) };
+    for (const field of PRICE_FIELDS) found[field.key] = issues.at(`[${index}].${field.key}`);
     const key = JSON.stringify(found);
     if (key === '{}') return;
     const before = cache.current.get(row._id);
@@ -158,13 +161,14 @@ function useRowErrors(issues, rows) {
   return (id) => next.get(id)?.found ?? null;
 }
 
-export function PricingTab() {
+export function PricingTab({ onDiskInvalid }) {
   const list = useListDraft('/pricing', { toDraft, toBody });
   const formId = useUid('pricing-form');
   const [test, setTest] = useState('');
   const [clientError, setClientError] = useState(null);
   const error = clientError ?? list.saveError;
-  const issues = useIssues(error);
+  const issues = useFieldIssues(error);
+  useDiskInvalid(list.saveError, onDiskInvalid);
 
   useUnsavedGuard(list.dirty, 'prices');
   useSaveHotkey(formId, list.dirty && !list.saving);
@@ -249,9 +253,9 @@ export function PricingTab() {
   const submit = async () => {
     const problems = [];
     rows.forEach((row, index) => {
-      if (!row.model.trim()) problems.push({ path: `pricing[${index}].model`, message: 'Enter a model pattern, for example gpt-5* or * for every model.' });
+      if (!row.model.trim()) problems.push({ path: `[${index}].model`, message: 'Enter a model pattern, for example gpt-5* or * for every model.' });
       for (const field of PRICE_FIELDS) {
-        if (field.required && row[field.key] == null) problems.push({ path: `pricing[${index}].${field.key}`, message: 'Enter a price. Use 0 for free.' });
+        if (field.required && row[field.key] == null) problems.push({ path: `[${index}].${field.key}`, message: 'Enter a price. Use 0 for free.' });
       }
     });
     if (problems.length > 0) {
@@ -319,11 +323,8 @@ export function PricingTab() {
             `}
       <//>
 
-      <${FormError} error=${withStop(error)} issues=${issues} title="Could not save the prices" />
+      <${SaveError} error=${error} issues=${issues} title="Could not save the prices" />
       <${SaveBar} dirty=${list.dirty} saving=${list.saving} what="prices" onDiscard=${() => { setClientError(null); list.discard(); }} summary="Unsaved changes to the prices" saveLabel="Save prices" />
     <//>
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default PricingTab;

@@ -31,17 +31,16 @@ import {
 import { api } from '../../lib/api.js';
 import { plural } from '../../lib/format.js';
 import { useAsync } from '../../lib/hooks.js';
+import { useLeaveGuard } from '../../lib/router.js';
 import {
   COMPAT_PRESETS,
   KINDS,
   blankCredential,
   blankHeader,
   configFromDraft,
-  credentialName,
   draftFromConfig,
   emptyDraft,
   envVarFor,
-  filledKeyless,
   freeName,
   hasSettings,
   headerKeepsStored,
@@ -50,10 +49,9 @@ import {
   isReference,
   kindInfo,
   localIssues,
-  rebaseError,
   referenceName,
   sectionOfPath,
-  withoutRiskyKeyless,
+  servesNothing,
 } from './model.js';
 import ModelsSection from './models-editor.js';
 import { Disclosure, KindPicker, Section, StoredSecret, TriState, firstFieldOf, focusAfterRemoval, focusSoon } from './parts.js';
@@ -426,15 +424,19 @@ function HeaderRow({ row, index, duplicate, error, onChange, onRemove }) {
   } else {
     value = html`<${Input} mono aria-label=${`Value of ${named}`} value=${row.entered} onChange=${(v) => onChange({ entered: v })} placeholder="Value" />`;
   }
-  const nameError = duplicate ? 'Listed twice: the last one wins.' : undefined;
+  // The gateway reports a header under one path, "headers.<name>", whether
+  // the name or the value is at fault; its message says which.
+  const aboutName = !!error && /header name/i.test(error);
+  const nameError = duplicate ? 'Listed twice: the last one wins.' : aboutName ? error : undefined;
+  const valueError = error && !aboutName ? error : undefined;
   return html`
     <li class="prov-header-row" id=${row.uid}>
       <${Input} mono aria-label=${`Name of header ${index + 1}`} value=${row.name} onChange=${(name) => onChange({ name })} placeholder="X-Title" error=${nameError} />
       <div class="prov-header-value" id=${valueId}>
         ${value}
         ${keeps && row.editing && html`<div class="prov-keep"><${Button} size="sm" variant="ghost" onClick=${() => change({ editing: false, entered: '' }, 'button')}>Keep the stored value<//></div>`}
-        ${error
-          ? html`<div class="field-error"><${Icon} name="alert-circle" size=${14} /><span>${error}</span></div>`
+        ${valueError
+          ? html`<div class="field-error"><${Icon} name="alert-circle" size=${14} /><span>${valueError}</span></div>`
           : moved && html`<p class="field-hint">The value stored for ${row.storedName} does not follow a renamed header. Type it again, or change the name back.</p>`}
       </div>
       <${IconButton} id=${`${row.uid}-remove`} icon="trash" size="sm" label=${`Remove ${named}`} onClick=${onRemove} />
@@ -494,96 +496,6 @@ function HeadersEditor({ draft, update, issues }) {
 }
 
 // ---------------------------------------------------------------------------
-// Saving
-// ---------------------------------------------------------------------------
-
-const entryPath = (name) => `/providers/${encodeURIComponent(name)}`;
-
-const listNames = (names) => (names.length === 1 ? names[0] : `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`);
-
-/**
- * An error for a save that went through only in part: the provider is stored
- * as `partial` (its view), without the credentials named in `left`.
- */
-function partialError(cause, partial, left) {
-  const them = left.length === 1 ? 'it' : 'them';
-  const why = String(cause?.message ?? '')
-    .trim()
-    .replace(/\.$/, '');
-  return {
-    status: cause?.status ?? 0,
-    code: cause?.code,
-    aborted: cause?.aborted === true,
-    issues: cause?.issues ?? [],
-    partial,
-    message: `The provider was saved without ${left.length === 1 ? 'the credential' : 'the credentials'} ${listNames(left)}, because adding ${them} failed${why ? `: ${why}` : ''}. Save again to add ${them}.`,
-  };
-}
-
-/**
- * Replace a stored provider entry with `config`.
- *
- * One PUT, unless the entry has credentials without a key that the gateway
- * could hand a removed key to (see "Keyless credentials" in model.js). Then
- * two: the entry without those credentials first, the whole entry second.
- * The answer is checked either way, and a credential that came back with a
- * key it was not given is taken out and put in again.
- *
- * Resolves with the provider view. Rejects with the ApiError of the request
- * that failed, or with a partialError when an earlier request had already
- * changed the stored entry.
- */
-async function replaceEntry(originalName, config) {
-  const names = (indexes) => indexes.map((index) => credentialName(config.credentials[index], index));
-  const keylessIndexes = config.credentials.map((entry, index) => (entry.api_key ? -1 : index)).filter((index) => index !== -1);
-  let name = originalName;
-  let partial = null;
-  let left = [];
-
-  if (keylessIndexes.length > 0) {
-    // Judged against the entry as it is stored now, not as it was when the form opened.
-    const stored = await api.get(entryPath(name));
-    const first = withoutRiskyKeyless(config, stored.config);
-    if (first) {
-      left = names(keylessIndexes.filter((index) => !first.credentials.includes(config.credentials[index])));
-      partial = await api.put(entryPath(name), first);
-      name = partial.name;
-    }
-  }
-
-  const whole = async () => {
-    try {
-      return await api.put(entryPath(name), config);
-    } catch (cause) {
-      throw partial ? partialError(cause, partial, left) : cause;
-    }
-  };
-
-  let view = await whole();
-  let filled = filledKeyless(config, view);
-  if (filled.length === 0) return view;
-
-  // The gateway attached a stored key after all. Taking the credential out
-  // drops that key from the configuration; then it goes back in.
-  const without = { ...config, credentials: config.credentials.filter((_, index) => !filled.includes(index)) };
-  left = names(filled);
-  name = view.name;
-  partial = await api.put(entryPath(name), without);
-  name = partial.name;
-  view = await whole();
-  filled = filledKeyless(config, view);
-  if (filled.length === 0) return view;
-
-  // Still: leave the provider without them rather than with a key on the wrong credential.
-  partial = await api.put(entryPath(view.name), without);
-  throw partialError(
-    { status: 0, message: `the gateway keeps attaching a stored key to ${filled.length === 1 ? 'it' : 'them'}. Give ${filled.length === 1 ? 'it' : 'each'} a label no other credential has, or a key of its own` },
-    partial,
-    names(filled),
-  );
-}
-
-// ---------------------------------------------------------------------------
 // The drawer
 // ---------------------------------------------------------------------------
 
@@ -599,12 +511,16 @@ async function replaceEntry(originalName, config) {
  * takenNames  names of the existing providers
  * onClose()   leave without saving (already confirmed when there were changes)
  * onSaved(view, previousName)
- * onPartial(view, previousName)  a save changed the stored entry and then failed
  * onRetarget(name)  carry the form over to the provider of that name
+ * leaves(to, from)  whether a route change takes the form away (the page
+ *             keeps the form in the URL and knows); such a change, and
+ *             signing out, asks first while there are unsaved changes
+ * onModelsFetched()  the form asked the upstream for its model list: the
+ *             provider's model-list state has changed
  * dirtyRef    kept true while the open form has unsaved changes
  * savingRef   kept true while a save is on its way
  */
-export default function ProviderEditor({ target, takenNames, onClose, onSaved, onPartial, onRetarget, dirtyRef, savingRef }) {
+export default function ProviderEditor({ target, takenNames, onClose, onSaved, onRetarget, onModelsFetched, leaves, dirtyRef, savingRef }) {
   const lastTarget = useRef(null);
   if (target) lastTarget.current = target;
   const shown = target ?? lastTarget.current;
@@ -646,33 +562,14 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
   const goneRef = useRef(gone);
   goneRef.current = gone;
 
-  const save = useAsync(async () => {
+  // One request says everything: the whole entry, every credential with its
+  // key (as shown, or typed anew) or with `null` for "no key".
+  const save = useAsync(() => {
     const s = sessionRef.current;
     const { config, paths } = configFromDraft(s.draft, { resetForKind: s.mode === 'new' || s.draft.kind !== s.originalKind });
     sentPaths.current = paths;
     // A provider that is no longer in the configuration is created again.
-    if (s.mode === 'new' || goneRef.current) return api.post('/providers', config);
-    try {
-      return await replaceEntry(s.originalName, config);
-    } catch (cause) {
-      const stored = cause?.partial;
-      if (stored) {
-        // The entry changed on the gateway: the form now edits what is stored there.
-        setSession((prev) =>
-          prev && prev.key === s.key
-            ? {
-                ...prev,
-                originalName: stored.name,
-                originalKind: stored.kind,
-                baseline: JSON.stringify(configFromDraft(draftFromConfig(stored.config)).config),
-                snapshot: JSON.stringify(stored.config),
-              }
-            : prev,
-        );
-        onPartial?.(stored, s.originalName);
-      }
-      throw cause;
-    }
+    return s.mode === 'new' || goneRef.current ? api.post('/providers', config) : api.put(`/providers/${encodeURIComponent(s.originalName)}`, config);
   });
 
   // A new form starts without the previous one's errors.
@@ -684,28 +581,41 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionKey]);
 
-  const remoteError = useMemo(() => rebaseError(save.error), [save.error]);
-  const error = localError ?? remoteError;
+  // The gateway's issue paths are places in the entry that was sent, which
+  // is how the fields below ask for them.
+  const error = localError ?? save.error;
   const issues = useIssues(error);
 
   const open = !!target;
   const draft = session?.draft;
   const dirty = !!session && JSON.stringify(configFromDraft(draft).config) !== session.baseline;
-  // Written only while open: when the URL closes the form (the Back button),
-  // the page still has to know whether there was something to lose.
+  // Written only while open: the page reads it after the form has closed, to
+  // tell a form that was left from one whose provider vanished under it.
   if (dirtyRef && open) dirtyRef.current = dirty;
   if (savingRef) savingRef.current = save.loading;
 
-  // Closing the tab or reloading with unsaved changes asks first.
-  useEffect(() => {
-    if (!open || !dirty) return undefined;
-    const warn = (event) => {
-      event.preventDefault();
-      event.returnValue = '';
-    };
-    window.addEventListener('beforeunload', warn);
-    return () => window.removeEventListener('beforeunload', warn);
-  }, [open, dirty]);
+  const confirmDiscard = () =>
+    confirm({
+      danger: true,
+      title: sessionRef.current?.mode === 'new' ? 'Discard the new provider?' : `Discard changes to ${sessionRef.current?.originalName}?`,
+      message: 'What you entered in this form has not been saved.',
+      confirmLabel: 'Discard changes',
+      cancelLabel: 'Keep editing',
+    });
+
+  // Every way out that takes the form away asks first while it has unsaved
+  // changes: Back, a link, the command palette, another form, signing out,
+  // and (the browser's own prompt) closing or reloading the tab.
+  const guard = useLeaveGuard(open && dirty, {
+    matters: (to, from) => to === null || !leaves || leaves(to, from),
+    ask: () => {
+      if (savingRef?.current) {
+        toast.info('The provider is being saved', { description: 'Stay on the form until the gateway has answered.' });
+        return false;
+      }
+      return confirmDiscard();
+    },
+  });
 
   if (!session) return null;
 
@@ -784,9 +694,19 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
     const view = await save.run();
     if (view && typeof view === 'object') {
       const created = mode === 'new' || !!gone;
-      toast.success(created ? `Provider ${view.name} created` : `Provider ${view.name} saved`, {
-        description: created ? `${plural((view.credentials ?? []).length, 'credential')}, ${plural(view.model_count ?? 0, 'model')}.` : undefined,
-      });
+      const credentials = plural((view.credentials ?? []).length, 'credential');
+      const title = created ? `Provider ${view.name} created` : `Provider ${view.name} saved`;
+      if ((view.model_count ?? 0) === 0 && servesNothing({ kind: view.kind, discover: view.discover, explicit: view.config?.models?.length ?? 0 })) {
+        // Saved as asked, and left with nothing to route to.
+        toast.warning(title, { description: 'It serves no models: discovery is off and its explicit list is empty. Add models to the list, or switch discovery on.' });
+      } else {
+        toast.success(title, {
+          // While the gateway is still asking the upstream, the model count is not the provider's yet.
+          description: !created ? undefined : view.discovery?.state === 'pending' ? `${credentials}. Its model list is being fetched.` : `${credentials}, ${plural(view.model_count ?? 0, 'model')}.`,
+        });
+      }
+      // Saved: closing the form is not leaving anything behind.
+      guard.release();
       if (dirtyRef) dirtyRef.current = false;
       onSaved(view, originalName);
     } else {
@@ -796,16 +716,9 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
 
   const requestClose = async () => {
     if (save.loading) return;
-    if (dirty) {
-      const ok = await confirm({
-        danger: true,
-        title: mode === 'new' ? 'Discard the new provider?' : `Discard changes to ${originalName}?`,
-        message: 'What you entered in this form has not been saved.',
-        confirmLabel: 'Discard changes',
-        cancelLabel: 'Keep editing',
-      });
-      if (!ok) return;
-    }
+    if (dirty && !(await confirmDiscard())) return;
+    // The question has been asked here: the leave guard does not ask again.
+    guard.release();
     if (dirtyRef) dirtyRef.current = false;
     onClose();
   };
@@ -1009,21 +922,12 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
               />
             <//>
           `}
-          ${draft.kind === 'openai' &&
-          html`<${Switch}
-            label="Relay WebSocket clients over the upstream WebSocket"
-            checked=${draft.websocket}
-            onChange=${(v) => update({ websocket: v })}
-            error=${issues.at('websocket')}
-            hint="Off: WebSocket clients are served from HTTP streaming."
-          />`}
-
           <${HeadersEditor} draft=${draft} update=${update} issues=${issues} />
         <//>
 
-        <${ModelsSection} draft=${draft} update=${update} issues=${issues} paths=${paths} hasIssueUnder=${hasIssueUnder} providerName=${mode === 'edit' ? originalName : null} dirty=${dirty} />
+        <${ModelsSection} draft=${draft} update=${update} issues=${issues} paths=${paths} hasIssueUnder=${hasIssueUnder} providerName=${mode === 'edit' ? originalName : null} dirty=${dirty} onModelsFetched=${onModelsFetched} />
 
-        <${FormError} error=${error} issues=${issues} title=${error?.partial ? 'The provider was saved only in part' : mode === 'new' || gone ? 'Could not create the provider' : 'Could not save the provider'} />
+        <${FormError} error=${error} issues=${issues} title=${mode === 'new' || gone ? 'Could not create the provider' : 'Could not save the provider'} />
       <//>
     <//>
   `;

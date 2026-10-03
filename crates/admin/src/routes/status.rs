@@ -3,6 +3,7 @@
 use crate::Shared;
 use crate::auth::{AuthContext, TICKET_TTL};
 use crate::error::{ApiResult, ok_json};
+use crate::views::{rejection_message, rejection_view, restart_required};
 use axum::Extension;
 use axum::extract::State;
 use serde_json::json;
@@ -38,6 +39,15 @@ pub(crate) async fn status(
     // are the gauges' own.
     let live = telemetry.status(now);
     let access = state.access();
+    // A file the gateway refused is the first thing to know about: nothing
+    // typed into it is in effect, and every edit is refused until it is
+    // fixed. It stays listed for as long as the file holds that content.
+    let rejection = store.rejection();
+    let warnings: Vec<String> = rejection
+        .iter()
+        .map(rejection_message)
+        .chain(scheduler.warnings())
+        .collect();
 
     ok_json(&json!({
         "version": Gateway::version(),
@@ -47,8 +57,10 @@ pub(crate) async fn status(
         "data_dir": telemetry.data_dir().map(|dir| dir.display().to_string()),
         "listen": state.options.listen.map(|addr| addr.to_string()),
         "tls": state.options.tls,
-        "restart_required": store.restart_required(),
-        "warnings": scheduler.warnings(),
+        "restart_required": restart_required(&state),
+        "command_line_overrides": state.options.command_line,
+        "config_rejected": rejection_view(store),
+        "warnings": warnings,
         "counts": {
             "providers": config.providers.len(),
             "credentials": credentials_total,

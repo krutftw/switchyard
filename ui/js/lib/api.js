@@ -7,9 +7,10 @@
 //
 // Every request carries `Authorization: Bearer <admin secret>`. The secret is
 // kept in sessionStorage (this tab only) and, when the user ticks "Remember
-// on this device", also in localStorage. A 401 from any endpoint clears it
-// and flips the auth store to "anonymous", which sends the app back to the
-// login page.
+// on this device", also in localStorage; a tab that resumes a remembered
+// session keeps a copy of its own. A 401 from any endpoint clears it and
+// flips the auth store to "anonymous", which sends the app back to the login
+// page. Signing out does the same in every tab of the browser.
 
 import { createStore } from './store.js';
 
@@ -66,6 +67,18 @@ function setToken(token, remember) {
   storageSet('localStorage', TOKEN_KEY, remember ? token : null);
 }
 
+/**
+ * Keep this tab's own copy of a secret it resumed with. A tab opened on a
+ * remembered session reads the secret from localStorage, which another tab
+ * changes: signing in there without "Remember" removes it. Without a copy of
+ * its own this tab's next request would go out without the secret and end
+ * its session as if the secret had been changed.
+ */
+function adoptToken(token) {
+  memoryToken = token;
+  storageSet('sessionStorage', TOKEN_KEY, token);
+}
+
 function clearToken() {
   memoryToken = null;
   storageSet('sessionStorage', TOKEN_KEY, null);
@@ -81,10 +94,13 @@ function clearToken() {
  *         "authenticated", or "anonymous".
  * reason: why the session ended, shown on the login page:
  *         "expired" (a request got 401), "signed-out", or null.
+ * elsewhere: true when the sign-out happened in another tab of this browser
+ *         (reason is then "signed-out"); false otherwise.
  */
 export const auth = createStore({
   status: getToken() ? 'unknown' : 'anonymous',
   reason: null,
+  elsewhere: false,
 });
 
 // ---------------------------------------------------------------------------
@@ -480,13 +496,15 @@ async function streamSSE(path, body, onEvent, signal) {
 async function login(secret, { remember = false } = {}) {
   await request('POST', '/login', { token: secret, body: {}, keepSessionOn401: true });
   setToken(secret, remember);
-  auth.set({ status: 'authenticated', reason: null });
+  auth.set({ status: 'authenticated', reason: null, elsewhere: false });
 }
 
 /**
- * Validate the stored secret at boot. Resolves true when it is still good.
+ * Validate the stored secret at boot. Resolves true when it is still good,
+ * and from then on this tab keeps its own copy of it (see adoptToken).
  * A network failure rejects so the caller can offer a retry instead of
- * throwing the stored secret away.
+ * throwing the stored secret away. A sign-out in another tab while the
+ * check is on its way wins: the tab stays signed out.
  */
 async function resume() {
   const token = getToken();
@@ -494,11 +512,15 @@ async function resume() {
     auth.set({ status: 'anonymous' });
     return false;
   }
+  const signOuts = signOutsSeen;
   try {
     await request('POST', '/login', { token, body: {}, keepSessionOn401: true, timeout: 10_000 });
-    auth.set({ status: 'authenticated', reason: null });
+    if (signOuts !== signOutsSeen) return false;
+    adoptToken(token);
+    auth.set({ status: 'authenticated', reason: null, elsewhere: false });
     return true;
   } catch (error) {
+    if (signOuts !== signOutsSeen) return false;
     // "invalid": the stored value could never have been accepted by login(),
     // so it is not ours; drop it like a rejected secret.
     if (error.status === 401 || error.code === 'invalid') {
@@ -515,14 +537,89 @@ async function resume() {
   }
 }
 
-function endSession(reason) {
+function endSession(reason, { elsewhere = false } = {}) {
   clearToken();
-  auth.set({ status: 'anonymous', reason });
+  auth.set({ status: 'anonymous', reason, elsewhere });
 }
 
-/** Forget the secret on this device and return to the login page. */
-function logout() {
+// ---------------------------------------------------------------------------
+// Signing out reaches every tab
+// ---------------------------------------------------------------------------
+//
+// "Sign out" forgets the secret in this browser, so every other tab of the
+// dashboard signs out with it: it drops its copy of the secret, closes its
+// live connection (lib/live.js follows the auth store) and shows the sign-in
+// page, which says it happened in another tab. The word goes out on a
+// BroadcastChannel and, for browsers without one, as a localStorage key
+// written and removed at once (the "storage" event reaches the other tabs
+// only). A tab hears both where both work; the second finds it signed out
+// already. Sign-in is not broadcast: each tab signs in by itself. Like a 401,
+// a sign-out from another tab cannot be held back by a leave guard.
+
+const SESSION_CHANNEL = 'sy.admin.session';
+const SIGNOUT_KEY = 'sy.admin.signedOutAt';
+let channel = null;
+/** Sign-outs heard from other tabs; resume() checks it did not miss one. */
+let signOutsSeen = 0;
+
+function signedOutElsewhere() {
+  signOutsSeen += 1;
+  if (auth.get().status === 'anonymous') {
+    // Already on the sign-in page: drop any secret this tab still holds.
+    clearToken();
+    return;
+  }
+  endSession('signed-out', { elsewhere: true });
+}
+
+function onSessionMessage(event) {
+  if (event?.data?.type === 'signed-out') signedOutElsewhere();
+}
+
+function onStorage(event) {
+  if (event?.key === SIGNOUT_KEY && event.newValue) signedOutElsewhere();
+}
+
+/**
+ * Start listening to the other tabs. Called once at load in a browser.
+ * Exported for tests, which load this module before they have a window.
+ */
+export function watchOtherTabs() {
+  if (typeof window === 'undefined') return;
+  if (!channel && typeof BroadcastChannel === 'function') {
+    try {
+      channel = new BroadcastChannel(SESSION_CHANNEL);
+      channel.onmessage = onSessionMessage;
+      // Node (the self-check) would otherwise stay alive for the channel.
+      channel.unref?.();
+    } catch {
+      channel = null;
+    }
+  }
+  window.removeEventListener('storage', onStorage);
+  window.addEventListener('storage', onStorage);
+}
+
+function tellOtherTabs() {
+  try {
+    channel?.postMessage({ type: 'signed-out' });
+  } catch {
+    /* a closed channel: the storage key below still goes out */
+  }
+  storageSet('localStorage', SIGNOUT_KEY, String(Date.now()));
+  storageSet('localStorage', SIGNOUT_KEY, null);
+}
+
+watchOtherTabs();
+
+/**
+ * Forget the secret in this browser and return to the login page. Every
+ * other tab signs out too, unless `allTabs: false` (dropping a stored secret
+ * this tab could not check, while the others may be working with it).
+ */
+function logout({ allTabs = true } = {}) {
   endSession('signed-out');
+  if (allTabs) tellOtherTabs();
 }
 
 export const api = {

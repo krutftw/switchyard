@@ -189,9 +189,11 @@
   place-items: center;
 }
 
+/* Square, whatever the row it sits in: a flex row never squeezes it. */
 .icon-btn {
   width: var(--control-h-md);
   padding: 0;
+  flex-shrink: 0;
 }
 
 .icon-btn[data-size="sm"] {
@@ -1677,16 +1679,36 @@ select.input-el option {
   flex: none;
 }
 
+/* The title takes the room that is left and wraps; the buttons keep theirs. */
 .overlay-head-text {
   display: flex;
   flex-direction: column;
   gap: var(--space-1);
+  flex: 1 1 auto;
   min-width: 0;
   padding-top: var(--space-1);
 }
 
 .overlay-title {
   font-size: var(--text-xl);
+  overflow-wrap: anywhere;
+}
+
+.overlay-desc {
+  overflow-wrap: anywhere;
+}
+
+/* A drawer's own actions and its close button, on one line at their own
+   width: a long title wraps beside them instead of squeezing them. */
+.overlay-head-actions {
+  display: flex;
+  flex: none;
+  align-items: center;
+  gap: var(--space-1);
+}
+
+.overlay-head-actions > * {
+  flex: none;
 }
 
 .overlay-desc {

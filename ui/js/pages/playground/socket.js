@@ -6,19 +6,29 @@
 // This is the client API, not the admin API: it needs a client key, and a
 // browser can only present one in the socket's URL (?key=). The key lives in
 // this component's state and nowhere else: not in the page address, not in
-// storage, not in the console. Leaving the page closes the socket and forgets
-// the key; the turns and frames (which never contain it) are kept in
-// session.js, so they are still there when the reader comes back.
+// storage. Leaving the page closes the socket and forgets the key; the turns
+// and frames (which never contain it) are kept in session.js, so they are
+// still there when the reader comes back.
+//
+// A browser prints the full address of a socket that fails to open in its
+// console, key included, and nothing the page does can stop it. So the page
+// gives it no failed socket to print: it asks the gateway over HTTP whether
+// the key is accepted (the key in a header, which the console never shows)
+// before it opens the socket, and a socket still connecting when the reader
+// cancels or leaves is closed once it is open instead of being abandoned. A
+// socket that is refused all the same (a proxy that blocks the upgrade) is
+// printed there; the notice above the key field says so.
 
-import { html, useEffect, useRef, useState } from '../../../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Button, CodeBlock, EmptyState, IconButton, Notice, Panel, SecretInput, StatusLamp, Switch, Textarea, confirm } from '../../components/index.js';
 import { nextId } from '../../lib/dom.js';
 import { formatTime } from '../../lib/format.js';
 import { useMediaQuery, useResource } from '../../lib/hooks.js';
-import { useLive } from '../../lib/live.js';
+import { useLive, useLiveGap } from '../../lib/live.js';
 import { href } from '../../lib/router.js';
 import Combobox from './combobox.js';
 import Conversation from './conversation.js';
+import { focusAdrift, focusFirst, rescueFocus } from './focus.js';
 import FrameList from './framelist.js';
 import { closeCodeMeaning, createReader, digestEvent, readError } from './protocols.js';
 import { socketMemory } from './session.js';
@@ -29,9 +39,11 @@ const FRAME_CAP = 500;
 const frameText = (frame) => `${frame.dir === 'out' ? '>' : frame.dir === 'in' ? '<' : '#'} ${frame.data || frame.name}`;
 
 /**
- * Why a socket that never opened was refused. Browsers report every failed
- * handshake as close code 1006 with no reason, so ask the same gateway the
- * same question over HTTP, where the answer can be read.
+ * Whether the gateway takes this key, asked over HTTP: before a socket is
+ * opened (a refused socket puts its address, key included, in the console),
+ * and again for a socket that never opened, which browsers report as close
+ * code 1006 with no reason. 'key' (refused), 'upgrade' (accepted: a socket
+ * that fails now is blocked on its way), 'unreachable', 'http-<status>'.
  */
 async function diagnose(origin, key, signal) {
   try {
@@ -48,6 +60,18 @@ async function diagnose(origin, key, signal) {
   }
 }
 
+/**
+ * Let go of a socket that is still connecting without the browser calling it
+ * a failure (closing it now prints "closed before the connection is
+ * established" with its address): close it the moment it opens.
+ */
+function abandon(ws, reason) {
+  ws.onmessage = null;
+  ws.onclose = null;
+  ws.onerror = null;
+  ws.onopen = () => ws.close(1000, reason);
+}
+
 function refusalText(reason, hasKey) {
   if (reason === 'key') {
     return hasKey
@@ -57,7 +81,7 @@ function refusalText(reason, hasKey) {
   if (reason === 'upgrade') {
     return 'The key is accepted over HTTP, so the WebSocket upgrade itself is being blocked. A reverse proxy in front of the gateway must forward the Upgrade and Connection headers.';
   }
-  if (reason === 'unreachable') return 'The gateway cannot be reached from this browser. Check that Switchyard is running.';
+  if (reason === 'unreachable') return 'Switchyard did not answer this browser. Check that it is running and reachable from this device, then connect again.';
   if (reason?.startsWith('http-')) return `The gateway answers HTTP ${reason.slice(5)} on the client API. Check the gateway log for the reason.`;
   return 'Browsers do not say why a WebSocket was refused. Checking the key over HTTP.';
 }
@@ -72,6 +96,7 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
   const status = useResource('/status');
   // auth.required can change while the page is open (Settings in another tab, an edited config file).
   useLive('config.reloaded', status.refresh);
+  useLiveGap(status.refresh);
   const authRequired = status.data?.auth_required;
   const coarse = useMediaQuery('(pointer: coarse)');
 
@@ -92,11 +117,28 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
   const reader = useRef(null);
   const active = useRef(null); // id of the assistant turn being received
   const raf = useRef(0);
-  const probe = useRef(null);
+  const probe = useRef(null); // the HTTP key check in flight
+  const pending = useRef(null); // { secret, fromField } from connect() until the socket opens or is refused
   const mounted = useRef(true);
+  const keyId = useRef(null);
+  if (!keyId.current) keyId.current = nextId('ws-key');
 
   const wsUrl = `${origin.replace(/^http/, 'ws')}/v1/responses`;
   const busy = active.current != null;
+
+  // Where the keyboard goes when the control that had it is disabled by
+  // what it started (see focus.js): the key field while a socket is open,
+  // "Send turn" while a turn runs, the message field once the socket closed.
+  const root = useRef(null);
+  // On a touch screen a focused text field brings the keyboard up over the
+  // answer: there the transcript takes the focus instead.
+  const messageField = () => root.current?.querySelector(coarse ? '.play-transcript[tabindex]' : '.play-composer textarea');
+  const connectButton = () => root.current?.querySelector('[data-play-connect]');
+  const keyField = () => document.getElementById(keyId.current);
+  useLayoutEffect(() => {
+    const at = document.activeElement;
+    if (at && at.disabled && root.current?.contains(at)) focusFirst(messageField(), connectButton());
+  }, [state, busy, lastResponseId]);
 
   // Both are written through to session.js first, so what happens while the
   // page is being left (the socket closing) is kept as well.
@@ -141,9 +183,28 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     );
   };
 
-  const disconnect = (code = 1000, reason = 'closed by the playground') => {
+  /** The attempt in progress was called off by the reader, before any socket opened. */
+  const cancelled = (secret) => {
+    setState('closed');
+    record({ name: 'cancelled', data: 'Stopped by the playground before the socket opened.', tone: 'info' });
+    setClosed({ code: 0, reason: '', opened: false, refusal: null, cancelled: true, hadKey: !!secret });
+  };
+
+  const disconnect = () => {
     const ws = socket.current;
-    if (ws && ws.readyState <= 1) ws.close(code, reason);
+    if (ws?.readyState === 1) {
+      ws.close(1000, 'closed by the playground');
+      return;
+    }
+    // Still checking the key over HTTP, or the socket is still connecting.
+    const attempt = pending.current;
+    if (!attempt) return;
+    pending.current = null;
+    probe.current?.abort();
+    probe.current = null;
+    socket.current = null;
+    if (ws?.readyState === 0) abandon(ws, 'cancelled by the playground');
+    cancelled(attempt.secret);
   };
 
   useEffect(() => {
@@ -155,19 +216,25 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
       const ws = socket.current;
       socket.current = null;
       if (!ws || ws.readyState > 1) return;
-      const wasOpen = ws.readyState === 1;
+      if (ws.readyState === 0) {
+        abandon(ws, 'left the playground');
+        return;
+      }
       ws.close(1000, 'left the playground');
-      if (!wasOpen) return;
       // The close event arrives after the page is gone: write the end of this socket down now.
       record({ name: 'close 1000', data: 'Closed by the playground when the page was left.', tone: 'info' });
       if (active.current) {
-        finishTurn({ status: 'error', error: { kind: 'stream', status: 0, message: 'The socket was closed before the response finished, because the page was left.', issues: [] } });
+        finishTurn({ status: 'error', error: { kind: 'stream', via: 'socket', status: 0, message: 'The socket was closed before the response finished, because the page was left.', issues: [] } });
       }
       setClosed({ code: 1000, reason: '', opened: true, refusal: null, left: true });
     };
   }, []);
 
-  const connect = () => {
+  /**
+   * fromField  the attempt was started with Enter in the key field: a refusal
+   *            hands the focus back there, to correct the key.
+   */
+  const connect = ({ fromField = false } = {}) => {
     const secret = key.trim();
     if (/\s/.test(secret) || /[^!-~]/.test(secret)) {
       setKeyError('A client key has no spaces or special characters. Paste it again as one line.');
@@ -186,23 +253,60 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     frames.current.openedAt = Date.now();
     setLastResponseId(null);
     active.current = null;
+    const attempt = { secret, fromField };
+    pending.current = attempt;
+    setState('connecting');
 
+    // The key is asked about over HTTP first: a socket the gateway refuses
+    // would put its address, key included, in the browser's console.
+    const controller = new AbortController();
+    probe.current = controller;
+    diagnose(origin, secret, controller.signal).then((answer) => {
+      if (controller.signal.aborted || pending.current !== attempt || !mounted.current) return;
+      probe.current = null;
+      if (answer === 'key' || answer === 'unreachable') refuse(attempt, answer);
+      else open(attempt);
+    });
+  };
+
+  /** No socket is opened: the HTTP check says it would be refused. */
+  const refuse = (attempt, refusal, why) => {
+    pending.current = null;
+    setState('closed');
+    record({
+      name: 'not opened',
+      data: why ?? (refusal === 'key' ? 'The key was refused over HTTP. No socket was opened.' : 'No answer over HTTP. No socket was opened.'),
+      tone: 'stop',
+    });
+    setClosed({ code: 0, reason: '', opened: false, refusal, hadKey: !!attempt.secret });
+    if (attempt.fromField) {
+      setTimeout(() => {
+        if (focusAdrift() || document.activeElement === connectButton()) focusFirst(keyField());
+      }, 0);
+    }
+  };
+
+  const open = (attempt) => {
+    const { secret } = attempt;
     let ws;
     try {
       ws = new WebSocket(secret ? `${wsUrl}?key=${encodeURIComponent(secret)}` : wsUrl);
     } catch {
-      setState('closed');
-      setClosed({ code: 0, reason: '', opened: false, refusal: 'unreachable' });
+      refuse(attempt, 'unreachable', 'The browser would not open a socket to this address.');
       return;
     }
     socket.current = ws;
-    setState('connecting');
     let opened = false;
 
     ws.onopen = () => {
       if (socket.current !== ws) return;
       opened = true;
+      pending.current = null;
       setState('open');
+      // Connected from the key field or the Connect button: the message is what comes next.
+      setTimeout(() => {
+        if (focusAdrift() || document.activeElement === connectButton()) focusFirst(messageField());
+      }, 0);
       setTurns((list) =>
         list.some((t) => t.role !== 'note') && list[list.length - 1]?.role !== 'note'
           ? [...list, { id: nextId('ws-turn'), role: 'note', text: 'A new socket was opened here. It does not remember the turns above: the next turn starts a new conversation.' }]
@@ -227,12 +331,19 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
       record({ dir: 'in', name: type, note: json ? digestEvent('openai-responses', { json, data: event.data }) : '', data: event.data, tone: type === 'error' || type === 'response.failed' ? 'stop' : undefined });
       const r = reader.current;
       if (!json || !r || !active.current) return;
+      // An error frame in answer to the request itself (nothing of a
+      // response was sent yet) is a refusal; one after that is a stream
+      // that broke.
+      const started = r.state.responseId != null;
       r.event({ json, data: event.data });
       if (type === 'response.completed' || type === 'response.incomplete') {
         if (typeof json.response?.id === 'string') setLastResponseId(json.response.id);
         finishTurn({});
       } else if (type === 'error' || type === 'response.failed') {
-        const error = { kind: 'stream', ...readError(json), retryAfter: null };
+        // readError takes the wait from error.headers["retry-after"]: a socket has no response headers.
+        const error = { kind: started ? 'stream' : 'frame', via: 'socket', ...readError(json) };
+        // The gateway does not have the response this page named: stop naming it.
+        if (error.code === 'previous_response_not_found') setLastResponseId(null);
         finishTurn({ status: 'error', error });
       }
     };
@@ -240,12 +351,15 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     ws.onclose = (event) => {
       if (socket.current !== ws) return;
       socket.current = null;
+      pending.current = null;
       setState('closed');
+      // Its responses went with it: the next socket could not continue any of them.
+      setLastResponseId(null);
       record({ name: `close ${event.code}`, data: event.reason || closeCodeMeaning(event.code), tone: event.code === 1000 ? 'info' : 'stop' });
       if (active.current) {
-        finishTurn({ status: 'error', error: { kind: 'stream', status: 0, message: `The socket closed (${event.code}) before the response finished.`, issues: [] } });
+        finishTurn({ status: 'error', error: { kind: 'stream', via: 'socket', status: 0, message: `The socket closed (${event.code}) before the response finished.`, issues: [] } });
       }
-      const info = { code: event.code, reason: event.reason, opened, refusal: null };
+      const info = { code: event.code, reason: event.reason, opened, refusal: null, hadKey: !!secret };
       setClosed(info);
       if (!opened) {
         const controller = new AbortController();
@@ -264,13 +378,21 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     const id = nextId('ws-turn');
     reader.current = createReader('openai-responses');
     active.current = id;
+    // A response.create without previous_response_id is a request of its
+    // own: the gateway sends the model this input and nothing that came
+    // before. Say so where the turns above would suggest otherwise (after a
+    // new socket the note is already there).
+    const fresh = !frame.previous_response_id;
     setTurns((list) => [
       ...list,
+      ...(fresh && list.some((t) => t.role !== 'note') && list[list.length - 1]?.role !== 'note'
+        ? [{ id: nextId('ws-turn'), role: 'note', text: 'A new conversation starts here: the next turn was sent without previous_response_id, so the model does not see the turns above.' }]
+        : []),
       ...(userText != null ? [{ id: nextId('ws-turn'), role: 'user', text: userText }] : []),
       { id, role: 'assistant', status: 'waiting', blocks: [], model: frame.model ?? model, protocol: 'openai-responses' },
     ]);
     ws.send(data);
-    record({ dir: 'out', name: frame.type, note: frame.previous_response_id ? 'continues the previous response' : 'new conversation', data });
+    record({ dir: 'out', name: frame.type, note: fresh ? 'new conversation' : 'continues the latest response', data });
   };
 
   const input = text.trim();
@@ -295,6 +417,8 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
 
   const sendToolResults = (turnId, results) => {
     setTurns((list) => list.map((t) => (t.id === turnId ? { ...t, blocks: t.blocks.map((b) => (b.type === 'tool_call' && b.id in results ? { ...b, result: results[b.id] } : b)) } : t)));
+    // The button that sent them leaves with the result form.
+    rescueFocus(messageField);
     const frame = { type: 'response.create', model: model.trim() };
     if (lastResponseId) frame.previous_response_id = lastResponseId;
     frame.input = Object.entries(results).map(([call_id, output]) => ({ type: 'function_call_output', call_id, output }));
@@ -322,11 +446,12 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
       ? html`<${StatusLamp} tone="clear" pulse label="Connected" />`
       : state === 'connecting'
         ? html`<${StatusLamp} tone="info" pulse label="Connecting" />`
-        : state === 'closed'
+        : state === 'closed' && !closed?.cancelled
           ? html`<${StatusLamp} tone=${closed && closed.opened && closed.code === 1000 ? 'off' : 'stop'} label=${closed?.opened ? `Closed, code ${closed.code}` : 'Refused'} />`
           : html`<${StatusLamp} tone="off" label="Not connected" />`;
 
-  const closedNotice = !closed
+  // A connection the reader called off is not a refusal: the frame list says it was cancelled.
+  const closedNotice = !closed || closed.cancelled
     ? null
     : closed.left
       ? html`<${Notice} title="The socket was closed when you left this page">
@@ -336,17 +461,20 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
         ? html`<${Notice} tone=${closed.code === 1000 ? 'neutral' : 'stop'} title=${`Closed with code ${closed.code}${closed.reason ? `: ${closed.reason}` : ''}`}>
             ${closeCodeMeaning(closed.code)}
           <//>`
-        : html`<${Notice} tone="stop" title="The gateway refused the connection">${refusalText(closed.refusal, !!key.trim())}<//>`;
+        : html`<${Notice} tone="stop" title=${closed.refusal === 'unreachable' ? 'The gateway could not be reached' : 'The gateway refused the connection'}>
+            ${refusalText(closed.refusal, closed.hadKey)}
+          <//>`;
 
   return html`
-    <div class="play-grid" data-layout="socket">
+    <div class="play-grid" data-layout="socket" ref=${root}>
       <div class="play-col">
         <${Panel} title="Connection" description=${html`<span class="mono">${wsUrl}</span>`} actions=${lamp}>
           <div class="stack" style="--gap:var(--space-3)">
             <${Notice} tone="caution" title="The key travels in the socket's address">
-              Browsers cannot set headers on a WebSocket, so the key is sent as ?key= in the socket URL. It is kept in this tab's memory only: never in the page address, never in storage. Developer tools and proxies that log URLs can still see it, so use a key you can revoke.
+              Browsers cannot set headers on a WebSocket, so the key is sent as ?key= in the socket URL. It is kept in this tab's memory only: never in the page address, never in storage. Developer tools, the browser's console when a socket is refused on its way to the gateway, and proxies that log URLs can still see it, so use a key you can revoke.
             <//>
             <${SecretInput}
+              id=${keyId.current}
               label="Client key"
               value=${key}
               onChange=${(value) => {
@@ -361,13 +489,18 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
                 ? 'This gateway accepts clients without a key (auth.required is off). Leave the field empty.'
                 : html`Paste a key from the <a href=${href('/keys')}>API keys</a> page. It is forgotten when you leave this page.`}
               onKeyDown=${(event) => {
-                if (event.key === 'Enter' && state !== 'open' && state !== 'connecting') connect();
+                if (event.key !== 'Enter' || event.isComposing) return;
+                // Connecting locks this field, and the focus moves to the
+                // button beside it, which reads Disconnect by then: the
+                // keypress that follows must not reach it.
+                event.preventDefault();
+                if (state !== 'open' && state !== 'connecting') connect({ fromField: true });
               }}
             />
             <div class="row row-wrap">
               ${state === 'open' || state === 'connecting'
-                ? html`<${Button} onClick=${() => disconnect()}>Disconnect<//>`
-                : html`<${Button} variant="primary" icon="plug" onClick=${connect}>Connect<//>`}
+                ? html`<${Button} data-play-connect="" onClick=${() => disconnect()}>Disconnect<//>`
+                : html`<${Button} data-play-connect="" variant="primary" icon="plug" onClick=${() => connect()}>Connect<//>`}
             </div>
             ${closedNotice}
           </div>
@@ -435,10 +568,10 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
               disabled=${!lastResponseId}
               onChange=${setChain}
               hint=${!lastResponseId
-                ? 'Available after the first response on this socket.'
+                ? 'Available once this socket has a response to continue from.'
                 : chained
-                  ? html`Adds <span class="mono">previous_response_id</span>: the gateway puts this socket's earlier turns in front of the new message.`
-                  : html`Sent without <span class="mono">previous_response_id</span>: a request of its own, which starts a new conversation on the same socket.`}
+                  ? html`Adds <span class="mono">previous_response_id</span>, naming the latest response: the gateway puts the conversation that led to it in front of the new message.`
+                  : html`Sent without <span class="mono">previous_response_id</span>: a request of its own, which starts a new conversation on the same socket. The model sees this message only.`}
             />
             <div class="play-composer-actions">
               <span class="faint">${busy ? 'Receiving the response. One turn runs at a time.' : ''}</span>

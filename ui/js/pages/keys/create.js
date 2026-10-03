@@ -4,8 +4,9 @@
 // key, the key itself in full with ready-to-paste examples. The second stage
 // has one way out, the "I have copied it" button: Escape, the scrim and the
 // close button are off, so the only showing of the key cannot be lost to a
-// stray click. Back, Forward, a link and the command palette are held off the
-// same way (guard.js).
+// stray click. Back, Forward, a link and an edited address are held off by a
+// leave guard, and the shell keeps the command palette shut over a dialog
+// that is not dismissable.
 //
 // The full key lives in this component's state and nowhere else: not in the
 // URL, not in storage, not in the console. Whatever the dialog held (the
@@ -17,9 +18,9 @@ import { Button, Checkbox, CopyButton, Form, FormError, Icon, Input, Modal, Noti
 import { api } from '../../lib/api.js';
 import { formatNumber, plural } from '../../lib/format.js';
 import { useAsync, useUid } from '../../lib/hooks.js';
-import { useLeaveGuard } from './guard.js';
+import { useLeaveGuard } from '../../lib/router.js';
 import { ConnectExamples, ModelPatternsField, SecretText } from './parts.js';
-import { emptyReference, referenceName, sentence } from './util.js';
+import { emptyReference, referenceName } from './util.js';
 
 export const NAME_MAX = 100;
 /** The gateway stores the limit as a u32; this is a ceiling nobody means to pass. */
@@ -50,16 +51,10 @@ function keyProblem(draft) {
   if (!draft.own) return undefined;
   const text = draft.key.trim();
   if (!text) return 'Enter a key value, or untick the box to have the gateway generate one.';
-  // The gateway accepts "env:" and then looks for a variable with no name.
+  // The gateway refuses a reference without a variable name (422).
   if (emptyReference(text)) return 'Name the variable the key is read from, as in env:TEAM_KEY.';
   if (/\s/.test(text)) return 'A key cannot contain spaces.';
   return undefined;
-}
-
-/** Which field a 409 belongs to: the gateway sends a sentence, no issue path. */
-function conflictField(error) {
-  if (error?.status !== 409) return null;
-  return /named/i.test(error.message) ? 'name' : 'key';
 }
 
 function OwnKeyNote({ value }) {
@@ -83,7 +78,7 @@ function OwnKeyNote({ value }) {
   return null;
 }
 
-function Created({ created, entry, models, listen, innerRef }) {
+function Created({ created, entry, models, listen, tls, innerRef }) {
   const variable = created.is_reference ? referenceName(created.key) : null;
   const limits = [
     created.models.length === 0 ? 'All models' : plural(created.models.length, 'model pattern'),
@@ -108,6 +103,7 @@ function Created({ created, entry, models, listen, innerRef }) {
           patterns=${created.models}
           models=${models.data}
           listen=${listen}
+          tls=${tls}
         />
       </div>
     </div>
@@ -119,10 +115,10 @@ function Created({ created, entry, models, listen, innerRef }) {
  * existing        the current keys (GET /keys), for the name check and to
  *                 learn whether a reference resolved
  * models          useResource('/models')
- * listen          status.listen
+ * listen, tls     status.listen and status.tls
  * onCreated       ({ id, key, is_reference }) => void, as soon as the key exists
  */
-export function CreateKeyModal({ open, onClose, existing, models, listen, onCreated }) {
+export function CreateKeyModal({ open, onClose, existing, models, listen, tls, onCreated }) {
   const formId = useUid('keys-create');
   const [draft, setDraft] = useState(EMPTY);
   const [problems, setProblems] = useState({});
@@ -166,9 +162,10 @@ export function CreateKeyModal({ open, onClose, existing, models, listen, onCrea
     };
   }, [open]);
 
-  // While the key is on show the dialog has one way out. Hold the others.
+  // While the key is on show the dialog has one way out. Every change of
+  // the route is refused, a change of the query included.
   useLeaveGuard(open && created != null, {
-    blockPalette: true,
+    matters: () => true,
     ask: () => {
       toast.info(created?.is_reference ? 'Close the dialog first' : 'The new key is still on show', {
         id: 'keys-created-guard',
@@ -236,22 +233,18 @@ export function CreateKeyModal({ open, onClose, existing, models, listen, onCrea
         dismissable=${false}
         footer=${html`<${Button} variant="primary" onClick=${finish}>${created.is_reference ? 'Done' : 'I have copied it'}<//>`}
       >
-        <${Created} created=${created} entry=${(existing ?? []).find((key) => key.id === created.id)} models=${models} listen=${listen} innerRef=${createdRef} />
+        <${Created} created=${created} entry=${(existing ?? []).find((key) => key.id === created.id)} models=${models} listen=${listen} tls=${tls} innerRef=${createdRef} />
       <//>
     `;
   }
 
-  const conflict = conflictField(create.error);
-  const fromGateway = (field) => {
-    if (touched[field] || !create.error) return undefined;
-    return issues.at(field) ?? (conflict === field ? sentence(create.error.message) : undefined);
-  };
-  const nameError = problems.name ?? fromGateway('name');
-  const keyError = problems.key ?? fromGateway('key');
+  // The gateway names the field in every refusal (400, 409 and 422 alike).
+  // An issue for the key field while that field is not on screen is listed
+  // by FormError instead.
+  const nameError = problems.name ?? (touched.name ? undefined : issues.at('name'));
+  const keyError = problems.key ?? (touched.key || !draft.own ? undefined : issues.at('key'));
   const modelIssues = touched.models ? [] : issues.under('models');
   const rpmError = touched.rpm ? undefined : issues.at('rate_limit_rpm');
-  // A conflict that landed on a visible field is already told there.
-  const conflictShown = conflict && (conflict === 'name' ? !touched.name : draft.own && !touched.key);
 
   return html`
     <${Modal}
@@ -317,11 +310,9 @@ export function CreateKeyModal({ open, onClose, existing, models, listen, onCrea
               <${OwnKeyNote} value=${draft.key} />
             `}
           </div>
-          ${!conflictShown && html`<${FormError} error=${create.error} issues=${issues} title="Could not create the key" />`}
+          <${FormError} error=${create.error} issues=${issues} title="Could not create the key" />
         <//>
       </div>
     <//>
   `;
 }
-
-export default CreateKeyModal;

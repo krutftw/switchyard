@@ -97,6 +97,7 @@ async fn serve(path: &Path, args: &ServeArgs, log: LogControl) -> Result<(), Cli
     let mut admin = AdminOptions::from_env();
     admin.listen = Some(addr);
     admin.tls = tls;
+    admin.command_line = command_line_overrides(args);
     let secret_from_env = admin.secret_override.is_some();
     let app = switchyard_server::router(gateway.clone())
         .merge(switchyard_admin::router(gateway.clone(), admin));
@@ -130,6 +131,20 @@ async fn serve(path: &Path, args: &ServeArgs, log: LogControl) -> Result<(), Cli
             "the server stopped with an error: {error}"
         ))),
     }
+}
+
+/// The settings `--host` / `--port` fix whatever the file says, as the
+/// dotted paths the admin API names them by. A restart with the same
+/// command line does not apply the file's value of these.
+fn command_line_overrides(args: &ServeArgs) -> Vec<String> {
+    let mut overridden = Vec::new();
+    if args.host.is_some() {
+        overridden.push("server.host".to_string());
+    }
+    if args.port.is_some() {
+        overridden.push("server.port".to_string());
+    }
+    overridden
 }
 
 /// Explains why the gateway could not be started.
@@ -315,6 +330,27 @@ mod tests {
         assert_eq!(
             tls.message,
             "cannot start the HTTPS listener: TLS private key file key.pem: access denied"
+        );
+    }
+
+    /// Regression (SU-5): the dashboard promised that a restart would apply
+    /// a changed `server.port` that `--port` keeps overriding.
+    #[test]
+    fn host_and_port_flags_are_reported_as_command_line_overrides() {
+        assert!(command_line_overrides(&ServeArgs::default()).is_empty());
+        let port = ServeArgs {
+            port: Some(18533),
+            ..ServeArgs::default()
+        };
+        assert_eq!(command_line_overrides(&port), ["server.port"]);
+        let both = ServeArgs {
+            host: Some("0.0.0.0".into()),
+            port: Some(0),
+            ..ServeArgs::default()
+        };
+        assert_eq!(
+            command_line_overrides(&both),
+            ["server.host", "server.port"]
         );
     }
 

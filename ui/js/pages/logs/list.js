@@ -15,7 +15,7 @@ import { Button, CopyButton, IconButton } from '../../components/button.js';
 import { highlightJson } from '../../components/code.js';
 import { Badge } from '../../components/status.js';
 import { api } from '../../lib/api.js';
-import { formatDate, formatTime } from '../../lib/format.js';
+import { DASH, formatTime, formatTimestamp } from '../../lib/format.js';
 import { href } from '../../lib/router.js';
 import { fieldText, levelTone, lineToJson, lineToText, lowerBound, splitHits, tailOf } from './model.js';
 
@@ -28,18 +28,10 @@ const TARGET_CHARS = 30;
 /** Field values longer than this get a title with the whole value. */
 const CHIP_TITLE_FROM = 40;
 
-const pad2 = (value) => String(value).padStart(2, '0');
-
 /** "2 Oct 2026 23:50:08.060 UTC+08:00" in local time. */
-export function fullTime(at) {
-  if (at == null) return 'Time unknown';
-  const date = new Date(at);
-  if (Number.isNaN(date.getTime())) return 'Time unknown';
-  const offset = -date.getTimezoneOffset();
-  const abs = Math.abs(offset);
-  const zone = `UTC${offset < 0 ? '−' : '+'}${pad2(Math.floor(abs / 60))}:${pad2(abs % 60)}`;
-  // A reference date in 1970 keeps the year in the output.
-  return `${formatDate(date, new Date(0))} ${formatTime(date, { ms: true })} ${zone}`;
+function fullTime(at) {
+  const text = formatTimestamp(at, { zone: true });
+  return text === DASH ? 'Time unknown' : text;
 }
 
 function isoTime(at) {
@@ -319,6 +311,18 @@ export function LogList({ lines, needle, expanded, activeSeq, targetOn, marks, f
   state.offsets = offsets;
   state.follow = follow;
   state.keyboardOn = activeSeq;
+  // The line that has just been opened (the layout effect keeps its first
+  // row in view).
+  if (state.expanded !== expanded) {
+    if (state.expanded) {
+      for (const seq of expanded) if (!state.expanded.has(seq)) state.opened = seq;
+    }
+    state.expanded = expanded;
+  }
+  // The control inside a row that has the focus, before the rows are drawn
+  // again (the layout effect below gives it back when drawing took it).
+  const focused = document.activeElement;
+  state.focused = focused && rowsEl.current && rowsEl.current.contains(focused) ? focused : null;
 
   // The window: what the viewport will show once this render is positioned.
   const viewHeight = state.viewHeight || 600;
@@ -386,6 +390,16 @@ export function LogList({ lines, needle, expanded, activeSeq, targetOn, marks, f
     if (!el) return;
     let dirty = false;
 
+    // When the rows drawn shift by more than one (a batch of new lines, a
+    // scroll), Preact takes the rows that stay out of the document and puts
+    // them back, and an element that leaves the document loses the focus.
+    // The control that had it gets it back; when its row is no longer
+    // drawn, or the control itself is gone (a closed line), the list does.
+    if (state.focused && (!document.activeElement || document.activeElement === document.body)) {
+      (state.focused.isConnected ? state.focused : el).focus({ preventScroll: true });
+    }
+    state.focused = null;
+
     if (el.clientWidth !== state.width) {
       // A new width re-wraps every wrapped row, and a narrow log lays its
       // lines out on two rows: nothing measured so far can be trusted.
@@ -402,6 +416,12 @@ export function LogList({ lines, needle, expanded, activeSeq, targetOn, marks, f
     }
     const topHeight = topEl.current ? topEl.current.getBoundingClientRect().height : 0;
     if (Math.abs(topHeight - state.topHeight) > 0.5) {
+      // What stands above the first line changed its height while it was in
+      // view (the reason older lines could not be loaded, say). It keeps its
+      // place and the lines move: held to the first line, the view would
+      // scroll the new text out of sight.
+      const anchor = state.anchor;
+      if (anchor && anchor.delta < 0 && state.lines.length > 0 && state.lines[0].seq === anchor.seq) anchor.delta -= topHeight - state.topHeight;
       state.topHeight = topHeight;
       dirty = true;
     }
@@ -452,16 +472,33 @@ export function LogList({ lines, needle, expanded, activeSeq, targetOn, marks, f
       if (Math.abs(el.scrollTop - state.scrollTop) > 0.5 && !atEnd(el)) return;
       const max = el.scrollHeight - el.clientHeight;
       if (Math.abs(el.scrollTop - max) > 0.5) el.scrollTop = max;
+      // A line was opened and, held at the end, the list would push its
+      // first row out at the top (a phone, a line with many fields): that
+      // row is what must stay in view, so following ends there.
+      const at = state.opened == null ? state.lines.length : lowerBound(state.lines, state.opened);
+      if (at < state.lines.length && state.lines[at].seq === state.opened) {
+        const rowTop = state.topHeight + state.offsets[at];
+        // (By more than the slack that still counts as being at the end.)
+        if (rowTop < el.scrollTop - END_SLACK) {
+          el.scrollTop = rowTop;
+          state.scrollTop = el.scrollTop;
+          updateAnchor();
+          onFollow(false);
+        }
+      }
     } else if (state.anchor && state.lines.length > 0) {
       const at = Math.min(state.lines.length - 1, lowerBound(state.lines, state.anchor.seq));
       const want = state.topHeight + state.offsets[at] + state.anchor.delta;
       if (Math.abs(el.scrollTop - want) > 0.5) el.scrollTop = want;
     }
     state.scrollTop = el.scrollTop;
+    state.opened = null;
 
-    // A list that fits its viewport cannot be scrolled away from its end:
-    // without a line being read, it follows.
-    if (!state.follow && state.keyboardOn == null && el.scrollHeight <= el.clientHeight + 0.5) onFollow(true);
+    // A list that fits its viewport cannot be scrolled away from its end,
+    // and one that lost so many lines to a filter that its place is now the
+    // end is there without a scroll event to say so: without a line being
+    // read, it follows.
+    if (!state.follow && state.keyboardOn == null && (el.scrollHeight <= el.clientHeight + 0.5 || atEnd(el))) onFollow(true);
   });
 
   // The viewport itself changes size with the window and the toolbar.
@@ -600,6 +637,3 @@ export function LogList({ lines, needle, expanded, activeSeq, targetOn, marks, f
     </div>
   `;
 }
-
-// Modules under js/pages/ are checked for a default export (ui/tests/check.mjs).
-export default LogList;

@@ -10,7 +10,6 @@ import {
   ErrorState,
   Field,
   Form,
-  FormError,
   Icon,
   IconButton,
   Input,
@@ -21,13 +20,12 @@ import {
   TagInput,
   confirm,
   toast,
-  useIssues,
 } from '../../components/index.js';
 import { prefersReducedMotion } from '../../lib/dom.js';
-import { plural } from '../../lib/format.js';
+import { plural, sentence } from '../../lib/format.js';
 import { useResource, useUid } from '../../lib/hooks.js';
 import { ApiError } from '../../lib/api.js';
-import { ConflictNotice, SaveBar, confirmDiscard, focusMoved, focusSoon, moveItem, rowId, sentence, useListDraft, useRevealProblem, useSaveHotkey, useUnsavedGuard, withStop } from './common.js';
+import { ConflictNotice, SaveBar, SaveError, confirmDiscard, focusMoved, focusSoon, moveItem, rowId, useDiskInvalid, useFieldIssues, useListDraft, useRevealProblem, useSaveHotkey, useUnsavedGuard } from './common.js';
 import { exact, getExact, holdsNull, inexactNumbers, lossIn, oversizedIntegers, parseExact } from './exact.js';
 
 // The rules are read with their numbers kept exact (see exact.js): saving
@@ -113,9 +111,13 @@ function cleanRule(kind, rule) {
 
 const toBody = (draft) => Object.fromEntries(KINDS.map((kind) => [kind.id, draft[kind.id].map((rule) => cleanRule(kind.id, rule))]));
 
-/** "payload.default[0].set" and "default.0.set" -> { kind: 'default', index: 0, rest: 'set' } */
+/**
+ * Where an issue of a refused save points. Its path is its place in the body
+ * that was sent, as useIssues writes it: "override.0.set.x" ->
+ * { kind: 'override', index: 0, rest: 'set.x' }.
+ */
 function parseIssuePath(path) {
-  const match = /^(?:payload\.)?(default|override|filter)\.(\d+)(?:\.(.*))?$/.exec(path);
+  const match = /^(default|override|filter)\.(\d+)(?:\.(.*))?$/.exec(path);
   return match ? { kind: match[1], index: Number(match[2]), rest: match[3] ?? '' } : null;
 }
 
@@ -423,7 +425,7 @@ function Example({ example, onInsert }) {
 // Tab
 // ---------------------------------------------------------------------------
 
-export function PayloadTab() {
+export function PayloadTab({ onDiskInvalid }) {
   const list = useListDraft('/payload', { toDraft, toBody, load: loadRules });
   const providers = useResource('/providers');
   const formId = useUid('payload-form');
@@ -441,17 +443,19 @@ export function PayloadTab() {
     setEditorOpen(true);
   };
   const saveError = blocked ?? list.saveError;
-  const issues = useIssues(saveError);
+  const issues = useFieldIssues(saveError);
+  useDiskInvalid(list.saveError, onDiskInvalid);
 
   useUnsavedGuard(list.dirty, 'payload rules');
-  useSaveHotkey(formId, list.dirty && !list.saving && !editorOpen);
+  // Nothing to do about the rule editor: a page shortcut is ignored while a drawer is open.
+  useSaveHotkey(formId, list.dirty && !list.saving);
   useRevealProblem(formId, saveError);
 
   // Issues of the last refused save, by rule. Claiming them here keeps them
   // out of the form-level list.
   const byRule = useMemo(() => {
     const map = new Map();
-    for (const issue of issues.under('payload').concat(issues.under('default'), issues.under('override'), issues.under('filter'))) {
+    for (const issue of KINDS.flatMap((kind) => issues.under(kind.id))) {
       const at = parseIssuePath(issue.path);
       if (!at) continue;
       const key = `${at.kind}:${at.index}`;
@@ -577,7 +581,7 @@ export function PayloadTab() {
         `;
       })}
 
-      <${FormError} error=${withStop(saveError)} issues=${issues} title="Could not save the payload rules" />
+      <${SaveError} error=${saveError} issues=${issues} title="Could not save the payload rules" />
       <${SaveBar}
         dirty=${list.dirty}
         saving=${list.saving}
@@ -593,6 +597,3 @@ export function PayloadTab() {
     ${editing && html`<${RuleEditor} key=${editing.nonce} open=${editorOpen} target=${editing} providers=${providerNames} onApply=${applyEdit} onClose=${() => setEditorOpen(false)} />`}
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default PayloadTab;

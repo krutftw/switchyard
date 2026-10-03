@@ -15,14 +15,14 @@ import { Button, EmptyState, ErrorState, Menu, Notice, Page, Panel, Segmented, S
 import { api } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
 import { loadStyles } from '../lib/dom.js';
-import { formatCompact, formatCurrency, formatDate, formatNumber, formatPercent, formatRelativeTime, formatTime, formatTokens, plural } from '../lib/format.js';
+import { formatCompact, formatCurrency, formatDate, formatNumber, formatPercent, formatRelativeTime, formatTime, formatTokens, plural, sentence } from '../lib/format.js';
 import { useNow, useResource, useSize } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { href, useQueryParam, useRoute } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import Breakdown from './usage/breakdown.js';
 import UsageCharts, { ChartsError, ChartsSkeleton, LatencyPanel, LatencySkeleton } from './usage/charts.js';
-import breakdownRows, { DEFAULT_GROUP, DEFAULT_RANGE, GROUPS, KEEP, RANGES, assignSlots, averageRate, bucketWords, filterRows, groupOf, promptTokens, rangeOf, ratio, viewRows } from './usage/data.js';
+import { DEFAULT_GROUP, DEFAULT_RANGE, GROUPS, KEEP, RANGES, assignSlots, averageRate, breakdownRows, bucketWords, filterRows, groupOf, promptTokens, rangeOf, ratio, viewRows } from './usage/data.js';
 import downloadFile, { breakdownCsv, fileName, timeseriesCsv, usageJson } from './usage/export.js';
 
 await loadStyles('pages/usage.css');
@@ -99,13 +99,21 @@ function errorTone(rate) {
   return rate < 0.05 ? 'caution' : 'stop';
 }
 
+/** What each lamp says, in words: the lamp's accessible name and its tooltip. */
+const ERROR_TONE_WORDS = {
+  clear: 'No failed requests',
+  caution: 'Under 5% of requests failed',
+  stop: '5% or more of requests failed',
+};
+
 /**
  * "38.2 per hour on average". Thin traffic moves to a longer unit ("1.0 per
  * day") and, past that, says "Fewer than 0.1 per day": a rate that exists is
  * never printed as 0.0.
  */
-function rateWords(requests, spanMs, range) {
-  const rate = averageRate(requests, spanMs, range.rateUnit);
+function rateWords(requests, range) {
+  // Over the length of the range, not `to - from` (see averageRate).
+  const rate = averageRate(requests, range.ms, range.rateUnit);
   if (!rate) return null;
   if (rate.below) return `Fewer than ${rate.below} per ${rate.unit} on average`;
   const value = rate.value >= 1_000_000 ? formatCompact(rate.value) : rate.value >= 100 ? formatNumber(Math.round(rate.value)) : formatNumber(rate.value, 1);
@@ -115,7 +123,7 @@ function rateWords(requests, spanMs, range) {
 function Headline({ summary, range, priced, hasPrices, loading, stale }) {
   const t = summary?.totals;
   const requests = t?.requests ?? 0;
-  const rateHint = t ? rateWords(requests, summary.to - summary.from, range) : null;
+  const rateHint = t ? rateWords(requests, range) : null;
 
   const errorRate = t ? ratio(t.errors, requests) : null;
   const errorText = errorRate == null ? null : formatPercent(errorRate);
@@ -144,22 +152,21 @@ function Headline({ summary, range, priced, hasPrices, loading, stale }) {
   }
 
   return html`
-    <div class="usage-fade" data-stale=${stale ? '' : undefined}>
-      <${StatGroup} class="usage-stats" label=${`Totals for ${range.phrase}`}>
-        <${Stat} label="Requests" value=${t ? (requests < 1_000_000 ? formatNumber(requests) : formatCompact(requests)) : null} hint=${rateHint} loading=${loading} />
-        <${Stat}
-          label="Error rate"
-          value=${errorText ? errorText.replace('%', '') : null}
-          unit=${errorText ? '%' : undefined}
-          lamp=${errorTone(errorRate)}
-          hint=${t && requests > 0 ? `${formatNumber(t.errors)} of ${formatNumber(requests)} failed` : null}
-          loading=${loading}
-        />
-        <${Stat} label="Input tokens" value=${t ? formatTokens(prompt) : null} hint=${promptHint} loading=${loading} />
-        <${Stat} label="Output tokens" value=${t ? formatTokens(t.output_tokens) : null} hint=${outputHint} loading=${loading} />
-        <${Stat} label="Estimated cost" value=${cost} hint=${costHint} loading=${loading} />
-      <//>
-    </div>
+    <${StatGroup} class="usage-stats usage-fade" label=${`Totals for ${range.phrase}`} data-stale=${stale ? '' : undefined}>
+      <${Stat} label="Requests" value=${t ? (requests < 1_000_000 ? formatNumber(requests) : formatCompact(requests)) : null} hint=${rateHint} loading=${loading} />
+      <${Stat}
+        label="Error rate"
+        value=${errorText ? errorText.replace('%', '') : null}
+        unit=${errorText ? '%' : undefined}
+        lamp=${errorTone(errorRate)}
+        lampLabel=${ERROR_TONE_WORDS[errorTone(errorRate)]}
+        hint=${t && requests > 0 ? `${formatNumber(t.errors)} of ${formatNumber(requests)} failed` : null}
+        loading=${loading}
+      />
+      <${Stat} label="Input tokens" value=${t ? formatTokens(prompt) : null} hint=${promptHint} loading=${loading} />
+      <${Stat} label="Output tokens" value=${t ? formatTokens(t.output_tokens) : null} hint=${outputHint} loading=${loading} />
+      <${Stat} label="Estimated cost" value=${cost} hint=${costHint} loading=${loading} />
+    <//>
   `;
 }
 
@@ -175,15 +182,15 @@ export default function Usage() {
   const range = rangeOf(rangeParam);
   const group = groupOf(groupParam);
 
-  const usage = useResource((signal) => loadUsage(range.value, group.value, signal), { deps: [range.value, group.value], pollMs: REFRESH_MS });
+  // Changing the range or the group starts a new load. Until it lands, the
+  // previous view stays on screen, dimmed, instead of a page of skeletons
+  // (keepPrevious). If the new one cannot be loaded the page says so in place
+  // of the numbers: they would be those of another range than the one selected.
+  const usage = useResource((signal) => loadUsage(range.value, group.value, signal), { deps: [range.value, group.value], pollMs: REFRESH_MS, keepPrevious: true });
   const pricing = useResource('/pricing');
 
-  // Changing the range or the group starts a new load. Until it lands, the
-  // previous view stays on screen, dimmed, instead of a page of skeletons.
-  const kept = useRef(null);
-  if (usage.data !== undefined) kept.current = usage.data;
-  else if (usage.error && !usage.loading) kept.current = null;
-  const data = usage.data ?? (usage.loading ? kept.current : null);
+  const data = usage.isPrevious && usage.error ? null : (usage.data ?? null);
+  const updatedAt = data ? usage.updatedAt : null;
   const firstLoad = usage.loading && !data;
   const summary = data?.summary ?? null;
   const shownRange = data ? rangeOf(data.range) : range;
@@ -195,12 +202,12 @@ export default function Usage() {
   // a range and group that never had a time series show the error instead.
   const lastSeries = useRef(null);
   if (data?.timeseries && lastSeries.current?.timeseries !== data.timeseries) {
-    lastSeries.current = { range: data.range, group: data.group, timeseries: data.timeseries, at: usage.updatedAt ?? Date.now() };
+    lastSeries.current = { range: data.range, group: data.group, timeseries: data.timeseries, at: updatedAt ?? Date.now() };
   }
   const held = lastSeries.current;
   const heldSeries = data && !data.timeseries && held && held.range === data.range && held.group === data.group ? held : null;
   const timeseries = data?.timeseries ?? heldSeries?.timeseries ?? null;
-  const chartsStale = usage.refreshing || (!!data && usage.data === undefined) || !!heldSeries;
+  const chartsStale = usage.refreshing || !!heldSeries;
 
   // null while the price table is unknown (loading, or it could not be read).
   const hasPrices = Array.isArray(pricing.data) ? pricing.data.length > 0 : null;
@@ -245,13 +252,9 @@ export default function Usage() {
 
   // Coming back from a dropped live connection: the tab may have slept
   // through any number of refreshes.
-  const liveStatus = useStore(liveState, (s) => s.status);
-  const lastLiveStatus = useRef(liveStatus);
-  useEffect(() => {
-    const before = lastLiveStatus.current;
-    lastLiveStatus.current = liveStatus;
-    if (liveStatus === 'open' && (before === 'reconnecting' || before === 'offline')) usage.refresh();
-  }, [liveStatus]);
+  useLiveGap(({ reason }) => {
+    if (reason === 'reconnect') usage.refresh();
+  });
 
   // ---- Export and clear ---------------------------------------------------
 
@@ -329,7 +332,7 @@ export default function Usage() {
   ];
 
   const actions = html`
-    <${Freshness} updatedAt=${usage.updatedAt} />
+    <${Freshness} updatedAt=${updatedAt} />
     <${Button} icon="refresh" loading=${refreshing} onClick=${refreshAll}>Refresh<//>
     <${Menu} label="Export" trigger=${(props) => html`<${Button} icon="download" iconRight="chevron-down" ...${props}>Export<//>`} items=${exportItems} />
     <${Menu} label="More usage actions" items=${[{ label: 'Clear statistics', icon: 'trash', danger: true, onSelect: clearStatistics }]} />
@@ -350,7 +353,7 @@ export default function Usage() {
       data &&
       html`
         <${Notice} tone="caution" title="Could not refresh usage statistics" action=${html`<${Button} size="sm" loading=${refreshing} onClick=${refreshAll}>Try again<//>`}>
-          ${usage.error.message} The numbers below were read at ${formatTime(usage.updatedAt)}.
+          ${sentence(usage.error.message)} The numbers below were read at ${formatTime(updatedAt)}.
         <//>
       `}
 
@@ -393,7 +396,7 @@ export default function Usage() {
             heldSeries &&
             html`
               <${Notice} tone="caution" title="Could not refresh the charts" action=${html`<${Button} size="sm" loading=${refreshing} onClick=${refreshAll}>Try again<//>`}>
-                ${data.timeseriesError?.message ?? 'The time series could not be read.'} The charts show the time series read at ${formatTime(heldSeries.at)}; the totals and the tables are current.
+                ${sentence(data.timeseriesError?.message) || 'The time series could not be read.'} The charts show the time series read at ${formatTime(heldSeries.at)}; the totals and the tables are current.
               <//>
             `}
 

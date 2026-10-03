@@ -2,6 +2,12 @@
 
 .kit {
   gap: var(--space-8);
+  /* The section strip below: one row of small controls, its padding and its
+     rule. 45px with a mouse; the control tokens grow on touch screens. */
+  --kit-nav-h: calc(var(--control-h-sm) + var(--space-2) * 2 + var(--hairline));
+  /* The strip sticks under the top bar and is drawn above table headers, so
+     sticky headers (and the rows' scroll margin) stop below it. */
+  --sticky-top: calc(var(--topbar-h) + var(--kit-nav-h));
 }
 
 .kit-nav {
@@ -49,7 +55,7 @@
   gap: var(--space-4);
   min-width: 0;
   /* Land below the sticky bars when jumped to. */
-  scroll-margin-top: calc(var(--topbar-h) + 56px);
+  scroll-margin-top: calc(var(--sticky-top) + var(--space-3));
 }
 
 .kit-section-head {
@@ -162,6 +168,12 @@
   white-space: nowrap;
 }
 
+/* The live connection is down: the numbers are the last ones heard. They
+   stay readable, and step back. */
+.kit-live-stats[data-stale] .stat-value {
+  opacity: 0.55;
+}
+
 .kit-inline {
   display: grid;
   grid-template-columns: 132px minmax(0, 1fr);
@@ -170,13 +182,19 @@
   font-size: var(--text-sm);
 }
 
-@media (max-width: 720px) {
-  .kit-grid {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
+/* Two chart panels side by side are narrow until the window is about this
+   wide: a mark next to its caption would be squeezed out of the panel (the
+   latency bars were, by 54px at 721px), so the caption goes above it, as it
+   does on a phone. */
+@media (max-width: 900px) {
   .kit-inline {
     grid-template-columns: minmax(0, 1fr);
     gap: var(--space-1);
+  }
+}
+
+@media (max-width: 720px) {
+  .kit-grid {
+    grid-template-columns: minmax(0, 1fr);
   }
 }

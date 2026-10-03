@@ -155,6 +155,24 @@ struct Hashes {
     /// going back to the live content is announced (see
     /// [`ConfigStore::is_live`]).
     rejected: Option<ContentHash>,
+    /// What was wrong with that content and when it was refused; set and
+    /// cleared together with `rejected` (see [`ConfigStore::rejection`]).
+    rejection: Option<Rejection>,
+}
+
+/// The file on disk, refused: what is wrong with it and since when.
+///
+/// The store keeps this for as long as the file holds the refused content
+/// (see [`ConfigStore::rejection`]), so that anyone who looks later — a
+/// dashboard page loaded after the [`ConfigEvent::Rejected`] went out — can
+/// still tell that the file is not in effect.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Rejection {
+    /// Every issue of the file. Issue texts name fields and rules, never
+    /// values.
+    pub issues: Vec<ConfigIssue>,
+    /// When the content was refused.
+    pub at: SystemTime,
 }
 
 /// Keeps the watcher alive; dropping it (with the store) ends the watch task.
@@ -299,6 +317,21 @@ impl ConfigStore {
     /// block the store.
     pub fn events(&self) -> broadcast::Receiver<ConfigEvent> {
         self.inner.events.subscribe()
+    }
+
+    /// The refusal of the file on disk, while it lasts: `Some` from the
+    /// moment content of the file was refused ([`ConfigEvent::Rejected`],
+    /// by the watcher or [`reload_from_disk`](Self::reload_from_disk)) until
+    /// the store next sees the file hold anything else: a configuration it
+    /// applies, the configuration in effect again, or a write of its own.
+    /// The previous configuration stays in effect all that time. (An edit
+    /// refused with [`ConfigStoreError::DiskInvalid`] is the caller's answer,
+    /// not a verdict on the file, and does not set it.)
+    ///
+    /// It is the state as of the store's last look at the file; with the
+    /// watcher running that look is at most a poll interval old.
+    pub fn rejection(&self) -> Option<Rejection> {
+        self.inner.hashes.lock().rejection.clone()
     }
 
     /// Settings whose live value differs from the value the process started
@@ -593,6 +626,7 @@ impl ConfigStore {
             if hashes.applied != Some(hash) {
                 return Live::No;
             }
+            hashes.rejection = None;
             hashes.rejected.take().is_some()
         };
         if recovered {
@@ -693,6 +727,7 @@ impl ConfigStore {
             hashes.applied = Some(hash);
             hashes.applied_text = Some(Arc::from(text));
             hashes.rejected = None;
+            hashes.rejection = None;
         }
         self.inner.updates.send_replace(config.clone());
         // No receiver is not an error.
@@ -709,7 +744,15 @@ impl ConfigStore {
     }
 
     fn reject(&self, issues: Vec<ConfigIssue>, source: Source, hash: ContentHash) {
-        self.inner.hashes.lock().rejected = Some(hash);
+        let at = SystemTime::now();
+        {
+            let mut hashes = self.inner.hashes.lock();
+            hashes.rejected = Some(hash);
+            hashes.rejection = Some(Rejection {
+                issues: issues.clone(),
+                at,
+            });
+        }
         // Issue texts name fields and rules, never values.
         let summary = issues
             .iter()
@@ -721,11 +764,10 @@ impl ConfigStore {
             issues = %summary,
             "configuration rejected; keeping the previous one"
         );
-        let _ = self.inner.events.send(ConfigEvent::Rejected {
-            source,
-            issues,
-            at: SystemTime::now(),
-        });
+        let _ = self
+            .inner
+            .events
+            .send(ConfigEvent::Rejected { source, issues, at });
     }
 
     /// Looks at the file after a change notification.
@@ -1152,6 +1194,58 @@ mod tests {
         assert_eq!(store.check_disk(true).await, Check::Unchanged);
         assert!(events.try_recv().is_err());
         assert_eq!(store.current().server.port, 9000);
+    }
+
+    /// Regression (QA-ONB-03, BE-1): a refused file was announced once and
+    /// then forgotten, so whoever looked afterwards — a dashboard page
+    /// loaded later — could not tell that the file was not in effect.
+    #[tokio::test]
+    async fn the_refusal_of_the_file_stays_queryable_until_the_file_changes() {
+        let (_dir, store) = store_with(BASE);
+        let path = store.path().to_path_buf();
+        assert_eq!(store.rejection(), None);
+
+        std::fs::write(&path, "[server]\nport = 0\n").unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Rejected);
+        let refused = store.rejection().expect("the refusal is remembered");
+        assert_eq!(refused.issues[0].path, "server.port");
+        // Looking again changes nothing, the time included.
+        assert_eq!(store.check_disk(true).await, Check::Unchanged);
+        assert_eq!(store.rejection(), Some(refused.clone()));
+        // Another broken version replaces it.
+        std::fs::write(&path, "[server]\nport = \"x\"\n").unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Rejected);
+        let second = store.rejection().unwrap();
+        assert_ne!(second.issues, refused.issues);
+
+        // Back to the configuration in effect: over.
+        std::fs::write(&path, BASE).unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Applied);
+        assert_eq!(store.rejection(), None);
+
+        // A valid new version: over too.
+        std::fs::write(&path, "[server]\nport = 0\n").unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Rejected);
+        std::fs::write(&path, "[server]\nport = 9001\n").unwrap();
+        assert_eq!(store.check_disk(true).await, Check::Applied);
+        assert_eq!(store.rejection(), None);
+
+        // A manual reload that refuses the file records it too, and an edit
+        // refused because of it leaves it as it is.
+        std::fs::write(&path, "[server]\nport = 0\n").unwrap();
+        assert!(store.reload_from_disk().await.is_err());
+        let refused = store.rejection().expect("refused by the reload");
+        let edit = |c: &mut Config| {
+            c.server.port = 9002;
+            Ok(())
+        };
+        let error = store.update(edit).await.unwrap_err();
+        assert!(matches!(error, ConfigStoreError::DiskInvalid(_)), "{error}");
+        assert_eq!(store.rejection(), Some(refused));
+
+        // Replacing the whole file ends it.
+        store.replace_text(BASE).await.unwrap();
+        assert_eq!(store.rejection(), None);
     }
 
     /// The text of the last applied configuration is the base of an edit

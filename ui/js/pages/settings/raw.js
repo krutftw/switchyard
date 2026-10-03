@@ -11,11 +11,11 @@
 import { html, useEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Button, EmptyState, ErrorState, Form, Modal, Notice, Panel, Skeleton, toast } from '../../components/index.js';
 import { api } from '../../lib/api.js';
-import { formatDateTime, plural } from '../../lib/format.js';
+import { formatDateTime, plural, sentence } from '../../lib/format.js';
 import { useAsync, useResource, useUid } from '../../lib/hooks.js';
-import { liveState, useLive } from '../../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../../lib/live.js';
 import { useStore } from '../../lib/store.js';
-import { SaveBar, confirmDiscard, expectSecret, secretSettled, sentence, useSaveHotkey, useUnsavedGuard } from './common.js';
+import { SaveBar, confirmDiscard, expectSecret, focusAfterNotice, forgetSecret, isSecretReference, secretSettled, useSaveHotkey, useUnsavedGuard } from './common.js';
 
 // Asked once per page load, not once per visit to the tab.
 let revealed = false;
@@ -105,9 +105,11 @@ export function indexToml(text) {
 }
 
 /**
- * The line an issue belongs to. Syntax errors carry "line L, column C";
- * configuration issues carry a path, which is looked up in the text (the
- * nearest enclosing table when the field itself is not written out).
+ * The line an issue belongs to. Errors of syntax and of shape (a string
+ * where a number goes) carry "line L, column C" as their path; issues of the
+ * configuration carry its place ("providers[1].base_url"), which is looked
+ * up in the text (the nearest enclosing table when the field itself is not
+ * written out, as for a missing admin.secret).
  */
 export function locateIssue(issue, index) {
   const at = /^line (\d+)(?:, column (\d+))?/.exec(issue.path ?? '');
@@ -139,8 +141,6 @@ function adminSecretIn(text) {
   const literal = /^'([^']*)'/.exec(raw);
   return literal ? literal[1] : undefined;
 }
-
-const isReference = (secret) => /^env:/.test(secret) || /^\$\{[^}]*\}$/.test(secret);
 
 // ---------------------------------------------------------------------------
 // Line diff
@@ -351,13 +351,16 @@ const REFUSED_POLL_MS = 5000;
 /**
  * onConfig  called with the new configuration view after a save or reload
  * refused   the refusal, while the gateway refuses the file that is on disk
- *           (the config.reloaded frame, a new object for each one), else null
+ *           (a new object for each config.reloaded frame that says so, or
+ *           for a save on another tab that was refused because of the
+ *           file), else null
  * onValid   called with that refusal when the file on disk is valid again
  */
 function RawEditor({ onConfig, refused = null, onValid }) {
   const liveOpen = useStore(liveState, (s) => s.status === 'open');
   const file = useResource('/config/raw', { pollMs: liveOpen ? 0 : 20_000 });
   useLive('config.reloaded', () => secretSettled().then(file.refresh));
+  useLiveGap(file.refresh);
 
   const formId = useUid('raw-form');
   const area = useRef(null);
@@ -389,7 +392,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
   }, [disk]);
 
   useUnsavedGuard(dirty, 'switchyard.toml');
-  useSaveHotkey(formId, dirty && !review);
+  useSaveHotkey(formId, dirty);
 
   const validate = useAsync((body) => api.post('/config/validate', { text: body }));
   const save = useAsync((body) => api.put('/config/raw', { text: body }));
@@ -408,8 +411,10 @@ function RawEditor({ onConfig, refused = null, onValid }) {
   }, [save.error]);
 
   // The file on disk was refused: say which lines, and notice when it is
-  // valid again. The gateway sends no frame when the file is put back the
-  // way it was, so it is read again every few seconds until it validates.
+  // valid again. The gateway announces that with a config.reloaded frame,
+  // which clears `refused` on every tab; reading the file again every few
+  // seconds covers a frame that did not get here (the live connection was
+  // down), and shows the file's problems as they change.
   //
   // Only a text read after the refusal is judged. The text that was already
   // loaded is the one from before the breaking edit: it validates, and
@@ -519,7 +524,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
     const saved = text;
     const before = adminSecretIn(disk ?? base);
     const after = adminSecretIn(saved);
-    const change = after !== before && typeof after === 'string' && after !== '' && !isReference(after) ? expectSecret(after) : null;
+    const change = after !== before && typeof after === 'string' && after !== '' && !isSecretReference(after) ? expectSecret(after) : null;
     const result = await save.run(toFile(saved, eol));
     setReview(false);
     if (!result) {
@@ -527,7 +532,11 @@ function RawEditor({ onConfig, refused = null, onValid }) {
       return;
     }
     const accepted = change ? await change.adopt() : true;
+    // The secret changed into something that cannot be read from the text.
+    if (!change && after !== before) forgetSecret();
     onConfig(result);
+    // What was just written is valid, whatever was said about the file before.
+    if (refused) onValid?.(refused);
     setBase(saved);
     setConflict(false);
     setReport(null);
@@ -552,6 +561,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
     if (fresh) adopt(fresh);
     if (result) {
       onConfig(result);
+      if (refused) onValid?.(refused);
       setReport(null);
       toast.success('Reloaded from disk', { description: 'The gateway read switchyard.toml again and applied it.' });
     }
@@ -570,9 +580,13 @@ function RawEditor({ onConfig, refused = null, onValid }) {
   // The diff is kept while the dialog animates out.
   if (review) reviewed.current = { before: disk ?? base, after: text };
 
+  // A new admin secret that this page cannot follow: a reference to a
+  // variable in the gateway's environment. (A text that leaves the admin
+  // interface without a secret, or switches it off, is refused by the
+  // gateway, and the refusal is reported under the editor like any other.)
   const secretBefore = review ? adminSecretIn(disk ?? base) : undefined;
   const secretAfter = review ? adminSecretIn(text) : undefined;
-  const secretLost = review && secretAfter !== secretBefore && (typeof secretAfter !== 'string' || secretAfter === '' || isReference(secretAfter));
+  const secretMoves = review && secretAfter !== secretBefore && typeof secretAfter === 'string' && isSecretReference(secretAfter);
 
   return html`
     <${Form}
@@ -594,6 +608,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
               setBase(disk);
               setConflict(false);
               setReport(null);
+              focusAfterNotice(() => area.current);
             }}
           >
             Load the new file
@@ -603,6 +618,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
             onClick=${() => {
               setBase(disk);
               setConflict(false);
+              focusAfterNotice(() => area.current);
             }}
           >
             Keep my edits
@@ -661,8 +677,8 @@ function RawEditor({ onConfig, refused = null, onValid }) {
     >
       <div class="stack" style="--gap:var(--space-3)">
         ${conflict && html`<${Notice} tone="caution" title="This overwrites changes made elsewhere">The file changed on disk after you started editing. The lines below are compared with the file as it is now.<//>`}
-        ${secretLost &&
-        html`<${Notice} tone="caution" title="The admin secret changes">This page cannot read the new secret from the text (it is an environment reference, or it is gone), so you will be asked to sign in again. With no secret at all the dashboard and the admin API switch off.<//>`}
+        ${secretMoves &&
+        html`<${Notice} tone="caution" title="The admin secret changes">The new secret is a reference to a variable in the gateway's environment, which this page cannot read: you will be asked to sign in again with that variable's value.<//>`}
         ${reviewed.current && html`<${Diff} before=${reviewed.current.before} after=${reviewed.current.after} />`}
       </div>
     <//>
@@ -694,6 +710,3 @@ export function RawTab({ onConfig, refused, onValid }) {
   }
   return html`<${RawEditor} onConfig=${onConfig} refused=${refused} onValid=${onValid} />`;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default RawTab;

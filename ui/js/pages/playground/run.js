@@ -60,7 +60,8 @@ export default async function runPlayground(payload, { signal, onResponse, onEve
       signal,
     });
   } catch (cause) {
-    throw transportError(cause, signal, 'Cannot reach the gateway. Check that Switchyard is running and that this device can connect to it.');
+    // What happened only: the note under it (adviceFor) says what to do.
+    throw transportError(cause, signal, 'The request did not reach the gateway.');
   }
 
   const contentType = res.headers.get('content-type') ?? '';

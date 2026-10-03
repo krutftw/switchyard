@@ -41,5 +41,3 @@ export function focusTarget(name, index = 0) {
   const all = document.querySelectorAll(`[data-overview-focus="${name}"]`);
   return all[Math.min(index, all.length - 1)] ?? null;
 }
-
-export default StaleMark;

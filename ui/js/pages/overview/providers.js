@@ -4,7 +4,7 @@
 // latency. Rows that hurt come first.
 
 import { html, useEffect, useMemo, useRef } from '../../../vendor/preact-htm.js';
-import { Button, ErrorState, HealthStrip, Panel, Skeleton, StatusLamp, Table } from '../../components/index.js';
+import { Button, HealthStrip, Panel, Skeleton, StatusLamp, Table } from '../../components/index.js';
 import { DASH, formatDuration, formatNumber, formatPercent, formatTime, plural } from '../../lib/format.js';
 import { href, navigate } from '../../lib/router.js';
 import { useStore } from '../../lib/store.js';
@@ -33,14 +33,11 @@ function CredentialLamps({ summary, now }) {
   const rest = credentials.length - shown.length;
   // The words beside and below the lamps say the same thing, credential by
   // credential, so the lamps themselves stay out of the accessibility tree.
+  // (The credentials of a provider that is switched off all read "disabled":
+  // no lamp is lit.)
   return html`
     <span class="overview-lamps" aria-hidden="true">
-      ${shown.map((cred) =>
-        // A provider that is switched off serves nothing, whatever its credentials would be: no lamp is lit.
-        summary.enabled
-          ? html`<${StatusLamp} key=${cred.id} tone=${cred.tone} title=${credentialTitle(cred, now)} />`
-          : html`<${StatusLamp} key=${cred.id} tone="off" title=${`${cred.name}: provider disabled`} />`,
-      )}
+      ${shown.map((cred) => html`<${StatusLamp} key=${cred.id} tone=${cred.tone} title=${credentialTitle(cred, now)} />`)}
       ${rest > 0 && html`<span class="overview-lamps-more">+${formatNumber(rest)}</span>`}
     </span>
   `;
@@ -112,7 +109,6 @@ export default function ProviderBoard({ providers, recent, onExpire }) {
 
   const totals = rows.reduce(
     (sum, row) => {
-      if (!row.enabled) return sum;
       sum.ready += row.counts.ready;
       sum.active += row.counts.total - row.counts.disabled;
       return sum;
@@ -158,7 +154,7 @@ export default function ProviderBoard({ providers, recent, onExpire }) {
         if (!health.known) {
           return attemptsFailed ? html`<span class="faint" title="The request records could not be loaded">${DASH}</span>` : html`<${Skeleton} width="124px" height="12px" />`;
         }
-        return html`<${HealthStrip} buckets=${healthOf(row)?.buckets ?? []} label=${`${row.name}, upstream attempts ${windowWords}`} />`;
+        return html`<${HealthStrip} buckets=${healthOf(row)?.buckets ?? []} label=${`${row.name}, ${windowWords}`} noun="upstream attempts" />`;
       },
     },
     {
@@ -201,17 +197,19 @@ export default function ProviderBoard({ providers, recent, onExpire }) {
       class="overview-board"
       title="Provider health"
       description=${html`${described(summary, providers, recent)}${attemptsFailed &&
+      providers.data != null &&
       html`<span class="overview-stale"><${StatusLamp} tone="caution" label="Attempts could not be loaded" /></span>`}`}
       flush
       actions=${html`<${Button} size="sm" href=${href('/providers')} iconRight="arrow-right">Providers<//>`}
     >
-      ${providers.error && !providers.data
-        ? html`<${ErrorState} compact title="Could not load the providers" error=${providers.error} onRetry=${providers.refresh} />`
-        : html`<${Table}
+      <${Table}
         columns=${columns}
         rows=${providers.data ? rows : undefined}
         rowKey="name"
         loading=${providers.loading}
+        error=${providers.data ? null : providers.error}
+        errorTitle="Could not load the providers"
+        onRetry=${providers.refresh}
         skeletonRows=${3}
         maxHeight=${rows.length > ROWS_BEFORE_SCROLL ? '452px' : undefined}
         onRowClick=${(row) => navigate('/providers', { query: { open: row.name } })}
@@ -222,7 +220,7 @@ export default function ProviderBoard({ providers, recent, onExpire }) {
           description: 'A provider is an upstream the gateway routes requests to. Add one and it appears here with a lamp for each credential.',
           action: html`<${Button} icon="plus" href=${href('/providers', { new: 1 })}>Add a provider<//>`,
         }}
-      />`}
+      />
     <//>
   `;
 }

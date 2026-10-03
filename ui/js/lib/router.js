@@ -7,7 +7,7 @@
 //   navigate('/providers');                   // push
 //   navigate('/requests', { query: { status: 'error' }, replace: true });
 //   html`<a href=${href('/requests/' + id)}>Open</a>`
-//   const [range, setRange] = useQueryParam('range', '24h');
+//   const [range, setRange] = useQueryParam('range', '24h', { push: true }); // Back returns to the last range
 //
 // Keep filters, tabs and the selected entity in the query so a link reproduces
 // the view.
@@ -444,12 +444,30 @@ export function useRoute() {
  * One query parameter as state. Reading returns `fallback` when the key is
  * absent; writing the fallback removes the key so default views keep clean
  * URLs.
+ *
+ *   const [q, setQ] = useQueryParam('q', '');                          // replaces
+ *   const [tab, setTab] = useQueryParam('tab', 'general', { push: true }); // a history step
+ *
+ * By default a change replaces the current history entry: right for what is
+ * typed (a search field would otherwise add an entry per keystroke). With
+ * `push: true` every change is a step of its own, so Back returns to the
+ * previous value: for what the user picks from a few choices (a tab, a time
+ * range, a grouping). The setter also takes options of its own for one call:
+ * `setTab('raw', { replace: true })`.
  */
-export function useQueryParam(key, fallback = '') {
+export function useQueryParam(key, fallback = '', { push = false } = {}) {
   const value = useStore(routeStore, (r) => r.query[key]);
   const set = useCallback(
-    (next) => setQuery({ [key]: next === fallback ? null : next }),
-    [key, fallback],
+    (next, options) => {
+      // Picking what is already shown is not a step.
+      const current = routeStore.get().query[key] ?? fallback;
+      if (next === current && push) return;
+      // The setter is handed straight to onChange, and form controls pass
+      // the DOM event as a second argument: only a plain object is options.
+      const own = options && Object.getPrototypeOf(options) === Object.prototype ? options : null;
+      setQuery({ [key]: next === fallback ? null : next }, { replace: own?.replace ?? !push, force: own?.force ?? false });
+    },
+    [key, fallback, push],
   );
   return [value ?? fallback, set];
 }

@@ -2,11 +2,16 @@
 // function of what the admin API returned (GET /models, /providers,
 // /aliases, /status), so it can be reasoned about, and tested, on its own.
 //
+// What the gateway says is taken as said: which target an alias's route
+// belongs to, the tier a route competes in and whether an alias is ignored
+// come from GET /models. Only what it does not say is worked out here: what
+// a name in an unsaved draft would match (lookup, aliasWarnings).
+//
 // The reasoning helpers mirror crates/core/src/reasoning.rs
 // (parse_model_suffix, normalize_depth): the page explains what the gateway
 // will do with `model(high)`, so it has to reach the same answer.
 
-import { formatDuration, formatNumber, plural } from '../../lib/format.js';
+import { formatNumber, plural } from '../../lib/format.js';
 
 // ---------------------------------------------------------------------------
 // Reasoning
@@ -90,15 +95,37 @@ function clampLevel(t, level) {
   return best;
 }
 
-/** What the gateway sends upstream when a request asks `t`'s model for `depth`. */
-export function fitDepth(depth, t) {
+/** The vendor families an upstream protocol belongs to (GET /providers `protocols`). */
+export const FAMILIES = ['openai', 'anthropic', 'google'];
+const PROTOCOL_FAMILY = { 'openai-chat': 'openai', 'openai-responses': 'openai', anthropic: 'anthropic', gemini: 'google' };
+export const protocolFamily = (protocol) => PROTOCOL_FAMILY[protocol] ?? null;
+
+/**
+ * Whether "let the provider decide" can be said to an upstream of `family`
+ * as it is. On OpenAI's APIs it is the absence of an effort; on Anthropic's
+ * it is adaptive thinking, which every model with effort levels has; on
+ * Gemini's it is the dynamic budget, which the model must allow.
+ */
+export function autoIsNative(t, family) {
+  if (family === 'openai') return true;
+  if (family === 'anthropic') return hasLevels(t) || !!t?.dynamic_allowed;
+  return !!t?.dynamic_allowed;
+}
+
+/**
+ * What the gateway sends upstream when a request asks `t`'s model for
+ * `depth`. `family` is the upstream's vendor family ("openai", "anthropic",
+ * "google"); it only matters for the automatic depth. Without one the
+ * strictest reading is taken (an upstream with no automatic mode of its own).
+ */
+export function fitDepth(depth, t, family = null) {
   const range = hasRange(t);
   const levels = hasLevels(t);
   let d = depth;
   if (d.mode === 'level' && range && !levels) d = { mode: 'budget', value: EFFORT_BUDGET[d.value] };
   else if (d.mode === 'budget' && levels && !range) d = { mode: 'level', value: budgetToEffort(d.value) };
 
-  if (d.mode === 'auto' && !t.dynamic_allowed) {
+  if (d.mode === 'auto' && !autoIsNative(t, family)) {
     if (levels && !range) d = { mode: 'level', value: 'medium' };
     else {
       const mid = Math.floor(((t.min ?? 0) + (t.max ?? 0)) / 2);
@@ -118,7 +145,12 @@ export function fitDepth(depth, t) {
   return d;
 }
 
-function depthPhrase(d) {
+const FAMILY_API = { openai: 'an OpenAI API', anthropic: 'the Anthropic API', google: 'the Gemini API' };
+/** "an OpenAI API", "the Anthropic API or the Gemini API". */
+const apiNames = (families) => families.map((family) => FAMILY_API[family]).join(' or ');
+
+/** A depth in words: "the high level", "a budget of 8,192 tokens", "reasoning off". */
+export function depthPhrase(d) {
   if (d.mode === 'off') return 'reasoning off';
   if (d.mode === 'auto') return 'a depth the provider picks';
   if (d.mode === 'level') return `the ${d.value} level`;
@@ -161,15 +193,19 @@ export function reasoningDetail(info) {
   if (hasLevels(t)) parts.push(`Levels: ${t.levels.join(', ')}`);
   if (hasRange(t)) parts.push(`Budget: ${formatNumber(t.min ?? 0)} to ${formatNumber(t.max ?? 0)} tokens`);
   parts.push(t.zero_allowed ? 'Can be turned off' : 'Cannot be turned off');
-  parts.push(t.dynamic_allowed ? 'Provider can pick the depth' : 'Needs an explicit depth');
+  // Without a mode of its own the automatic depth still exists where the
+  // upstream API has one (autoIsNative).
+  parts.push(t.dynamic_allowed ? 'Provider can pick the depth' : hasLevels(t) ? 'Provider can pick the depth, except over the Gemini API' : 'Needs an explicit depth, except over an OpenAI API');
   return parts;
 }
 
 /**
  * The four suffix forms, written for one model: what to type and what the
- * gateway then sends. `name` is the client-facing name.
+ * gateway then sends. `name` is the client-facing name. `families` are the
+ * vendor families of the upstreams the model is routed to (all three when
+ * that is not known): what "automatic" becomes depends on the upstream.
  */
-export function suffixExamples(name, t) {
+export function suffixExamples(name, t, families = FAMILIES) {
   const levels = hasLevels(t);
   const range = hasRange(t);
   const out = [];
@@ -203,13 +239,74 @@ export function suffixExamples(name, t) {
     text: fittedOff.mode === 'off' ? 'Turns reasoning off for the request.' : `This model cannot stop reasoning, so the gateway sends its lowest setting, ${depthPhrase(fittedOff)}. Anthropic upstreams are still told to disable it.`,
   });
 
-  const fittedAuto = fitDepth({ mode: 'auto' }, t);
-  out.push({
-    model: `${name}(auto)`,
-    title: 'Automatic',
-    text: fittedAuto.mode === 'auto' ? 'Lets the provider decide how much to reason.' : `This model needs an explicit depth, so the gateway sends ${depthPhrase(fittedAuto)}.`,
-  });
+  // Automatic is kept wherever the upstream has a way to say it; only an
+  // upstream without one is given an explicit depth instead.
+  const reach = FAMILIES.filter((family) => (families?.length ? families : FAMILIES).includes(family));
+  const native = reach.filter((family) => autoIsNative(t, family));
+  const explicit = reach.filter((family) => !autoIsNative(t, family));
+  let auto = 'Lets the provider decide how much to reason.';
+  if (explicit.length > 0) {
+    const sent = depthPhrase(fitDepth({ mode: 'auto' }, t, explicit[0]));
+    auto =
+      native.length === 0
+        ? `This model needs an explicit depth, so the gateway sends ${sent}.`
+        : `Lets the provider decide when the request goes upstream over ${apiNames(native)}. Over ${apiNames(explicit)} this model needs an explicit depth, so the gateway sends ${sent}.`;
+  }
+  out.push({ model: `${name}(auto)`, title: 'Automatic', text: auto });
   return out;
+}
+
+/** The targets of an alias row that route, as written, in the order they are tried. */
+function routableTargets(row) {
+  const indexes = [...new Set(row.routes.map((route) => route.targetIndex).filter((index) => index != null))].sort((a, b) => a - b);
+  return indexes.map((index) => row.aliasTargets?.[index]).filter((target) => target != null);
+}
+
+/**
+ * The depth one alias target fixes, the way the gateway expands it
+ * (AliasExpander::expand in crates/scheduler/src/registry.rs): the target's
+ * own suffix, or, when it names another alias, that alias's targets' (the
+ * innermost pin wins).
+ *
+ *   depth   the depth pinned on the first model reached through the target, or null
+ *   always  every model reached through it has a pinned depth
+ */
+function targetPin(row, target, rowsByName, left) {
+  const parsed = parseSuffix(target);
+  const own = parsed.depth;
+  const direct = { depth: own, always: own !== null };
+  // `gpt-5 -> gpt-5(high)` reaches the provider's model of that name.
+  if (targetsOwnName(row, target)) return direct;
+  const entry = lookup(rowsByName, parsed.base);
+  // The parentheses may belong to a configured model id: nothing is pinned then.
+  if (!entry && parsed.raw !== null && lookup(rowsByName, target)) return { depth: null, always: false };
+  if (!entry?.isAlias || left <= 0) return direct;
+  const inner = routableTargets(entry).map((t) => targetPin(entry, t, rowsByName, left - 1));
+  if (inner.length === 0) return direct;
+  return { depth: inner[0].depth ?? own, always: own !== null || inner.every((pin) => pin.always) };
+}
+
+/**
+ * Where a depth pinned on an alias target leaves the reasoning suffix: a
+ * pin wins over the suffix in the request, so the suffix only counts on a
+ * model reached without one. null for a model, or an alias that routes nowhere.
+ *
+ *   first      the target requests go to first, as written
+ *   firstPin   the depth it fixes, or null when the suffix decides there
+ *   pinned     the targets that fix a depth on every model they reach
+ *   open       the targets through which a suffix can still count
+ */
+export function suffixPins(row, rowsByName) {
+  if (!row?.isAlias) return null;
+  const targets = routableTargets(row);
+  if (targets.length === 0) return null;
+  const pins = targets.map((target) => ({ target, ...targetPin(row, target, rowsByName ?? new Map(), 8) }));
+  return {
+    first: pins[0].target,
+    firstPin: pins[0].depth,
+    pinned: pins.filter((pin) => pin.always).map((pin) => pin.target),
+    open: pins.filter((pin) => !pin.always).map((pin) => pin.target),
+  };
 }
 
 /** Suffixes worth offering in the alias target picker for a reasoning model. */
@@ -239,14 +336,6 @@ const COOLDOWN_REASON = {
 
 /** "connection failed" for "transport"; the raw word for a newer gateway's reasons. */
 export const cooldownReason = (reason) => (reason ? (COOLDOWN_REASON[reason] ?? String(reason).replace(/_/g, ' ')) : null);
-
-/** "41s", "2m 05s": the time left until `until`, never negative. */
-export function timeLeft(until, now) {
-  if (!until) return null;
-  // Whole seconds: a countdown that reads "51.0s" ticks in the wrong place.
-  const seconds = Math.max(1, Math.ceil((until - now) / 1000));
-  return seconds < 60 ? `${seconds}s` : formatDuration(seconds * 1000);
-}
 
 /**
  * The state of one route (provider + upstream model) of a model entry.
@@ -301,6 +390,32 @@ export function routeState(route, provider) {
 const AVAILABILITY_RANK = { routable: 0, cooling: 1, unknown: 2, nocreds: 3, noroute: 4 };
 
 /**
+ * For an alias entry: which of its targets each route belongs to, as an
+ * index into `targets`. GET /models names the target on every route of an
+ * alias (`target`, as written) and lists the routes in target order; a
+ * target written twice has its routes listed under each, so a route that
+ * repeats one already seen moves on to the next target of the same spelling.
+ * null for a route without a target (the entry is a model, not an alias).
+ */
+function targetIndexes(routes, targets) {
+  let at = 0;
+  let seen = new Set();
+  return routes.map((route) => {
+    if (route.target == null || !targets) return null;
+    const key = `${route.provider}\n${route.upstream_model}`;
+    if (targets[at] !== route.target || seen.has(key)) {
+      let next = targets.indexOf(route.target, at + 1);
+      if (next === -1 && targets[at] !== route.target) next = targets.indexOf(route.target);
+      if (next === -1) return targets[at] === route.target ? at : null;
+      if (next !== at) seen = new Set();
+      at = next;
+    }
+    seen.add(key);
+    return at;
+  });
+}
+
+/**
  * Build the table rows: each model entry with its routes' states and one
  * overall availability.
  *
@@ -309,17 +424,23 @@ const AVAILABILITY_RANK = { routable: 0, cooling: 1, unknown: 2, nocreds: 3, nor
  * `unknown` is a model that cannot be served right now while the provider
  * details that would say why (cooling down, switched off) are not loaded.
  *
+ * Each route keeps what GET /models says about it (`priority`, the tier it
+ * competes in, and for an alias `target`) and gains `index`, its state
+ * (routeState) and `targetIndex` (targetIndexes).
+ *
  * `providers` is the array from GET /providers (may be undefined).
  */
 export function buildRows(models, providers) {
   const byName = new Map((providers ?? []).map((p) => [p.name, p]));
   return (models ?? []).map((entry) => {
-    const routes = (entry.routes ?? []).map((route, index) => ({ ...route, index, ...routeState(route, byName.get(route.provider)) }));
+    const targetOf = targetIndexes(entry.routes ?? [], entry.alias_targets);
+    const routes = (entry.routes ?? []).map((route, index) => ({ ...route, index, targetIndex: targetOf[index], ...routeState(route, byName.get(route.provider)) }));
     const serving = routes.filter((r) => r.state === 'clear');
     const cooling = routes.filter((r) => r.state === 'caution' && !r.unknown);
     const unknown = routes.filter((r) => r.unknown);
     let availability;
-    if (routes.length === 0) {
+    // `ignored` is the gateway's word for an alias none of whose targets routes.
+    if (entry.ignored || routes.length === 0) {
       availability = { key: 'noroute', tone: 'off', label: 'No route', until: null };
     } else if (serving.length > 0) {
       availability = { key: 'routable', tone: 'clear', label: 'Routable', detail: serving.length < routes.length ? `${serving.length} of ${plural(routes.length, 'route')}` : null, until: null };
@@ -338,6 +459,8 @@ export function buildRows(models, providers) {
       name: entry.name,
       info: entry.info ?? {},
       hidden: !!entry.hidden,
+      // An alias without a routable target: no request can be served under the name.
+      ignored: !!entry.ignored,
       isAlias,
       kind: isAlias ? 'alias' : 'model',
       aliasTargets: entry.alias_targets ?? null,
@@ -367,48 +490,22 @@ export function nextCooldownEnd(providers, now) {
 }
 
 /**
- * The priority the gateway tries a route at. It tiers by credential, not by
- * provider: each credential has an effective priority (its own, else the
- * provider's), and of the credentials that can serve a model only the
- * highest tier is used. So a route counts at the highest priority among the
- * credentials that can serve it now; when none can, among those that could
- * once they are back.
- *
- * `provider` is the provider's view from GET /providers (may be undefined).
+ * Which routes carry traffic right now, as a Set of route indexes. Requests
+ * go to the highest tier that has an available credential (a route's
+ * `priority` in GET /models is that tier) and share the load there by the
+ * routing strategy; an alias tries its targets in order. So: of the routes
+ * that can serve, those of the first alias target that has any, and among
+ * them the highest priority.
  */
-export function routePriority(route, provider, now = Date.now()) {
-  if (!provider) return 0;
-  const fallback = provider.priority ?? 0;
-  const usable = (provider.credentials ?? []).filter((c) => !c.disabled && c.status !== 'disabled' && c.usable !== false && c.status !== 'unusable');
-  if (usable.length === 0) return fallback;
-  const ready = usable.filter((c) => !((c.cooldown_until ?? 0) > now) && !(c.model_cooldowns ?? []).some((m) => m.model === route.upstream_model && (m.until ?? 0) > now));
-  return Math.max(...(ready.length ? ready : usable).map((c) => c.priority ?? fallback));
-}
-
-/** Map(route index -> routePriority) for every route of a row. */
-export function routePriorities(row, providers, now = Date.now()) {
-  const byName = new Map((providers ?? []).map((p) => [p.name, p]));
-  return new Map(row.routes.map((r) => [r.index, routePriority(r, byName.get(r.provider), now)]));
-}
-
-/**
- * Which routes carry traffic right now. Credentials of a higher priority are
- * tried first and share the load by the routing strategy; an alias tries its
- * targets in order. So: of the routes that can serve, those of the first
- * alias target that has any, and among them the highest priority.
- *
- * `priorities` is Map(route index -> priority) from routePriorities.
- */
-export function litRoutes(row, priorities, targetOf) {
+export function litRoutes(row) {
   let candidates = row.routes.filter((r) => r.state === 'clear');
   if (candidates.length === 0) return new Set();
-  if (row.isAlias && targetOf) {
-    const firstTarget = Math.min(...candidates.map((r) => targetOf.get(r.index) ?? 0));
-    candidates = candidates.filter((r) => (targetOf.get(r.index) ?? 0) === firstTarget);
+  if (row.isAlias) {
+    const firstTarget = Math.min(...candidates.map((r) => r.targetIndex ?? 0));
+    candidates = candidates.filter((r) => (r.targetIndex ?? 0) === firstTarget);
   }
-  const of = (r) => priorities?.get(r.index) ?? 0;
-  const top = Math.max(...candidates.map(of));
-  return new Set(candidates.filter((r) => of(r) === top).map((r) => r.index));
+  const top = Math.max(...candidates.map((r) => r.priority ?? 0));
+  return new Set(candidates.filter((r) => (r.priority ?? 0) === top).map((r) => r.index));
 }
 
 /**
@@ -484,51 +581,17 @@ export function servesName(names, name) {
   return findFloating(index, text) === true;
 }
 
-/**
- * For an alias row: which target each of its routes comes from.
- * Returns Map(route index -> target index). Routes that cannot be attributed
- * are left out.
- */
-export function routesByTarget(row, rowsByName) {
-  const map = new Map();
-  if (!row.isAlias) return map;
-  const claimed = new Set();
-  let self = -1;
-  row.aliasTargets.forEach((target, targetIndex) => {
-    const entry = lookup(rowsByName, parseSuffix(target).base) ?? lookup(rowsByName, target);
-    if (!entry) return;
-    if (entry.name === row.name) {
-      // `gpt-5 -> gpt-5(high)`: the target is the provider's model behind the
-      // alias, which the table no longer lists under its own name.
-      if (self === -1) self = targetIndex;
-      return;
-    }
-    for (const theirs of entry.routes) {
-      const mine = row.routes.find((r) => !claimed.has(r.index) && r.provider === theirs.provider && r.upstream_model === theirs.upstream_model);
-      if (mine) {
-        claimed.add(mine.index);
-        map.set(mine.index, targetIndex);
-      }
-    }
-  });
-  // What no other target accounts for comes from that model.
-  if (self !== -1) for (const route of row.routes) if (!claimed.has(route.index)) map.set(route.index, self);
-  return map;
-}
+/** Whether `target` of an alias names the alias itself, with or without a reasoning suffix. */
+export const targetsOwnName = (row, target) => parseSuffix(target).base.trim().toLowerCase() === row.name.toLowerCase();
 
 /**
  * True when a provider's own model stands behind an alias of the same name
- * (`gpt-5 -> gpt-5(high)` pins a depth on the real gpt-5). The gateway does
- * not say so anywhere, so it is read off the routes: the alias targets its
- * own name and has routes that no other target explains.
+ * (`gpt-5 -> gpt-5(high)` pins a depth on the real gpt-5). GET /models says
+ * so through the routes: one of them belongs to a target that names the
+ * alias itself, and such a target only routes when that model exists.
  */
-export function pinsOwnModel(row, rowsByName) {
-  if (!row?.isAlias || row.routes.length === 0) return false;
-  const lower = row.name.toLowerCase();
-  const self = row.aliasTargets.findIndex((target) => parseSuffix(target).base.trim().toLowerCase() === lower);
-  if (self === -1) return false;
-  const targets = routesByTarget(row, rowsByName);
-  return row.routes.some((route) => targets.get(route.index) === self);
+export function pinsOwnModel(row) {
+  return !!row?.isAlias && row.routes.some((route) => route.target != null && targetsOwnName(row, route.target));
 }
 
 // ---------------------------------------------------------------------------
@@ -539,23 +602,20 @@ const WILDCARD_HOSTS = new Set(['0.0.0.0', '::', '[::]', '']);
 
 /**
  * The base URL to put in copy-ready commands: the address the gateway
- * listens on (GET /status `listen`). A wildcard bind address cannot be
- * called, so the host the dashboard was opened on stands in for it. When
- * the dashboard is on the listener itself the scheme is the page's;
- * otherwise something sits in between and plain http to the listener is the
- * only thing known.
+ * listens on (GET /status `listen`), with the scheme that listener serves
+ * (GET /status `tls`). A wildcard bind address cannot be called, so the host
+ * the dashboard was opened on stands in for it. Until /status has loaded,
+ * the address the dashboard itself was opened on is used.
  *
- * `loc` is window.location (protocol, hostname, port, origin).
+ * `loc` is window.location (hostname, origin).
  */
-export function gatewayBase(listen, loc) {
+export function gatewayBase(listen, loc, tls = false) {
   const match = /^(.*):(\d+)$/.exec(listen ?? '');
   if (!match) return loc?.origin ?? 'http://127.0.0.1:8317';
   let host = match[1];
   const port = match[2];
   if (WILDCARD_HOSTS.has(host)) host = loc?.hostname?.includes(':') ? `[${loc.hostname}]` : (loc?.hostname ?? '127.0.0.1');
-  const pagePort = loc?.port || (loc?.protocol === 'https:' ? '443' : '80');
-  const scheme = loc && pagePort === port ? loc.protocol : 'http:';
-  return `${scheme}//${host}:${port}`;
+  return `${tls ? 'https:' : 'http:'}//${host}:${port}`;
 }
 
 /** Quote for a POSIX shell: wrap in single quotes, escape the ones inside. */
@@ -684,10 +744,12 @@ export function sameAliases(body, saved) {
 }
 
 /**
- * What is worth saying about a draft alias before it is saved. These are
- * warnings, not errors: the gateway accepts all of them (and reports the
- * real errors itself, see the 422 mapping in aliases.js). They follow what
- * the gateway does with the list (build_aliases and resolve in
+ * What is worth saying about a draft alias before it is saved. They are
+ * shown as warnings and never stop a save: the gateway is the authority and
+ * reports what it refuses itself (the 422 mapping in aliases.js). Where a
+ * hint says "the gateway refuses" it repeats one of the gateway's own rules
+ * (validate in crates/core/src/config.rs); the rest follow what the gateway
+ * does with a list it accepts (build_aliases and resolve in
  * crates/scheduler/src/registry.rs).
  *
  * rows        every draft row
@@ -728,7 +790,13 @@ export function aliasWarnings(row, rows, rowsByName, realNames, { ready = true }
 
   if (name) {
     const parsedName = parseSuffix(name);
-    if (draftNames.has(lower)) {
+    // The first three are the gateway's own rules for a name, in its order
+    // (validate in crates/core/src/config.rs); it answers 422 on each.
+    if (/\s/.test(name)) {
+      out.name = 'A name cannot contain spaces: clients send it as a model name. The gateway refuses it.';
+    } else if (parsedName.depth !== null) {
+      out.name = `A name cannot end in a reasoning suffix such as (${parsedName.raw.trim()}): clients add that themselves. The gateway refuses it.`;
+    } else if (draftNames.has(lower)) {
       out.name = 'Another alias already has this name. The gateway refuses duplicates.';
     } else if (ready && ownModel) {
       out.name = row.targets.some((t) => pinsSelf(t.value.trim()))
@@ -743,7 +811,7 @@ export function aliasWarnings(row, rows, rowsByName, realNames, { ready = true }
   for (const target of row.targets) {
     const value = target.value.trim();
     if (!value) continue;
-    // The one case the gateway refuses outright (422).
+    // The gateway refuses it (422 on this target).
     if (name && value.toLowerCase() === lower) {
       out.targets.set(target.id, 'An alias cannot target itself.');
       continue;
@@ -770,5 +838,3 @@ export function aliasWarnings(row, rows, rowsByName, realNames, { ready = true }
   }
   return out;
 }
-
-export default buildRows;

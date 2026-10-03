@@ -13,7 +13,7 @@
 //     meta (see run.js; null until the headers arrive), firstContentMs,
 //     events, eventTotal, responseText, usage, finish, error, record }
 
-import { html, useState } from '../../../vendor/preact-htm.js';
+import { html, useRef, useState } from '../../../vendor/preact-htm.js';
 import {
   Badge,
   Button,
@@ -32,6 +32,7 @@ import {
 } from '../../components/index.js';
 import { formatCurrency, formatDuration, formatNumber, formatTime } from '../../lib/format.js';
 import { href } from '../../lib/router.js';
+import { placeFocus } from './focus.js';
 import FrameList from './framelist.js';
 import { KEY_VARIABLE, protocolInfo, snippetFamily, statusName } from './protocols.js';
 
@@ -202,6 +203,8 @@ function InfoTab({ run }) {
             hidden: !record?.upstream_protocol,
           },
           { label: 'Credential', value: record?.credential_label, hidden: !record?.credential_label },
+          // What the gateway applied after fitting a suffix, an alias target or the body to the model.
+          { label: 'Reasoning applied', value: record?.reasoning, mono: true, hidden: !record?.reasoning },
           { label: 'Attempts', value: record?.attempts ? formatNumber(record.attempts.length) : null, hidden: !record?.attempts },
           { label: 'Stream', value: streamValue(run) },
           { label: 'Time to first byte', value: meta ? formatDuration(meta.ttfbMs) : null },
@@ -261,8 +264,15 @@ function CodeTab({ protocol, curl, snippets }) {
 export default function Inspector({ tab, onTab, run, view, onView, next, raw, onRawToggle, onRawChange, onRawReset, loading = false, protocol, curl, snippets }) {
   const current = INSPECTOR_TABS.includes(tab) ? tab : 'request';
   const eventCount = run && run.meta?.streamed ? run.eventTotal : null;
+  const root = useRef(null);
+  // "Show the response" and "Show the events" leave with the empty state
+  // they are in: the keyboard goes to the tab they opened.
+  const jump = (id) => {
+    onTab(id);
+    placeFocus(() => root.current?.querySelector('[role="tab"][aria-selected="true"]'));
+  };
   return html`
-    <section class="panel play-insp" aria-label="Inspector">
+    <section ref=${root} class="panel play-insp" aria-label="Inspector">
       <div class="play-insp-tabs">
         <${Tabs}
           label="Inspector"
@@ -280,8 +290,8 @@ export default function Inspector({ tab, onTab, run, view, onView, next, raw, on
       <div class="play-insp-body" role="tabpanel" aria-label=${current}>
         ${current === 'request' &&
         html`<${RequestTab} run=${run} view=${view} onView=${onView} next=${next} raw=${raw} onRawToggle=${onRawToggle} onRawChange=${onRawChange} onRawReset=${onRawReset} loading=${loading} />`}
-        ${current === 'events' && html`<${EventsTab} run=${run} onTab=${onTab} />`}
-        ${current === 'response' && html`<${ResponseTab} run=${run} onTab=${onTab} />`}
+        ${current === 'events' && html`<${EventsTab} run=${run} onTab=${jump} />`}
+        ${current === 'response' && html`<${ResponseTab} run=${run} onTab=${jump} />`}
         ${current === 'info' && html`<${InfoTab} run=${run} />`}
         ${current === 'code' && html`<${CodeTab} protocol=${protocol} curl=${curl} snippets=${snippets} />`}
       </div>

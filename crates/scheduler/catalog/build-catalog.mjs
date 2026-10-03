@@ -27,6 +27,12 @@
 // claude-opus-4-1-20250805). When `created` is more than 60 days away from
 // the date in the id, the date in the id (midnight UTC) is written instead;
 // see `createdFor`. The catalog's tests check the same rule.
+//
+// Values the source has wrong are corrected from the vendors' model pages
+// (`CORRECTIONS`), and a thinking budget never exceeds the model's output
+// limit: a budget is part of the output (Anthropic requires `budget_tokens <
+// max_tokens`), so a larger `thinking.max` is capped at `max_output_tokens`.
+// The catalog's tests check both.
 
 import { readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -43,6 +49,28 @@ const SECTIONS = [
 const SKIP_IDS = new Set(["codex-auto-review"]);
 
 const EFFORTS = ["minimal", "low", "medium", "high", "xhigh", "max"];
+
+// Fields the source has wrong, by model id, as the vendors document them.
+const CORRECTIONS = {
+  // 200K-token context windows; 3.7 Sonnet writes up to 64K tokens (128K
+  // only behind a beta header).
+  "claude-3-5-haiku-20241022": { context_window: 200000 },
+  "claude-3-7-sonnet-20250219": { context_window: 200000, max_output_tokens: 64000 },
+  // Released on 18 and 20 November 2025, not in January.
+  "gemini-3-pro-preview": { created: 1763424000 },
+  "gemini-3-pro": { created: 1763424000 },
+  "gemini-3-pro-image-preview": { created: 1763596800 },
+  "gemini-3-pro-image": { created: 1763596800 },
+};
+
+function correct(entry) {
+  Object.assign(entry, CORRECTIONS[entry.id] ?? {});
+  const t = entry.thinking;
+  if (t && entry.max_output_tokens !== undefined && t.max > entry.max_output_tokens) {
+    t.max = entry.max_output_tokens;
+  }
+  return entry;
+}
 
 function positiveInt(...candidates) {
   for (const c of candidates) {
@@ -120,7 +148,7 @@ function normalise(raw, family) {
   if (thinking) entry.thinking = thinking;
   entry.family = family;
   entry.kinds = [];
-  return entry;
+  return correct(entry);
 }
 
 function build(source) {

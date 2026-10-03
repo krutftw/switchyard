@@ -3,10 +3,10 @@
 
 import { html, useMemo, useRef } from '../../../vendor/preact-htm.js';
 import { Badge, Button, CopyButton, Icon, Input, Notice, Pagination, Panel, Select, StatusLamp, Table, sortRows } from '../../components/index.js';
-import { DASH, formatNumber, formatTokens, plural } from '../../lib/format.js';
+import { DASH, formatCountdownWords, formatNumber, formatTokens, plural } from '../../lib/format.js';
 import { useHotkey, useNow } from '../../lib/hooks.js';
 import { href, setQuery, useQueryParam } from '../../lib/router.js';
-import { cooldownReason, timeLeft } from './logic.js';
+import { cooldownReason } from './logic.js';
 
 const PAGE_SIZE = 50;
 /** Routes shown in a table cell before the rest fold into "+N more". */
@@ -23,7 +23,7 @@ export function BackIn({ until, reason, prefix = 'back in', suffix = '' }) {
   const now = useNow();
   const why = cooldownReason(reason);
   if (!until || until <= now) return why ? html`<span>${why}${suffix}</span>` : null;
-  return html`<span>${why ? `${why}, ` : ''}${prefix} <span class="num">${timeLeft(until, now)}</span>${suffix}</span>`;
+  return html`<span>${why ? `${why}, ` : ''}${prefix} <span class="num">${formatCountdownWords((until - now) / 1000)}</span>${suffix}</span>`;
 }
 
 /** Entry kind: model or alias, plus "hidden" when an alias hides it from listings. */
@@ -112,15 +112,48 @@ function whyNoModels(providers, onRetry) {
       action: open,
     };
   }
-  const discovering = enabled.filter((p) => p.discover && (p.models?.length ?? 0) === 0);
-  if (discovering.length > 0) {
-    const one = discovering.length === 1;
+  // Where each provider's model list stands is said by GET /providers
+  // (`discovery`): still being fetched, or fetched and failed, with the reason.
+  const listless = enabled.filter((p) => (p.models?.length ?? 0) === 0);
+  const pending = listless.filter((p) => p.discovery?.state === 'pending');
+  if (pending.length > 0) {
+    const one = pending.length === 1;
     return {
       tone: 'info',
       icon: 'search',
-      title: 'Waiting for model lists',
-      description: `The gateway asks ${one ? discovering[0].name : `${discovering.length} providers`} which models ${one ? 'it serves' : 'they serve'}. They appear here as soon as an answer arrives; a provider that cannot be reached lists none.`,
+      title: one ? 'Waiting for the model list' : 'Waiting for model lists',
+      description: `The gateway is asking ${one ? pending[0].name : `${pending.length} providers`} which models ${one ? 'it serves' : 'they serve'}. They appear here as soon as an answer arrives.`,
       action: html`<${Button} icon="refresh" onClick=${onRetry}>Check again<//><${Button} variant="ghost" href=${href('/providers')}>Open providers<//>`,
+    };
+  }
+  const failed = listless.filter((p) => p.discovery?.state === 'failed');
+  if (failed.length > 0) {
+    const one = failed.length === 1;
+    const first = failed[0];
+    const link = (p) => html`<a class="mono" href=${href('/providers', { open: p.name })}>${p.name}</a>`;
+    // "a", "a and b", "a, b and c", each name a link to that provider.
+    const who = one ? link(first) : failed.flatMap((p, i) => [i === 0 ? '' : i === failed.length - 1 ? ' and ' : ', ', link(p)]);
+    // The gateway's reason is a fragment of one line; it is quoted as its own words.
+    const reason = String(first.discovery.error ?? '').trim().replace(/[.\s]+$/, '');
+    return {
+      tone: 'caution',
+      icon: 'alert',
+      title: one ? 'Could not fetch the model list' : 'Could not fetch the model lists',
+      // On one line: htm drops the spaces around a line break inside running text.
+      description: html`<span>The gateway asked ${who} which models ${one ? 'it serves' : 'they serve'} and got no list, so ${one ? 'it serves' : 'they serve'} none.</span>${reason && html`<span class="models-said"> ${one ? 'The gateway says' : `About ${first.name} the gateway says`}: ${reason}.</span>`}`,
+      action: html`<${Button} href=${href('/providers', { open: first.name })}>Open ${first.name}<//><${Button} variant="ghost" icon="refresh" onClick=${onRetry}>Check again<//>`,
+    };
+  }
+  // Fetched, and nothing in it (or `exclude` hides it all).
+  const blank = listless.filter((p) => p.discovery?.state === 'ok');
+  if (blank.length > 0) {
+    const one = blank.length === 1;
+    return {
+      tone: 'caution',
+      icon: 'models',
+      title: 'No models are listed',
+      description: `${one ? blank[0].name : `${blank.length} providers`} answered with a model list that is empty, or ${one ? 'its' : 'their'} exclude list hides all of it. Check the exclude list, or give the provider a model list of its own.`,
+      action: one ? html`<${Button} href=${href('/providers', { open: blank[0].name })}>Open ${blank[0].name}<//>` : open,
     };
   }
   return {
@@ -151,8 +184,8 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
 
   // A filter change starts again at the first page.
   const setFilter = (patch) => setQuery({ ...patch, page: null });
-  // Not while the drawer is open: the search box is behind it, outside its focus trap.
-  useHotkey('/', () => search.current?.focus(), { enabled: !open });
+  // (Ignored while the drawer is open: the keyboard then belongs to that layer.)
+  useHotkey('/', () => search.current?.focus());
 
   const columns = useMemo(
     () => [
@@ -234,12 +267,12 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
   const filtering = !!(q.trim() || provider || avail);
   const clear = () => setQuery({ q: null, provider: null, avail: null, page: null });
 
-  // The gateway lists every alias, also one with nothing to route to, so
-  // "no models" is decided from what providers serve: a model of the table,
-  // or an alias that routes (its targets are served, even when an alias has
-  // taken their name). With nothing served the reason is said: in place of
-  // the table when it is empty, above it when only dead aliases are left.
-  const served = rows ? rows.filter((row) => !row.isAlias || row.routes.length > 0).length : null;
+  // The gateway lists every alias, also one with nothing to route to
+  // (`ignored`), so "no models" is decided from the entries a request can be
+  // routed by: a model, or an alias that is not ignored. With none the
+  // reason is said: in place of the table when it is empty, above it when
+  // only ignored aliases are left.
+  const served = rows ? rows.filter((row) => !row.ignored).length : null;
   const noModels = served === 0 && !providersLoading ? whyNoModels(providers, onRetry) : null;
   const onlyAliases = noModels && rows.length > 0;
 
@@ -263,7 +296,7 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
     ${onlyAliases &&
     html`
       <${Notice} tone=${noModels.tone} title=${noModels.title} action=${noModels.action}>
-        ${noModels.description} Until then the ${rows.length === 1 ? 'alias below has' : `${rows.length} aliases below have`} nothing to route to.
+        ${noModels.description}<span> Meanwhile the ${rows.length === 1 ? 'alias below has' : `${rows.length} aliases below have`} nothing to route to.</span>
       <//>
     `}
     <${Panel} flush footer=${total > PAGE_SIZE ? html`<${Pagination} class="grow" page=${page} pageSize=${PAGE_SIZE} total=${total} noun="models" onPage=${(next) => setQuery({ page: next === 1 ? null : String(next) })} />` : null}>
@@ -309,6 +342,7 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
         onSort=${(next) => setQuery({ sort: !next || (next.key === 'name' && next.dir === 'asc') ? null : `${next.key}:${next.dir}`, page: null })}
         loading=${loading || providersLoading}
         error=${error}
+        errorTitle="Could not load the model table"
         onRetry=${onRetry}
         onRowClick=${(row) => onOpen(row.name)}
         selectedKey=${open || null}

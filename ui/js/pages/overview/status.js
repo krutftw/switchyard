@@ -4,7 +4,7 @@
 
 import { html, useMemo, useState } from '../../../vendor/preact-htm.js';
 import { Button, CodeBlock, CopyButton, IconButton, Notice, Panel, Skeleton, StatusLamp } from '../../components/index.js';
-import { formatDateTime, formatDuration, formatNumber, formatTime, plural } from '../../lib/format.js';
+import { formatDateTime, formatDuration, formatNumber, formatTime, plural, sentence } from '../../lib/format.js';
 import { href } from '../../lib/router.js';
 import { serverClock, useServerNow } from './data.js';
 import { clientBase, curlExample, firstRun, gatewayVerdict, summarizeProvider, warningTarget } from './model.js';
@@ -105,18 +105,19 @@ function RefreshNotice({ down, sections, onRetry }) {
   if (!down && sections.length === 0) return null;
   const retrying = sections.some((section) => section.resource.refreshing);
   const action = html`<${Button} size="sm" icon="refresh" loading=${retrying} onClick=${onRetry}>Try again<//>`;
-  const error = sections[0]?.resource.error;
+  // The gateway's own words, as a sentence: other text follows them.
+  const why = sentence(sections[0]?.resource.error?.message);
   if (down) {
     return html`
       <${Notice} tone="stop" title=${down.unreachable ? 'The gateway cannot be reached' : 'The gateway is not answering'} action=${action}>
-        ${error?.message} Everything on this page shows what was loaded up to <span class="num">${formatTime(down.at)}</span>.${!down.unreachable && ' The gateway is reachable but answers with an error: its own log says why.'}
+        ${why} Everything on this page shows what was loaded up to <span class="num">${formatTime(down.at)}</span>.${!down.unreachable && ' The gateway is reachable but answers with an error: its own log says why.'}
       <//>
     `;
   }
   // Old data on screen, or (the request records) none at all.
   const stale = sections.filter((section) => section.resource.data != null);
   const missing = sections.filter((section) => section.resource.data == null);
-  const sentence = (names) => {
+  const subjectOf = (names) => {
     const subject = listed(names);
     return `${subject.charAt(0).toUpperCase()}${subject.slice(1)}`;
   };
@@ -125,10 +126,10 @@ function RefreshNotice({ down, sections, onRetry }) {
     sections.length > 1 ? 'Could not refresh parts of this page' : stale.length === 1 ? `Could not refresh ${stale[0].what}` : `Could not load ${missing[0].what}`;
   return html`
     <${Notice} tone="caution" title=${title} action=${action}>
-      ${error?.message}${stale.length > 0 &&
-      html`${' '}${sections.length === 1 ? 'Showing' : `${sentence(stale.map((section) => section.what))} ${stale.length === 1 ? 'shows' : 'show'}`} what was loaded at <span class="num">${Number.isFinite(since) ? formatTime(since) : 'an earlier time'}</span>.`}${missing.length > 0 &&
+      ${why}${stale.length > 0 &&
+      html`${' '}${sections.length === 1 ? 'Showing' : `${subjectOf(stale.map((section) => section.what))} ${stale.length === 1 ? 'shows' : 'show'}`} what was loaded at <span class="num">${Number.isFinite(since) ? formatTime(since) : 'an earlier time'}</span>.`}${missing.length > 0 &&
       sections.length > 1 &&
-      html`${' '}${sentence(missing.map((section) => section.what))} could not be loaded.`}
+      html`${' '}${subjectOf(missing.map((section) => section.what))} could not be loaded.`}
     <//>
   `;
 }
@@ -249,7 +250,7 @@ export function FirstRun({ status, providers, onHide }) {
   const state = firstRun(status.data, providers.data);
   if (!state.show) return null;
   const listen = status.data.listen;
-  const { base, direct } = clientBase(listen, typeof location === 'undefined' ? null : location);
+  const { base, direct } = clientBase(listen, typeof location === 'undefined' ? null : location, status.data.tls);
   const curl = curlExample({ base, model: state.model, authRequired: state.authRequired });
   const providerDone = !state.noProviders && !state.mockOnly;
   // The dashboard was not opened on the socket the gateway listens on (a
@@ -309,5 +310,3 @@ export function FirstRun({ status, providers, onHide }) {
     <//>
   `;
 }
-
-export default StatusStrip;

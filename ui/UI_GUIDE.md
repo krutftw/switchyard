@@ -2,7 +2,8 @@
 
 This is the contract between the dashboard foundation (design system and app
 shell) and the pages built on it. Read it once, keep `#/_kit` open while you
-work, and copy patterns from `js/pages/kitchen-sink.js`.
+work (type the address: the kit is not in the navigation or the command
+palette), and copy patterns from `js/pages/kitchen-sink.js`.
 
 Contents: [Ground rules](#ground-rules) · [Running it](#running-it) ·
 [File layout](#file-layout) · [Adding a page](#adding-a-page) ·
@@ -128,7 +129,9 @@ ui/
 2. Add an entry to `ROUTES` in `js/routes.js` (path, title, icon, group, load).
 
 That is all: the sidebar, the phone navigation, the command palette and the
-document title follow the route table.
+document title follow the route table. An entry without `group` stays out of
+the navigation; one with `dev: true` (a page for page authors, like the kit)
+stays out of the command palette too and is opened by its address.
 
 A page that outgrows one file puts the rest in `js/pages/<name>/` and its
 styles in `css/pages/<name>.css`. Only the route module (the file directly in
@@ -185,6 +188,17 @@ What a page gets and must do:
 - **URL state.** Filters, the selected tab, the time range and the open record
   belong in the query (`useQueryParam`), so a link reproduces the view and
   Back closes a drawer. Use `navigate(path, { query })` to change page.
+- **Which changes are a step in the history.** A query change replaces the
+  current entry by default: right for what is typed (a search field would
+  add an entry per keystroke) and for paging. What the user picks from a few
+  choices is a step Back returns to: a tab, a time range, a grouping, the
+  record a drawer opens. Ask for it where the parameter is declared,
+  `useQueryParam('tab', 'general', { push: true })`, or per call,
+  `setQuery({ open: id }, { replace: false })`. A pushing setter does nothing
+  when given the value already shown, and takes `{ replace: true }` for the
+  one call that should not be a step (correcting a stale `?tab=`). The
+  setter may be passed straight to `onChange`: the DOM event a control hands
+  it as a second argument is not taken for options.
 - **Page CSS.** If the shared classes are not enough, add
   `css/pages/<name>.css` and load it at the top of the module, before the
   component is defined: `await loadStyles('pages/<name>.css');`. Prefix its
@@ -227,6 +241,20 @@ Whatever fails, at whatever stage (sending, waiting, reading the body), the
 rejection is an `ApiError`; you never need to handle a raw `TypeError` or
 `DOMException`. A 401 from any call ends the session and brings back the
 sign-in page; pages do not handle it.
+
+**The session and the other tabs.** Each tab holds its own copy of the
+secret (in `sessionStorage`, and in memory), including a tab that resumed a
+remembered session from `localStorage`: signing in elsewhere without
+"Remember" does not take it away. Signing out (`api.logout()`, which the
+shell's sign-out calls) forgets the secret in the whole browser: every other
+tab of the dashboard hears it (a `BroadcastChannel`, and a `storage` event
+for browsers without one), drops its copy, closes its live connection and
+shows the sign-in page. The `auth` store then reads
+`{ status: 'anonymous', reason: 'signed-out', elsewhere: true }` there, and
+`elsewhere: false` in the tab that signed out. Like a 401, a sign-out from
+another tab cannot be held back by a leave guard. `api.logout({ allTabs: false })`
+drops the secret without telling the other tabs (the boot screen's "Use a
+different secret", for a secret it could not even check).
 
 A success without a body (a 204, an empty 200) resolves `null`.
 
@@ -702,6 +730,10 @@ if (ok) { toast.success('Key deleted'); keys.refresh(); }
 ```
 
 - Drawer for the detail of a row; keep its id in the URL.
+- A drawer's `actions` sit on one line with the close button, at their own
+  width; a long title (a provider name with no space in it) wraps beside
+  them. Keep `actions` to a few icon buttons and at most one labelled button,
+  or they leave the title little room on a phone; put the rest in a `Menu`.
 - Modal only when the task must interrupt: a short create form, a
   confirmation. Try inline first.
 - `dismissable=${false}` (Modal and Drawer) turns off every way out the
@@ -719,7 +751,10 @@ if (ok) { toast.success('Key deleted'); keys.refresh(); }
   function returning an element), else to the nearest thing around the
   opener that can hold focus: its row, its panel, the drawer it was in, the
   page's `<main>`. Never to `<body>`. The same happens when the opener is
-  removed shortly after the layer closed (the list refetched).
+  removed shortly after the layer closed (the list refetched). A layer that
+  opened while nothing had the focus (Ctrl+K on a page just loaded, a drawer
+  opened by a link) has no opener: it hands the focus to `returnFocus`, else
+  to the page's `<main>`.
 - **A focus you place yourself wins.** A closing layer only hands the focus
   back while it is still inside the layer or nowhere (`<body>`). If the page
   has moved it meanwhile, to the row that took a deleted one's place say, it
@@ -942,7 +977,10 @@ Tokens: `--dur-press` 110ms, `--dur-fast` 150ms, `--dur-base` 200ms,
   replacement.
 - Focus is never dropped on `<body>`. Overlays hand it back (see Overlays);
   when your own control removes itself (a dismiss button, "Show 12 new"),
-  move focus to what took its place.
+  move focus to what took its place. The shell does it for the page: on a
+  change of page, and when it replaces the sign-in form after signing in,
+  the focus goes to `<main>`. A plain load of a remembered session leaves it
+  where the browser put it, so the first Tab reaches "Skip to content".
 - Colour is never the only signal: lamps have labels, charts have legends
   and tables, invalid fields have text.
 - Icon-only controls use `IconButton` (it requires `label`).

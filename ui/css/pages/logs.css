@@ -42,11 +42,6 @@
   max-width: calc(var(--space-10) * 11);
 }
 
-/* The field has its own clear button, reachable from the keyboard. */
-.logs-search input::-webkit-search-cancel-button {
-  display: none;
-}
-
 /* The target filter: as wide as a typical target, never wider than the row. */
 .logs-target-pick {
   flex: 0 1 calc(var(--space-10) * 6);

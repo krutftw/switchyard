@@ -320,6 +320,14 @@ scheduler only when that rests no more than the failing model itself:
 `mock-error-429` / `mock-error-500` rest themselves, `mock-error-401` rests
 nothing (an `Auth` failure would rest the provider's only credential and with
 it every working mock model). The same holds for `test_provider`.
+Payload rules apply to a mock attempt as to any other: the mock stands in
+for an upstream that speaks the client's protocol, so the rules that match
+(by model, by provider — the mock's name — and by protocol, the client's)
+patch the client's body as they would a passthrough body, `default` rules
+consulting the client's original body; the patched body is decoded again
+and that is the request the mock answers (and that is captured as the
+upstream request). A rule that leaves a body the protocol cannot be read
+from ends the request with a 400, as a real upstream would.
 
 **Waiting** (`routing.max_wait_secs`, off by default): when no credential can
 be picked because all of them are resting — including the ones this very

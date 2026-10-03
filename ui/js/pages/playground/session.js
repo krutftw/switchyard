@@ -51,14 +51,14 @@ export const socketMemory = {
   closed: null, // { code, reason, opened, refusal, left } of the last socket
 };
 
-export function forgetSocket() {
+function forgetSocket() {
   socketMemory.turns = [];
   socketMemory.frames = { list: [], total: 0, seq: 0, t0: 0, openedAt: null };
   socketMemory.closed = null;
 }
 
 /** Stop what is running and forget everything. */
-export default function forgetSession() {
+function forgetSession() {
   work.abort?.abort();
   work.lookup?.abort();
   work.run = null;

@@ -18,8 +18,9 @@
 //   combobox.js      the model field
 //   socket.js        the WebSocket view
 //   session.js       the conversation and the last request, kept while the page is left
+//   focus.js         where the keyboard goes when a control removes or disables itself
 
-import { html, useEffect, useMemo, useRef } from '../../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useMemo, useRef } from '../../vendor/preact-htm.js';
 import {
   Button,
   CopyButton,
@@ -45,11 +46,12 @@ import { useCommands } from '../lib/commands.js';
 import { copyText, loadStyles, nextId } from '../lib/dom.js';
 import { formatDateTime, formatNumber, plural } from '../lib/format.js';
 import { useDebounced, useLocalStorage, useMediaQuery, useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { href, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import Combobox from './playground/combobox.js';
 import Conversation from './playground/conversation.js';
+import { focusFirst, pageMain, placeFocus, rescueFocus } from './playground/focus.js';
 import Inspector, { EVENT_CAP, INSPECTOR_TABS } from './playground/inspector.js';
 import buildBody, {
   DEFAULT_SETTINGS,
@@ -67,6 +69,8 @@ import buildBody, {
   protocolInfo,
   publicPath,
   readError,
+  splitSuffix,
+  suffixKind,
   summarizeRawBody,
 } from './playground/protocols.js';
 import runPlayground from './playground/run.js';
@@ -90,12 +94,6 @@ function gatewayOrigin() {
   const dir = location.pathname.replace(/[^/]*$/, '');
   return location.origin + dir.replace(/\/admin\/$/, '/').replace(/\/$/, '');
 }
-
-const StopIcon = () => html`
-  <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.75" stroke-linejoin="round" aria-hidden="true" focusable="false">
-    <rect x="6.5" y="6.5" width="11" height="11" rx="1.5" />
-  </svg>
-`;
 
 function cleanSettings(stored) {
   const s = { ...DEFAULT_SETTINGS, ...(stored && typeof stored === 'object' ? stored : {}) };
@@ -143,8 +141,21 @@ const setReplay = setter('replay');
 const patchTurn = (id, change) => setTurns((list) => list.map((t) => (t.id === id ? { ...t, ...change } : t)));
 const wait = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/** "model(high)" -> ["model", "high"]: the reasoning suffix the gateway splits off a model name. */
-const splitSuffix = (name) => /^(.+)\(([^()]+)\)$/.exec(name)?.slice(1) ?? null;
+/**
+ * What a reasoning suffix on the model name does, as the gateway applies it
+ * (crates/core: a suffix wins over the body; `auto` is left to the upstream).
+ */
+function suffixHint(raw) {
+  const kind = suffixKind(raw);
+  const shown = `(${raw})`;
+  if (kind === 'level') return `The gateway reads ${shown} as the reasoning effort; it wins over the setting below.`;
+  if (kind === 'off') return `The gateway reads ${shown} as reasoning switched off; it wins over the setting below.`;
+  if (kind === 'budget') return `The gateway reads ${shown} as a thinking budget in tokens and fits it to what the model accepts; it wins over the setting below.`;
+  if (kind === 'auto') {
+    return `The gateway reads ${shown} as the model's own choice of depth: an OpenAI upstream is sent no effort, a Claude model with effort levels thinks adaptively, a Gemini model that allows it gets a dynamic budget. It wins over the setting below.`;
+  }
+  return `${shown} is not a reasoning depth the gateway knows (an effort name, auto, none or a token budget): it is dropped, and the setting below applies.`;
+}
 
 export default function Playground() {
   const origin = useMemo(gatewayOrigin, []);
@@ -164,16 +175,11 @@ export default function Playground() {
 
   // ---- Models: live when the connection is up, polled when it is not ------
   const liveStatus = useStore(liveState, (s) => s.status);
-  const liveSince = useStore(liveState, (s) => s.since);
   const models = useResource('/models', { pollMs: liveStatus === 'open' ? 0 : 30_000 });
   useLive('config.reloaded', models.refresh);
   useLive('credential', models.refresh);
-  const sawLive = useRef(null);
-  useEffect(() => {
-    // Frames sent while the connection was down are gone: ask again.
-    if (liveStatus === 'open' && sawLive.current !== null && sawLive.current !== liveSince) models.refresh();
-    if (liveStatus === 'open') sawLive.current = liveSince;
-  }, [liveStatus, liveSince]);
+  // Frames sent while the connection was down, or dropped for it, are gone: ask again.
+  useLiveGap(models.refresh);
 
   const modelList = Array.isArray(models.data) ? models.data : [];
   const modelOptions = useMemo(
@@ -182,11 +188,15 @@ export default function Playground() {
         const routes = Array.isArray(m.routes) ? m.routes : [];
         const ready = routes.reduce((n, r) => n + (r.credentials_available ?? 0), 0);
         const providers = [...new Set(routes.map((r) => r.provider))];
+        // `ignored`: an alias none of whose targets can be routed. `credentials_available`
+        // counts the credentials that could serve the model now: 0 when every one is
+        // resting, switched off or unusable, which this list cannot tell apart.
+        const dead = m.ignored || routes.length === 0;
         return {
           value: m.name,
           hint: m.alias_targets ? `alias of ${m.alias_targets.join(', ')}` : providers.join(', '),
-          tone: routes.length === 0 ? 'stop' : ready === 0 ? 'caution' : undefined,
-          toneLabel: routes.length === 0 ? 'no route' : 'resting',
+          tone: dead ? 'stop' : ready === 0 ? 'caution' : undefined,
+          toneLabel: dead ? 'no route' : 'no credential',
         };
       }),
     [models.data],
@@ -211,10 +221,18 @@ export default function Playground() {
   if (knownModel) {
     const routes = knownModel.routes ?? [];
     const ready = routes.reduce((n, r) => n + (r.credentials_available ?? 0), 0);
-    if (routes.length === 0) modelHint = 'No provider serves this name right now. Requests for it fail.';
-    else if (ready === 0) modelHint = 'Every credential for this model is resting. Requests fail until a cooldown ends.';
+    if (knownModel.ignored) modelHint = `None of this alias's targets (${(knownModel.alias_targets ?? []).join(', ')}) can be routed, so requests for it fail. Change the targets on the Models page.`;
+    else if (routes.length === 0) modelHint = 'No provider serves this name right now. Requests for it fail.';
+    else if (ready === 0) modelHint = 'No credential can serve this model right now: each one is resting, switched off or unusable. Requests fail until one is back.';
     else modelHint = `Served by ${[...new Set(routes.map((r) => r.provider))].join(', ')}.`;
-    if (suffixed) modelHint += ` The gateway reads (${suffixed[1]}) as the reasoning effort; it wins over the setting below.`;
+    // An alias target written with a suffix pins the depth on its routes:
+    // there it wins over a suffix on the alias and over the request body.
+    const pinned = [...new Set(routes.map((r) => r.target).filter((t) => typeof t === 'string' && suffixKind(splitSuffix(t)?.[1]) != null))];
+    if (pinned.length > 0) {
+      modelHint += ` Its target ${pinned.join(', ')} pins the reasoning depth: on that route ${suffixed ? `(${suffixed[1]}) and the setting below change` : 'the setting below changes'} nothing.`;
+    } else if (suffixed) {
+      modelHint += ` ${suffixHint(suffixed[1])}`;
+    }
   } else if (models.error && !models.data) {
     modelHint = 'The model list could not be loaded. Type a name; it is sent as written.';
   } else if (model && models.data) {
@@ -225,6 +243,22 @@ export default function Playground() {
   const { turns, draft, busy, view, raw, rawError, modelError, failure, replay } = useStore(session);
   const modelInput = useRef(null);
   const run = work.run;
+
+  // Where the keyboard goes when the control that had it removes or disables
+  // itself (see focus.js): the message field, else the composer's main button.
+  const composerBox = useRef(null);
+  // On a touch screen a focused text field brings the keyboard up over the
+  // answer: there the transcript takes the focus instead.
+  const composerTargets = () =>
+    coarse
+      ? [composerBox.current?.parentElement?.querySelector('.play-transcript[tabindex]'), pageMain()]
+      : [composerBox.current?.querySelector('textarea'), composerBox.current?.querySelector('.play-composer-actions > .btn:last-child'), pageMain()];
+  // "Stop", once the request has ended, is a "Send" that is disabled while
+  // there is no message. This runs before the browser lets go of the focus.
+  useLayoutEffect(() => {
+    const at = document.activeElement;
+    if (!busy && at && at.disabled && composerBox.current?.contains(at)) focusFirst(...composerTargets());
+  }, [busy]);
 
   const issues = useIssues(failure);
 
@@ -356,11 +390,11 @@ export default function Playground() {
             if (json === undefined) error = { kind: 'http', status: meta.status, message: 'The gateway answered with a body that is not JSON. It is under Response in the inspector.', issues: [] };
           } else {
             const parsed = readError(json ?? text.slice(0, 600), meta.status);
-            error = { kind: 'http', ...parsed, status: meta.status, retryAfter: meta.retryAfter };
+            error = { kind: 'http', ...parsed, status: meta.status, retryAfter: meta.retryAfter ?? parsed.retryAfter };
           }
         },
       });
-      if (!error && reader.state.error) error = { kind: current.meta?.streamed ? 'stream' : 'http', ...reader.state.error, retryAfter: null };
+      if (!error && reader.state.error) error = { kind: current.meta?.streamed ? 'stream' : 'http', ...reader.state.error };
       if (error) status = 'error';
     } catch (thrown) {
       if (thrown instanceof ApiError && thrown.aborted) {
@@ -491,6 +525,8 @@ export default function Playground() {
   const sendToolResults = (turnId, results) => {
     // Raw mode sends only what is in the editor; the result form is not offered then.
     if (busy || raw.on) return;
+    // The button that sent them leaves with the result form.
+    rescueFocus(composerTargets);
     sendForm(turns.map((t) => (t.id === turnId ? { ...t, blocks: t.blocks.map((b) => (b.type === 'tool_call' && b.id in results ? { ...b, result: results[b.id] } : b)) } : t)));
   };
 
@@ -511,6 +547,8 @@ export default function Playground() {
    */
   const regenerate = () => {
     if (busy || lastAnswer === -1) return;
+    // "Send again" in an error note goes away with the answer it belongs to.
+    rescueFocus(composerTargets);
     const target = turns[lastAnswer];
     if (raw.on) {
       let keep = turns.length;
@@ -550,10 +588,11 @@ export default function Playground() {
     setView('next');
   };
 
+  /** Resolves true when raw mode was left (false: the reader kept the edited body). */
   const toggleRaw = async (on) => {
     if (on) {
       enterRaw(nextText);
-      return;
+      return false;
     }
     if (raw.text !== raw.seed) {
       const ok = await confirm({
@@ -562,10 +601,16 @@ export default function Playground() {
         message: 'Your changes to the raw JSON are lost. The body is built from the form again.',
         confirmLabel: 'Discard changes',
       });
-      if (!ok) return;
+      if (!ok) return false;
     }
     setRaw({ on: false, text: '', seed: '' });
     setRawError(null);
+    return true;
+  };
+
+  /** "Leave raw mode" in the composer: the button goes, the message field takes its place. */
+  const leaveRaw = async () => {
+    if (await toggleRaw(false)) placeFocus(composerTargets);
   };
 
   const rebuildRaw = async () => {
@@ -592,9 +637,6 @@ export default function Playground() {
     // over what was edited since.
     if (!source.data || work.appliedFrom === from) return;
     const record = source.data.record ?? {};
-    // Right after `from` changes, the resource still holds the previous
-    // request for one render: wait for the record that was asked for.
-    if (record.id !== from) return;
     work.appliedFrom = from;
     const text = source.data.bodies?.client_request;
     if (typeof text !== 'string' || text === '') {
@@ -646,10 +688,15 @@ export default function Playground() {
 
   const replayNotice = (() => {
     if (!from) return null;
-    const dismiss = html`<${Button} size="sm" onClick=${() => setFrom('')}>Dismiss<//>`;
+    // Both buttons leave with their notice: the keyboard goes to the page, not to <body>.
+    const leaving = (action) => () => {
+      action();
+      rescueFocus(pageMain);
+    };
+    const dismiss = html`<${Button} size="sm" onClick=${leaving(() => setFrom(''))}>Dismiss<//>`;
     const name = html`<span class="mono">${from}</span>`;
     if (source.error && !source.data) {
-      return html`<${Notice} tone="stop" title="Could not load the request to replay" action=${html`<span class="row"><${Button} size="sm" icon="refresh" onClick=${source.refresh}>Try again<//>${dismiss}</span>`}>
+      return html`<${Notice} tone="stop" title="Could not load the request to replay" action=${html`<span class="row"><${Button} size="sm" icon="refresh" onClick=${leaving(source.refresh)}>Try again<//>${dismiss}</span>`}>
         ${source.error.message}
       <//>`;
     }
@@ -721,18 +768,18 @@ export default function Playground() {
 
   const composer = raw.on
     ? html`
-        <div class="play-composer">
+        <div class="play-composer" ref=${composerBox}>
           <p class="muted">Raw mode: the body under Request in the inspector is sent as it is written there. The conversation above is not added to it.</p>
           <div class="play-composer-actions">
-            <${Button} variant="ghost" disabled=${busy} onClick=${() => toggleRaw(false)}>Leave raw mode<//>
+            <${Button} variant="ghost" disabled=${busy} onClick=${leaveRaw}>Leave raw mode<//>
             ${busy
-              ? html`<${Button} onClick=${stop}><${StopIcon} />Stop<//>`
+              ? html`<${Button} icon="stop" onClick=${stop}>Stop<//>`
               : html`<${Button} variant="primary" icon="send" onClick=${() => sendRaw()}>Send raw request<//>`}
           </div>
         </div>
       `
     : html`
-        <div class="play-composer">
+        <div class="play-composer" ref=${composerBox}>
           <${Textarea}
             label="Message"
             value=${draft}
@@ -751,7 +798,7 @@ export default function Playground() {
           <div class="play-composer-actions">
             <span class="faint hide-phone">Enter sends. Shift and Enter starts a new line.</span>
             ${busy
-              ? html`<${Button} onClick=${stop}><${StopIcon} />Stop<//>`
+              ? html`<${Button} icon="stop" onClick=${stop}>Stop<//>`
               : html`<${Button} variant=${awaitingTools ? 'secondary' : 'primary'} icon="send" disabled=${!draft.trim()} onClick=${() => sendText(draft)}>Send<//>`}
           </div>
         </div>
@@ -849,17 +896,17 @@ export default function Playground() {
                     step=${1}
                     placeholder=${protocol === 'anthropic' ? String(anthropicMaxTokens(settings)) : 'Default'}
                     disabled=${formLocked}
+                    warning=${budgetConflict
+                      ? `Not above the thinking budget, ${formatNumber(budget)} tokens at this effort: an Anthropic upstream answers 400. Raise it, clear the field, or lower the effort.`
+                      : undefined}
                   />
                 </div>
-                ${budgetConflict
-                  ? html`<${Notice} tone="caution" title="max_tokens is not above the thinking budget">
-                      An Anthropic upstream answers 400 unless max_tokens is larger than thinking.budget_tokens, ${formatNumber(budget)} at this effort. Raise Max output tokens, clear the field, or lower the effort.
-                    <//>`
-                  : html`<p class="field-hint">
-                      ${protocol === 'anthropic' && settings.maxTokens == null
-                        ? `Anthropic requires max_tokens: ${formatNumber(anthropicMaxTokens(settings))} is sent while the field is empty.`
-                        : `Max output tokens is sent as ${MAX_TOKENS_FIELD[protocol]}.`}
-                    </p>`}
+                ${!budgetConflict &&
+                html`<p class="field-hint">
+                  ${protocol === 'anthropic' && settings.maxTokens == null
+                    ? `Anthropic requires max_tokens: ${formatNumber(anthropicMaxTokens(settings))} is sent while the field is empty.`
+                    : `Max output tokens is sent as ${MAX_TOKENS_FIELD[protocol]}.`}
+                </p>`}
                 <${Select}
                   label="Reasoning effort"
                   value=${settings.effort}
@@ -890,7 +937,13 @@ export default function Playground() {
             flush
             class="play-chat"
             actions=${html`
-              <${IconButton} icon="refresh" label=${raw.on ? 'Send the raw request again' : 'Regenerate the last answer'} disabled=${busy || lastAnswer === -1} onClick=${regenerate} />
+              <${IconButton}
+                icon="refresh"
+                label=${raw.on ? 'Send the raw request again' : 'Regenerate the last answer'}
+                disabled=${lastAnswer === -1}
+                aria-disabled=${busy && lastAnswer !== -1 ? 'true' : undefined}
+                onClick=${regenerate}
+              />
               <${IconButton} icon="trash" label="Clear the conversation" disabled=${turns.length === 0} onClick=${clear} />
             `}
           >
@@ -906,7 +959,17 @@ export default function Playground() {
                 icon="playground"
                 title="Nothing sent yet"
                 description="Choose a model, write a message and send it. The answer appears here; the inspector shows the exact body and every event."
-                action=${raw.on ? null : html`<${Button} disabled=${busy} onClick=${() => sendText('Hello')}>Send "Hello"<//>`}
+                action=${raw.on
+                  ? null
+                  : html`<${Button}
+                      disabled=${busy}
+                      onClick=${() => {
+                        sendText('Hello');
+                        rescueFocus(composerTargets);
+                      }}
+                    >
+                      Send "Hello"
+                    <//>`}
               />`}
             />
             ${composer}

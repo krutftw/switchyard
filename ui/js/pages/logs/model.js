@@ -5,8 +5,10 @@
 // The buffer combines two sources that overlap:
 //
 //   pages of GET /logs   the newest lines that match a server-side query
-//                        (level, q), and older ones through the `before`
-//                        cursor;
+//                        (level, q, target), and older ones through the
+//                        `before` cursor. A page also says where it ends:
+//                        `last_seq`, the newest line the gateway held when
+//                        it took the page, whatever the query;
 //   "log" live frames    every line the gateway writes, unfiltered.
 //
 // The gateway numbers its lines (`seq`, one more per line), so merging is a
@@ -117,19 +119,52 @@ function haystack(line) {
 }
 
 /**
+ * A target filter as `GET /logs?target=` reads it, ignoring case:
+ *   "a::b"   exactly that target
+ *   "a::"    the module `a` and everything below it
+ *   "a*"     every target that starts so ("*" alone: every target)
+ * Returns { exact, prefix } (either may be null), or null for no filter.
+ */
+function targetRule(target) {
+  const text = String(target ?? '').trim().toLowerCase();
+  if (!text) return null;
+  if (text.endsWith('*')) return { exact: null, prefix: text.replace(/\*+$/, '') };
+  if (text.endsWith('::')) return { exact: text.slice(0, -2), prefix: text };
+  return { exact: text, prefix: null };
+}
+
+function targetHit(rule, target) {
+  const name = String(target ?? '').toLowerCase();
+  return name === rule.exact || (rule.prefix !== null && name.startsWith(rule.prefix));
+}
+
+/** True when every target the filter `inner` lets through passes `outer` too. */
+function targetWithin(outer, inner) {
+  const wide = targetRule(outer);
+  if (wide === null || wide.prefix === '') return true;
+  const narrow = targetRule(inner);
+  if (narrow === null) return false;
+  if (narrow.exact !== null && !targetHit(wide, narrow.exact)) return false;
+  return narrow.prefix === null || (wide.prefix !== null && narrow.prefix.startsWith(wide.prefix));
+}
+
+/**
  * The display filter, prepared once per change:
  *   level   least severe level shown ("trace" shows everything)
  *   q       text searched for, ignoring case
- *   target  exact target, or "" for any
+ *   target  target shown, read the way the gateway reads it (targetRule),
+ *           or "" for any
  */
 export function makeFilter({ level = 'trace', q = '', target = '' } = {}) {
   const text = String(q ?? '').trim();
+  const name = String(target ?? '').trim();
   return {
     level: parseLevel(level),
     rank: levelRank(parseLevel(level)),
     q: text,
     needle: text.toLowerCase(),
-    target: String(target ?? ''),
+    target: name,
+    targetRule: targetRule(name),
   };
 }
 
@@ -139,32 +174,42 @@ export function isFiltered(filter) {
 
 export function matches(line, filter) {
   if (filter.rank > 0 && levelRank(line.level) < filter.rank) return false;
-  if (filter.target && line.target !== filter.target) return false;
+  if (filter.targetRule && !targetHit(filter.targetRule, line.target)) return false;
   if (filter.needle && !haystack(line).includes(filter.needle)) return false;
   return true;
 }
 
 /**
- * The query to send for a display filter. The gateway has no target
- * parameter, but `q` also searches the target, so a target filter without a
- * search text is sent as `q`: its pages then hold lines of that target
- * (and the few others that mention it, which the display filter drops).
+ * The query to send for a display filter. The gateway applies all three
+ * parts, so a page holds nothing but lines the filter shows.
  */
 export function serverQuery(filter) {
-  return { level: filter.rank > 0 ? filter.level : '', q: filter.q || filter.target || '' };
+  return { level: filter.rank > 0 ? filter.level : '', q: filter.q, target: filter.target };
+}
+
+/** A query with every part present. */
+function asQuery(query) {
+  return { level: query?.level || '', q: query?.q || '', target: query?.target || '' };
+}
+
+/** True when two queries ask the gateway for the same lines. */
+export function sameQuery(a, b) {
+  const x = asQuery(a);
+  const y = asQuery(b);
+  return x.level === y.level && x.q === y.q && x.target === y.target;
 }
 
 /**
  * True when lines loaded under `query` are all the lines `filter` can show:
- * the filter is the same or narrower. A lower level, or a search text that
- * the loaded one is not part of, needs a reload.
+ * the filter is the same or narrower. A lower level, a search text that the
+ * loaded one is not part of, or a target outside the loaded one needs a
+ * reload.
  */
 export function covers(query, filter) {
   if (filter.rank < levelRank(parseLevel(query.level))) return false;
+  if (!targetWithin(query.target, filter.target)) return false;
   const loaded = String(query.q ?? '').trim().toLowerCase();
-  if (!loaded) return true;
-  if (filter.needle && filter.needle.includes(loaded)) return true;
-  return filter.target !== '' && filter.target.toLowerCase().includes(loaded);
+  return !loaded || filter.needle.includes(loaded);
 }
 
 /**
@@ -174,6 +219,7 @@ export function covers(query, filter) {
  */
 export function narrows(outer, inner) {
   if (levelRank(parseLevel(inner.level)) < levelRank(parseLevel(outer.level))) return false;
+  if (!targetWithin(outer.target, inner.target)) return false;
   const wide = String(outer.q ?? '').trim().toLowerCase();
   return !wide || String(inner.q ?? '').toLowerCase().includes(wide);
 }
@@ -248,17 +294,6 @@ export function downloadName(now = new Date()) {
   return `switchyard-${now.toISOString().slice(0, 19).replace(/:/g, '-')}Z.log`;
 }
 
-/**
- * A message from the gateway as a sentence of its own, so that text can
- * follow it: first letter upper-cased, a full stop when it ends without one.
- */
-export function sentence(message) {
-  const text = String(message ?? '').trim();
-  if (!text) return '';
-  const head = text[0].toUpperCase() + text.slice(1);
-  return /[.!?]$/.test(head) ? head : `${head}.`;
-}
-
 // ---------------------------------------------------------------------------
 // The buffer
 // ---------------------------------------------------------------------------
@@ -317,10 +352,11 @@ function pageLines(page, base) {
  * The line buffer of the page.
  *
  *   lines       every line held, oldest first, unique by seq
- *   query       { level, q } the history part was loaded under
+ *   query       { level, q, target } the history part was loaded under
  *   floor       seq the next older page ends before, or null (see `cursor`)
  *   hasMore     the gateway may have older lines for `query`
- *   lastSeq     highest seq seen from any source
+ *   lastSeq     highest seq known of: seen from any source, or named by a
+ *               page as the newest line the gateway held
  *   cleared     lines up to this seq were cleared from the view
  *   trimmed     older lines were dropped to stay within `maxLines`
  *   focus       the query of what the page is showing, or null: when the
@@ -340,7 +376,7 @@ function pageLines(page, base) {
 export function createLogStore({ maxLines = MAX_LINES } = {}) {
   const store = {
     lines: [],
-    query: { level: '', q: '' },
+    query: asQuery(null),
     floor: null,
     hasMore: false,
     lastSeq: 0,
@@ -400,6 +436,17 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
     return fetched.length ? fetched[0].seq : null;
   };
 
+  /**
+   * Where a page ends: the newest line the gateway held when it took the
+   * page (`last_seq`), as a position in the buffer. Up to there the page
+   * holds every line its query returns, and the next live frame is the line
+   * after it. 0 for an empty log.
+   */
+  const endOf = (page) => {
+    const n = Number(page?.last_seq);
+    return Number.isFinite(n) && n > 0 ? store.base + n : 0;
+  };
+
   /** The `before` parameter of the next older page, or null when there is none. */
   store.cursor = () => (store.floor === null ? null : store.floor - store.base);
 
@@ -416,10 +463,10 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
    */
   store.narrow = (query) => {
     if (!query || !narrows(store.query, query)) return false;
-    const keep = makeFilter({ level: query.level, q: query.q });
+    const keep = makeFilter(query);
     const before = store.lines.length;
     store.lines = store.lines.filter((line) => matches(line, keep));
-    store.query = { level: query.level || '', q: query.q || '' };
+    store.query = asQuery(query);
     // The live run goes on, but the buffer no longer holds all of it.
     if (run !== null) run.from = run.last + 1;
     return store.lines.length < before;
@@ -427,7 +474,7 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
 
   /** How many lines `query` would leave in the part that counts against `maxLines`. */
   store.wouldKeep = (query) => {
-    const keep = makeFilter({ level: query.level, q: query.q });
+    const keep = makeFilter(query);
     const end = heldFrom();
     let count = 0;
     for (let i = 0; i < end; i += 1) if (matches(store.lines[i], keep)) count += 1;
@@ -460,14 +507,32 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
     }
   };
 
-  /** Live frames, in arrival order. */
+  /**
+   * Live frames, as they arrived since the last batch. The gateway numbers
+   * a line and announces it in two steps, so two lines written at the same
+   * moment now and then arrive the wrong way round: the batch is put in
+   * order first, and a line that comes after its successor all the same
+   * (in the next batch) is taken in without disturbing the run.
+   */
   store.live = (batch) => {
-    const fresh = [];
-    let started = false;
+    const lines = [];
     for (const raw of batch) {
       const line = normalizeLine(raw, store.base);
-      if (!line) continue;
-      if (run !== null && line.seq <= run.last) continue; // a repeat
+      if (line) lines.push(line);
+    }
+    lines.sort((x, y) => x.seq - y.seq);
+    const fresh = lines.filter((line, i) => i === 0 || line.seq !== lines[i - 1].seq);
+    let started = false;
+    let added = 0;
+    for (const line of fresh) {
+      if (run !== null && line.seq <= run.last) {
+        // A repeat (the run holds it), or a line that is late: the one just
+        // before the run makes the run begin there.
+        if (line.seq < run.from) added += 1;
+        if (line.seq === run.from - 1) run.from = line.seq;
+        continue;
+      }
+      added += 1;
       if (run !== null && line.seq === run.last + 1) {
         run.last = line.seq;
       } else {
@@ -475,15 +540,13 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
         started = true;
       }
       if (line.seq > store.lastSeq) store.lastSeq = line.seq;
-      fresh.push(line);
     }
     joinRun();
-    if (fresh.length) {
-      fresh.sort((x, y) => x.seq - y.seq);
+    if (added > 0) {
       store.lines = mergeSorted(store.lines, dropCleared(fresh));
       trim();
     }
-    return { added: fresh.length, needSync: started && holeBeforeRun() };
+    return { added, needSync: started && holeBeforeRun() };
   };
 
   /** The live connection dropped or lost frames: the next frame starts a new run. */
@@ -514,19 +577,26 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
    * run. Lines of the live run stay: they are complete under any query. So
    * do the lines of earlier runs, which cannot be fetched again.
    *
-   * `sentAt` is `lastSeq` at the time the request was sent; the response
-   * covers at least that far. A page fetched for a paused view ends at the
-   * pause instead: `upTo` is the seq it was asked to end before.
+   * The page covers its query up to where it says it ends (`last_seq`), so
+   * the live frame after that line joins it without another request, also
+   * when the newest line that matches is much older. `sentAt` is `lastSeq`
+   * at the time the request was sent: the response covers at least that
+   * far. A page fetched for a paused view ends at the pause instead: `upTo`
+   * is the seq it was asked to end before.
    */
   store.reset = (page, query, sentAt = 0, upTo = null) => {
     const fetched = dropCleared(pageLines(page, store.base));
     const earlier = store.lines.slice(0, currentFrom());
     const kept = run === null ? [] : store.lines.slice(lowerBound(store.lines, Math.max(run.from, store.base + 1)));
     store.lines = earlier.concat(mergeSorted(fetched, kept));
-    store.query = { level: query.level || '', q: query.q || '' };
+    store.query = asQuery(query);
     store.trimmed = false;
-    const last = fetched.length ? fetched[fetched.length - 1].seq : 0;
+    const last = Math.max(fetched.length ? fetched[fetched.length - 1].seq : 0, endOf(page));
     covered = Math.max(store.base, upTo !== null ? upTo - 1 : Math.max(last, sentAt));
+    // A run that ends before the page begins is still catching up with it
+    // (see `sync`): until its frames are in, the buffer is whole only as
+    // far as the run goes.
+    if (upTo === null && run !== null && fetched.length > 0 && page?.has_more === true && run.last < fetched[0].seq - 1) covered = Math.max(store.base, run.last);
     joinRun();
     if (last > store.lastSeq) store.lastSeq = last;
     store.floor = floorOf(page, fetched);
@@ -549,7 +619,7 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
     const fetched = dropCleared(pageLines(page, store.base));
     const before = store.lines.length;
     store.lines = mergeSorted(fetched, store.lines);
-    store.query = { level: query.level || '', q: query.q || '' };
+    store.query = asQuery(query);
     store.floor = floorOf(page, fetched);
     store.hasMore = store.floor !== null;
     closeFloorIfCleared();
@@ -574,15 +644,25 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
    */
   store.sync = (page, sentAt = 0) => {
     const fetched = dropCleared(pageLines(page, store.base));
+    // Where the page ends, whether or not its newest lines match the query.
+    const end = endOf(page);
+    // How far the buffer is whole once the page is in: to its end, normally.
+    let whole = Math.max(sentAt, end);
     if (fetched.length) {
       const first = fetched[0].seq;
       const last = fetched[fetched.length - 1].seq;
+      whole = Math.max(whole, last);
       if (page?.has_more === true && first > covered + 1) {
         // The page does not reach back to what the buffer covers and the
         // gateway has more in between: everything older would sit behind a
         // hole. Keep what is complete (the page, and the live run when it
         // starts earlier) and let "load older" fetch the rest again.
         const cut = run !== null && run.from < first ? run.from : first;
+        // A run that is kept and ends before the page begins: the lines in
+        // between are still on their way, as frames. Until they are in, the
+        // buffer is whole only as far as the run goes, however far the page
+        // reaches; should they never come, the next catch-up finds the hole.
+        if (cut !== first && run.last < first - 1) whole = run.last;
         store.lines = store.lines.slice(0, currentFrom()).concat(store.lines.slice(lowerBound(store.lines, cut)));
         store.floor = cut === first ? (floorOf(page, fetched) ?? first) : cut;
         store.hasMore = true;
@@ -598,9 +678,9 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
       }
       store.lines = mergeSorted(store.lines, fetched);
       if (last > store.lastSeq) store.lastSeq = last;
-      covered = Math.max(covered, last);
     }
-    covered = Math.max(covered, sentAt);
+    if (end > store.lastSeq) store.lastSeq = end;
+    covered = Math.max(covered, whole);
     joinRun();
     trim();
     return { needSync: holeBeforeRun() };
@@ -660,6 +740,3 @@ export function createLogStore({ maxLines = MAX_LINES } = {}) {
 
   return store;
 }
-
-// Modules under js/pages/ are checked for a default export (ui/tests/check.mjs).
-export default createLogStore;

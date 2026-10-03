@@ -6,8 +6,11 @@
 //   ENDPOINTS        docs/DESIGN.md section 9 and the banner at GET /
 //   REASONING        crates/core/src/reasoning.rs (parse_model_suffix,
 //                    normalize_depth) and each codec's write_reasoning
-//   SHORTCUTS        the useHotkey calls in js/shell/shell.js and the key
-//                    handlers of the palette and the shared components
+//   SHORTCUTS        every useHotkey call (js/shell/shell.js, the "/" of
+//                    pages/requests/filters.js, pages/models/table.js and
+//                    pages/logs.js, useSaveHotkey in pages/settings/common.js)
+//                    and the key handlers of the palette and the shared
+//                    components
 //   MIT_LICENCE      LICENSE at the repository root
 
 // ---------------------------------------------------------------------------
@@ -42,11 +45,8 @@ export const ENDPOINTS = [
 /**
  * The URL of an endpoint's first path on a gateway reached at `base`
  * (no trailing slash): ws:// or wss:// for the WebSocket routes.
- *
- * It is also this module's default export: ui/tests/check.mjs asks every
- * file under js/pages/ for one, sub-modules included.
  */
-export default function endpointUrl(endpoint, base) {
+export function endpointUrl(endpoint, base) {
   const root = endpoint.ws ? String(base).replace(/^http/i, 'ws') : String(base);
   return `${root}${endpoint.paths[0]}`;
 }
@@ -69,6 +69,11 @@ export const KEY_PLACES = ['Authorization: Bearer', 'x-api-key', 'x-goog-api-key
  * with both a range and levels keeps the form the caller used. Every cell
  * was checked against what the gateway sends upstream; check again when the
  * catalog gains a model family.
+ *
+ * model(auto) stays auto wherever the upstream can say it (normalize_depth):
+ * no effort for the OpenAI family, adaptive thinking for Claude models with
+ * levels, the dynamic budget for Gemini models that allow it. Only a model
+ * with no such mode gets an explicit value.
  */
 export const REASONING = [
   {
@@ -122,29 +127,23 @@ export const REASONING = [
   {
     suffix: 'model(auto)',
     meaning: 'The provider decides. model(-1) means the same.',
-    openai: [
-      {
-        code: ['reasoning_effort: "medium"', 'reasoning.effort: "medium"'],
-        note: 'The GPT models in the catalog: none has a dynamic mode.',
-      },
-      {
-        code: null,
-        note: 'A model the gateway does not know: no effort is sent, so the model’s default applies.',
-      },
-    ],
+    openai: {
+      code: null,
+      note: 'No effort is sent: on OpenAI’s APIs that is how to say auto, and the model’s own default applies. An effort in the request body is removed. The same for every model, known to the gateway or not.',
+    },
     anthropic: [
       {
         code: ['thinking.type: "adaptive"'],
-        note: 'Without an effort. claude-opus-5, claude-sonnet-5, their 5-5 versions, and models the gateway does not know.',
+        note: 'Without an effort. Every Claude model that takes effort levels (4.6 and later, claude-fable-5 included) and models the gateway does not know.',
       },
       {
-        code: ['thinking.type: "enabled"', 'thinking.budget_tokens: 64512'],
-        note: 'Every other Claude model that thinks, the 4.6 to 4.8 models and claude-fable-5 included: the middle of the budget range, kept below max_tokens.',
+        code: ['thinking.type: "enabled"', 'thinking.budget_tokens: 63999'],
+        note: 'Models that only take budgets, such as claude-sonnet-4-5: the middle of the budget range, 64512, lowered to stay below max_tokens (63999 under that model’s limit of 64000).',
       },
     ],
     gemini: {
       code: ['thinkingBudget: -1'],
-      note: 'A model defined without dynamic thinking gets the middle of its range, or medium. No Gemini model in the catalog is one.',
+      note: 'The dynamic budget: every Gemini model in the catalog allows it, and models the gateway does not know get it too. A model defined without it gets the middle of its range, or medium.',
     },
   },
 ];
@@ -179,7 +178,7 @@ export const REASONING_RULES = [
 export const ARROWS = {
   up: { icon: 'arrow-up', label: 'Up arrow' },
   down: { icon: 'arrow-down', label: 'Down arrow' },
-  left: { icon: 'arrow-right', label: 'Left arrow', flip: true },
+  left: { icon: 'arrow-left', label: 'Left arrow' },
   right: { icon: 'arrow-right', label: 'Right arrow' },
 };
 
@@ -197,6 +196,13 @@ export const SHORTCUTS = [
       { keys: [['mod', 'b']], action: 'Collapse or expand the sidebar.', desktop: true },
       { keys: [['escape']], action: 'Close the dialog, drawer, menu or palette on top.' },
       { keys: [['tab'], ['shift', 'tab']], action: 'Move between controls. Focus stays inside an open dialog.' },
+    ],
+  },
+  {
+    title: 'Pages',
+    items: [
+      { keys: [['/']], action: 'Put the cursor in the search box on Requests, Models and Logs.' },
+      { keys: [['mod', 's']], action: 'Save the open Settings tab while it has unsaved changes.' },
     ],
   },
   {

@@ -1,14 +1,13 @@
 // Settings: the pieces every tab shares.
 //
-//   helpers        getPath, deepEqual, nestPatch, spellDuration, wildcardMatch,
+//   helpers        getPath, deepEqual, nestPatch, durationHint, wildcardMatch,
 //                  focusSoon (a place for the keyboard when its control has
-//                  gone), sentence / withStop (the gateway's messages as prose)
-//   guard          useUnsavedGuard, confirmLeave, confirmDiscard: one place
-//                  that knows whether the open tab has unsaved edits, and that
-//                  stops the router from leaving while it has
-//   adoptSecret    keeps this browser signed in after the admin secret changed
+//                  gone)
+//   guard          useUnsavedGuard, confirmDiscard: the open tab asks before
+//                  it is left with unsaved edits
+//   expectSecret   keeps this browser signed in after the admin secret changed
 //   useEdits       a form as "the configuration plus what the user changed"
-//   useSettingsSave, SettingsForm, SaveBar
+//   useSettingsSave, SettingsForm, SaveBar, SaveError
 //   SettingRow and the row controls (TextRow, NumberRow, SwitchRow, ...)
 //   OptionList     a radio group whose options carry an explanation
 //   useListDraft   payload rules and prices: a whole document edited as a draft
@@ -17,11 +16,11 @@ import { html, useEffect, useMemo, useRef, useState } from '../../../vendor/prea
 import { Badge, Button, Form, FormError, Input, Kbd, Notice, NumberInput, Panel, Select, Skeleton, Switch, confirm, toast, useIssues } from '../../components/index.js';
 import { rovingIndex } from '../../components/nav.js';
 import { ApiError, api, auth, isRemembered } from '../../lib/api.js';
-import { plural } from '../../lib/format.js';
+import { formatDurationWords, plural } from '../../lib/format.js';
 import { hotkeyLabel, useAsync, useHotkey, useIsPhone, usePresence, useResource, useUid } from '../../lib/hooks.js';
-import { liveState, useLive } from '../../lib/live.js';
-import { href, navigate, parseHash, routeStore } from '../../lib/router.js';
-import { createStore, useStore } from '../../lib/store.js';
+import { liveState, useLive, useLiveGap } from '../../lib/live.js';
+import { setQuery, useLeaveGuard } from '../../lib/router.js';
+import { useStore } from '../../lib/store.js';
 
 // ---------------------------------------------------------------------------
 // Small helpers
@@ -64,31 +63,13 @@ export function nestPatch(flat) {
 }
 
 /**
- * Seconds in words, at most two units: 1800 -> "30 minutes",
- * 5400 -> "1 hour 30 minutes", 43200 -> "12 hours", 90061 -> "about 1 day 1 hour".
- * Returns '' for anything that is not a non-negative number.
+ * What to print under a seconds field: the duration in words ("30 minutes",
+ * "1 hour 30 minutes"), or what zero means.
  */
-export function spellDuration(seconds) {
-  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return '';
-  let rest = Math.round(seconds);
-  if (rest === 0) return '0 seconds';
-  const parts = [];
-  for (const [name, size] of [['day', 86_400], ['hour', 3600], ['minute', 60], ['second', 1]]) {
-    if (parts.length === 2) break;
-    const n = Math.floor(rest / size);
-    if (n > 0) {
-      parts.push(plural(n, name));
-      rest -= n * size;
-    }
-  }
-  return `${rest > 0 ? 'about ' : ''}${parts.join(' ')}`;
-}
-
-/** What to print under a seconds field: the duration in words, or what zero means. */
 export function durationHint(seconds, zero) {
-  if (seconds == null) return undefined;
+  if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds < 0) return undefined;
   if (seconds === 0 && zero) return zero;
-  return spellDuration(seconds) || undefined;
+  return formatDurationWords(seconds * 1000);
 }
 
 /**
@@ -185,121 +166,46 @@ export function focusSoon(find, { leaving, scroll = true } = {}) {
 export const selectedTab = () => document.querySelector('.settings-main > .tabs [role="tab"][aria-selected="true"]');
 
 /**
- * A message of the gateway as a sentence: they start in lower case and come
- * without a full stop. Only a plain first word is capitalised, since a
- * message may start with a path (`routing.max_attempts: ...`).
+ * A notice that goes away takes its buttons with it. Call this with the
+ * action of such a button: if that leaves the keyboard without a place, it
+ * goes to `find()` (default: the selected tab). The page is not scrolled.
  */
-export function sentence(message) {
-  const text = String(message ?? '');
-  if (!text) return text;
-  return `${/^[a-z]+[ ,;:]/.test(text) ? text[0].toUpperCase() + text.slice(1) : text}${/[.!?:]$/.test(text) ? '' : '.'}`;
+export function focusAfterNotice(find = selectedTab) {
+  focusSoon(find, { leaving: () => false, scroll: false });
 }
 
-/**
- * FormError prints an error's message and puts a sentence right after it.
- * Returns the same error with its message written as a sentence.
- */
-const stopped = new WeakMap();
-export function withStop(error) {
-  const message = error?.message ?? '';
-  if (!error || !message) return error;
-  const text = sentence(message);
-  if (text === message) return error;
-  if (!stopped.has(error)) {
-    stopped.set(error, new ApiError(error.status, text, { issues: error.issues, retryAfter: error.retryAfter, code: error.code, body: error.body }));
-  }
-  return stopped.get(error);
-}
+/** A secret written as a reference to an environment variable ("env:NAME", "${NAME}"), not as the secret itself. */
+export const isSecretReference = (secret) => /^env:/.test(secret) || /^\$\{[^}]*\}$/.test(secret);
 
 // ---------------------------------------------------------------------------
 // Unsaved-changes guard
 // ---------------------------------------------------------------------------
 
-// The tab that is open says whether it has unsaved edits and what to call
-// them. Tab switches ask confirmLeave(); leaving the page is caught below.
-const guard = createStore({ dirty: false, what: '' });
-
-/** Register the open tab's unsaved state for as long as it is mounted. */
-export function useUnsavedGuard(dirty, what) {
-  useEffect(() => {
-    guard.set({ dirty, what });
-    return () => guard.set({ dirty: false, what: '' });
-  }, [dirty, what]);
-}
+/** The question asked before unsaved edits to `what` are thrown away. */
+const discardQuestion = (what) => ({
+  danger: true,
+  title: `Discard unsaved changes to ${what}?`,
+  message: 'Your edits have not been saved. Discarding them cannot be undone.',
+  confirmLabel: 'Discard changes',
+  cancelLabel: 'Keep editing',
+});
 
 /** Ask before throwing edits away. Resolves true when the user agrees. */
 export function confirmDiscard(what) {
-  return confirm({
-    danger: true,
-    title: `Discard unsaved changes to ${what}?`,
-    message: 'Your edits have not been saved. Discarding them cannot be undone.',
-    confirmLabel: 'Discard changes',
-    cancelLabel: 'Keep editing',
-  });
-}
-
-/** True when it is fine to leave the open tab: nothing unsaved, or the user agreed to lose it. */
-export async function confirmLeave() {
-  const { dirty, what } = guard.get();
-  if (!dirty) return true;
-  const ok = await confirmDiscard(what);
-  if (ok) guard.set({ dirty: false });
-  return ok;
+  return confirm(discardQuestion(what));
 }
 
 const tabOf = (route) => route.query.tab || 'general';
 
-/** True when going to `next` would close the tab that is open now. */
-function leavesTab(next) {
-  const current = routeStore.get();
-  return next.path !== current.path || tabOf(next) !== tabOf(current);
-}
-
-function askThenGo(next) {
-  confirmLeave().then((ok) => {
-    if (ok) navigate(next.path, { query: next.query });
-  });
-}
-
-if (typeof window !== 'undefined') {
-  // Leaving the page (a navigation link, the command palette, Back) is a
-  // change of the URL fragment. The router follows it on `hashchange`, and
-  // by then it is too late to keep the page. Two earlier points are used:
-  //
-  // 1. The Navigation API announces the navigation before it happens and
-  //    lets it be cancelled: nothing changes until the user has answered.
-  // 2. Where that is missing, or the navigation cannot be cancelled (some
-  //    Back and Forward traversals), `popstate` still comes before
-  //    `hashchange`: the address is put back, so the router sees no change.
-  if (window.navigation?.addEventListener) {
-    window.navigation.addEventListener('navigate', (event) => {
-      if (!guard.get().dirty || !event.hashChange || !event.cancelable) return;
-      let next;
-      try {
-        next = parseHash(new URL(event.destination.url).hash);
-      } catch {
-        return;
-      }
-      if (!leavesTab(next)) return;
-      event.preventDefault();
-      askThenGo(next);
-    });
-  }
-
-  window.addEventListener('popstate', () => {
-    if (!guard.get().dirty) return;
-    const next = parseHash(location.hash);
-    if (!leavesTab(next)) return;
-    const current = routeStore.get();
-    history.replaceState(history.state, '', href(current.path, current.query));
-    askThenGo(next);
-  });
-
-  // Closing or reloading the tab: the browser shows its own prompt.
-  window.addEventListener('beforeunload', (event) => {
-    if (!guard.get().dirty) return;
-    event.preventDefault();
-    event.returnValue = '';
+/**
+ * The open tab has unsaved edits to `what` while `dirty` is true. Every way
+ * of leaving it then asks first: another tab (the tab is in the query),
+ * another page, the command palette, Back, sign-out, closing the window.
+ */
+export function useUnsavedGuard(dirty, what) {
+  useLeaveGuard(dirty, {
+    ...discardQuestion(what),
+    matters: (to, from) => !to || to.path !== from.path || tabOf(to) !== tabOf(from),
   });
 }
 
@@ -316,6 +222,13 @@ function forgetPending() {
   if (pending) clearTimeout(pending.timer);
   pending = null;
 }
+
+/**
+ * The admin secret is about to become one this page cannot know (a reference
+ * to a variable in the gateway's environment): a secret adopted a moment ago
+ * must not be tried again when the session ends.
+ */
+export const forgetSecret = forgetPending;
 
 let settling = Promise.resolve();
 
@@ -446,17 +359,41 @@ export function useEdits(base) {
  *            request. `done(result)` runs after a successful save and may
  *            resolve a string that becomes the toast's second line;
  *            `failed()` runs when the save was refused
+ *   onDiskInvalid  (error) => void: the save was refused because the file
+ *            on disk is not valid (see isDiskInvalid)
  *
- * Returns { submit, saving, error, issues }.
+ * Returns { submit, saving, error, issues, refused, clear }:
+ *
+ *   refused  the error as it came back
+ *   error    what of it still applies (see stillOpen): an issue goes once
+ *            its field is edited, the whole error once nothing is unsaved
+ *   clear()  forget the error (Discard)
  */
-export function useSettingsSave({ form, config, name, toPatch, check, risks, prepare }) {
+export function useSettingsSave({ form, config, name, toPatch, check, risks, prepare, onDiskInvalid }) {
   const [clientError, setClientError] = useState(null);
   const save = useAsync((patch) => api.patch('/settings', patch));
-  const error = clientError ?? save.error;
-  const issues = useIssues(error);
+  // The form as it was when the last save was checked and sent: what the
+  // refusal is about.
+  const sentForm = useRef(null);
+  const refused = clientError ?? save.error;
+  const error = useMemo(() => stillOpen(refused, form, sentForm.current), [refused, form]);
+  const issues = useFieldIssues(error);
+  useDiskInvalid(save.error, onDiskInvalid);
+
+  const clear = () => {
+    setClientError(null);
+    // reset() also drops the answer of a save on its way: never then.
+    if (!save.loading) save.reset();
+  };
+  // Nothing unsaved (Discard, every edit typed back, the same values saved
+  // elsewhere): a refusal is about edits that are gone.
+  useEffect(() => {
+    if (!form.dirty && !save.loading && refused) clear();
+  }, [form.dirty]);
 
   const submit = async () => {
     if (!form.dirty || save.loading) return;
+    sentForm.current = form;
     const problems = check?.() ?? [];
     if (problems.length > 0) {
       save.reset();
@@ -506,7 +443,113 @@ export function useSettingsSave({ form, config, name, toPatch, check, risks, pre
     else toast.success(`${name} settings saved`, options);
   };
 
-  return { submit, saving: save.loading, error: withStop(error), issues };
+  return { submit, saving: save.loading, error, issues, refused, clear };
+}
+
+/** "providers[0].name" -> "providers.0.name", as useIssues compares paths. */
+const issuePath = (path) =>
+  String(path ?? '')
+    .replace(/\[(\w+)\]/g, '.$1')
+    .replace(/^\./, '');
+
+/**
+ * What still applies of a refused save of `form`, which was `sent` when it
+ * was checked and sent:
+ *
+ *   - nothing once nothing is unsaved;
+ *   - an issue goes once the value it is about differs from the refused one
+ *     (a field at, under or above its path). Typed back to the refused
+ *     value, the field gets its message back;
+ *   - with the last issue, the whole error: the notice would otherwise send
+ *     the user to a field that is no longer highlighted. While some are
+ *     left, the notice says "Nothing was saved." instead of the gateway's
+ *     message, which names the fixed ones too.
+ *
+ * An error without issues (the gateway could not be reached) stays until a
+ * save works or the edits are discarded. A refusal because the file on disk
+ * is not valid is about the file, not about the fields, and stays whole.
+ */
+function stillOpen(error, form, sent) {
+  if (!error) return null;
+  if (!form.dirty) return null;
+  if (isDiskInvalid(error) || !sent) return error;
+  const issues = error.issues ?? [];
+  if (issues.length === 0) return error;
+  const paths = [...new Set([...sent.paths, ...form.paths])];
+  const edited = (raw) => {
+    const at = issuePath(raw);
+    if (!at) return false;
+    return [at, ...paths].some((path) => (path === at || path.startsWith(`${at}.`) || at.startsWith(`${path}.`)) && !deepEqual(form.value(path), sent.value(path)));
+  };
+  const open = issues.filter((issue) => !edited(issue.path));
+  if (open.length === issues.length) return error;
+  if (open.length === 0) return null;
+  // The gateway's message spells out every issue, the fixed ones too; the
+  // ones that are left are at their fields (or listed in the notice).
+  return new ApiError(error.status, 'Nothing was saved.', { issues: open, retryAfter: error.retryAfter, code: error.code, body: error.body });
+}
+
+// ---------------------------------------------------------------------------
+// A save refused because the file on disk is not valid
+// ---------------------------------------------------------------------------
+
+/**
+ * True for the 409 the gateway gives to every edit while switchyard.toml on
+ * disk holds something it refused: writing the edit would rebuild the file
+ * from the last valid configuration and discard what was typed there. The
+ * error's issues are then the file's (`line 12, column 8`, or a place in the
+ * configuration such as `routing.max_attempts`), not those of what was sent,
+ * so they must not be handed to the form's fields. None of the endpoints this
+ * page saves to answers 409 for anything else.
+ */
+export const isDiskInvalid = (error) => error?.status === 409;
+
+/** useIssues, except that the file's issues of a disk-invalid refusal belong to no field. */
+export function useFieldIssues(error) {
+  return useIssues(isDiskInvalid(error) ? null : error);
+}
+
+/** The file's problems of a disk-invalid refusal in one line, for the notice above the tabs. */
+export const fileProblems = (error) => (error?.issues ?? []).map((issue) => (issue.path ? `${issue.path}: ${issue.message}` : issue.message)).join('; ');
+
+/** Tell the page, once per refusal, that a save found the file on disk invalid. */
+export function useDiskInvalid(error, onDiskInvalid) {
+  const report = useRef(onDiskInvalid);
+  report.current = onDiskInvalid;
+  useEffect(() => {
+    if (isDiskInvalid(error)) report.current?.(error);
+  }, [error]);
+}
+
+/**
+ * The form-level error of a save: FormError, or for a disk-invalid refusal
+ * what is wrong with the file and the way to the tab that can repair it.
+ * The edits stay in the form; the unsaved-changes guard asks before the tab
+ * is left. That notice goes when the gateway says the file is valid again:
+ * the save bar is still there, and saving now works.
+ *
+ *   error, issues  the save's error and its useFieldIssues
+ *   title          "Could not save the prices"
+ */
+export function SaveError({ error, issues, title }) {
+  const [lifted, setLifted] = useState(null);
+  useLive('config.reloaded', (data) => {
+    if (data?.ok && isDiskInvalid(error)) setLifted(error);
+  });
+  useEffect(() => {
+    if (lifted !== null && lifted === error) focusAfterNotice();
+  }, [lifted, error]);
+  if (!isDiskInvalid(error)) return html`<${FormError} error=${error} issues=${issues} title=${title} />`;
+  if (lifted === error) return null;
+  return html`
+    <${Notice} tone="stop" title=${title} action=${html`<${Button} size="sm" onClick=${() => setQuery({ tab: 'raw' })}>Open the raw file<//>`}>
+      <span>switchyard.toml on disk is not valid, and saving would overwrite it, so nothing was written. Your changes are still here. Fix or restore the file, on the Raw file tab or in an editor, then save again.</span>
+      ${error.issues.length > 0 &&
+      html`<ul class="issue-list" aria-label="Problems in the file">
+        ${error.issues.map((issue, i) => html`<li key=${i}>${issue.path && html`<span class="issue-path">${issue.path}</span>`}<span>${issue.message}</span></li>`)}
+      </ul>`}
+    <//>
+  `;
 }
 
 /**
@@ -528,7 +571,7 @@ export function SaveBar({ dirty, summary, saving = false, onDiscard, what, saveL
   const { mounted, state } = usePresence(open, 140);
   const isPhone = useIsPhone();
   const bar = useRef(null);
-  useToastClearance(bar, open);
+  useToastLift(bar, open);
 
   // The bar goes away after Save and after Discard, and the button that was
   // pressed with it. Hand the keyboard on instead of dropping it on <body>.
@@ -580,16 +623,20 @@ const TOAST_GAP = 8;
 /**
  * Toasts rise from the corner the save bar's buttons are in, and they are
  * drawn above everything: the toast that confirms a save would sit on Save
- * and Discard for as long as it shows. While the bar is up, measure how far
- * the stack has to move to clear it and hand that to the style sheet as
- * --settings-toast-lift (see settings.css). A bar that sits high enough on
- * the page for the stack to fit under it needs no lift.
+ * and Discard for as long as it shows. While the bar is up, the stack is
+ * raised with the shared --toast-lift (UI_GUIDE, "Variables a page sets").
+ *
+ * How far is measured, not fixed: the bar is one line or two, it sticks to
+ * the bottom of the window while the form runs on below and sits above the
+ * page's own margin at the end of it, and a bar that is high enough on the
+ * page for the stack to fit under it needs no lift at all.
  */
-function useToastClearance(ref, active) {
+function useToastLift(ref, active) {
   useEffect(() => {
     const el = ref.current;
     const toasts = document.querySelector('.toasts');
     if (!active || !el || !toasts) return undefined;
+    const root = document.documentElement;
     let frame = 0;
     const measure = () => {
       frame = 0;
@@ -603,10 +650,12 @@ function useToastClearance(ref, active) {
       }
       const top = rect.top - slide;
       const bottom = rect.bottom - slide;
+      // Where the stack rests when nothing lifts it.
+      root.style.setProperty('--toast-lift', '0px');
       const rest = parseFloat(getComputedStyle(toasts).bottom) || 0;
       const fitsBelow = window.innerHeight - bottom >= rest + Math.max(toasts.offsetHeight, TOAST_MIN) + TOAST_GAP;
       const lift = fitsBelow ? 0 : Math.max(0, Math.round(window.innerHeight - top + TOAST_GAP - rest));
-      document.body.style.setProperty('--settings-toast-lift', `${lift}px`);
+      root.style.setProperty('--toast-lift', `${lift}px`);
     };
     const schedule = () => {
       if (!frame) frame = requestAnimationFrame(measure);
@@ -629,7 +678,7 @@ function useToastClearance(ref, active) {
       stacked?.disconnect();
       window.removeEventListener('resize', schedule);
       document.removeEventListener('scroll', scrolled, { capture: true });
-      document.body.style.removeProperty('--settings-toast-lift');
+      root.style.removeProperty('--toast-lift');
     };
   }, [active, ref]);
 }
@@ -666,7 +715,9 @@ export function SettingsForm({ form, saver, what, children }) {
   const formId = useUid('settings-form');
   useUnsavedGuard(form.dirty, what);
   useSaveHotkey(formId, form.dirty && !saver.saving);
-  useRevealProblem(formId, saver.error);
+  // The refusal itself: a field that is fixed must not send the cursor on
+  // to the next problem while the user is typing in it.
+  useRevealProblem(formId, saver.refused);
 
   // The configuration changed underneath unsaved edits (another tab, the
   // file on disk). The edits stay; say that the rest moved.
@@ -684,12 +735,12 @@ export function SettingsForm({ form, saver, what, children }) {
   return html`
     <${Form} id=${formId} class="settings-form" onSubmit=${saver.submit}>
       ${elsewhere &&
-      html`<${Notice} tone="info" title="The configuration changed elsewhere" action=${html`<${Button} size="sm" onClick=${() => setElsewhere(false)}>Dismiss<//>`}>
+      html`<${Notice} tone="info" title="The configuration changed elsewhere" action=${html`<${Button} size="sm" onClick=${() => { setElsewhere(false); focusAfterNotice(); }}>Dismiss<//>`}>
         Fields you have not edited now show the new values. Your edits are kept and will be saved on top of them.
       <//>`}
       ${children}
-      <${FormError} error=${saver.error} issues=${saver.issues} title=${`Could not save the ${what}`} />
-      <${SaveBar} dirty=${form.dirty} saving=${saver.saving} what=${what} onDiscard=${form.reset} summary=${`${plural(form.count, 'unsaved change')}`} />
+      <${SaveError} error=${saver.error} issues=${saver.issues} title=${`Could not save the ${what}`} />
+      <${SaveBar} dirty=${form.dirty} saving=${saver.saving} what=${what} onDiscard=${() => { form.reset(); saver.clear(); }} summary=${`${plural(form.count, 'unsaved change')}`} />
     <//>
   `;
 }
@@ -740,11 +791,19 @@ function rowProps({ form, issues, path, label, description, restart, kind }) {
   return { id: fieldId(path), label, description, restart, kind, changed: form.changed(path) };
 }
 
+// A row's control has no label of its own (the row has it), and most have no
+// hint. The shared controls put such a control in a field wrapper only once
+// it has an error to show, which builds the input anew: it loses the focus,
+// and a NumberInput that loses the focus settles its text, so "70000" typed
+// into the port turned into 65535 under the cursor. An empty hint keeps the
+// wrapper there from the start (settings.css hides the empty line).
+const NO_HINT = '';
+
 /** A text setting. Extra props (mono, placeholder, icon) go to the Input. */
 export function TextRow({ form, issues, path, label, description, restart, hint, error, ...rest }) {
   return html`
     <${SettingRow} ...${rowProps({ form, issues, path, label, description, restart })}>
-      <${Input} id=${fieldId(path)} value=${form.value(path) ?? ''} onChange=${form.set(path)} hint=${hint} error=${error ?? issues.at(path)} ...${rest} />
+      <${Input} id=${fieldId(path)} value=${form.value(path) ?? ''} onChange=${form.set(path)} hint=${hint ?? NO_HINT} error=${error ?? issues.at(path)} ...${rest} />
     <//>
   `;
 }
@@ -766,7 +825,7 @@ export function NumberRow({ form, issues, path, label, description, restart, hin
         onChange=${form.set(path)}
         placeholder="Default"
         max=${Number.MAX_SAFE_INTEGER}
-        hint=${value === null ? "Empty: saving puts this back to the gateway's default." : hint}
+        hint=${value === null ? "Empty: saving puts this back to the gateway's default." : (hint ?? NO_HINT)}
         error=${error ?? issues.at(path)}
         ...${rest}
       />
@@ -791,7 +850,7 @@ export function SwitchRow({ form, issues, path, label, description, restart, dis
 export function SelectRow({ form, issues, path, label, description, options, ...rest }) {
   return html`
     <${SettingRow} ...${rowProps({ form, issues, path, label, description })}>
-      <${Select} id=${fieldId(path)} value=${form.value(path)} onChange=${form.set(path)} options=${options} error=${issues.at(path)} ...${rest} />
+      <${Select} id=${fieldId(path)} value=${form.value(path)} onChange=${form.set(path)} options=${options} hint=${NO_HINT} error=${issues.at(path)} ...${rest} />
     <//>
   `;
 }
@@ -906,6 +965,7 @@ export function useListDraft(path, { toDraft, toBody, load }) {
   const liveOpen = useStore(liveState, (s) => s.status === 'open');
   const resource = useResource(load ?? path, { pollMs: liveOpen ? 0 : 20_000 });
   useLive('config.reloaded', () => secretSettled().then(resource.refresh));
+  useLiveGap(resource.refresh);
 
   const [draft, setDraft] = useState(null);
   const [adopted, setAdopted] = useState(null); // JSON of the server version the draft started from
@@ -1006,15 +1066,11 @@ export function ConflictNotice({ list, noun }) {
       tone="caution"
       title=${`The ${noun} changed elsewhere while you were editing`}
       action=${html`<div class="btn-group">
-        <${Button} size="sm" onClick=${list.takeTheirs}>Load the new ${noun}<//>
-        <${Button} size="sm" onClick=${list.keepMine}>Keep my edits<//>
+        <${Button} size="sm" onClick=${() => { list.takeTheirs(); focusAfterNotice(); }}>Load the new ${noun}<//>
+        <${Button} size="sm" onClick=${() => { list.keepMine(); focusAfterNotice(); }}>Keep my edits<//>
       </div>`}
     >
       Loading the new ${noun} discards your edits. Keeping yours means saving will replace what was changed elsewhere.
     <//>
   `;
 }
-
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default SettingsForm;

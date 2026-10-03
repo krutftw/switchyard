@@ -643,6 +643,16 @@ function focusNear(trail) {
   return false;
 }
 
+/**
+ * The last place to put the focus rather than <body>: the page's main
+ * region (the shell's <main tabindex="-1">), as it was when the layer
+ * closed. False when it cannot take it (the sign-in page has none that is
+ * focusable) or has left the document since (the whole view was replaced).
+ */
+function focusMain(main) {
+  return isFocusable(main) && focusOn(main);
+}
+
 /** How long after a layer closes its opener is watched for being removed. */
 const OPENER_WATCH_MS = 2000;
 
@@ -750,9 +760,6 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
       document.removeEventListener('keydown', onKey);
       pop();
       unlock?.();
-      // Nothing had the focus when the layer opened: nothing to give it back to.
-      if (!previous || previous === document.body) return;
-      if (root) handedBack.set(root, { previous, trail, at: Date.now() });
 
       // The focus is this layer's to hand back only while it is still inside
       // the layer, or nowhere. Anywhere else, somebody put it there on
@@ -763,18 +770,34 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
         const at = document.activeElement;
         return !at || at === document.body || !document.contains(at) || (root != null && root.contains(at));
       };
+      const fallback = returnRef.current;
+      const main = document.querySelector('main');
+      const toFallback = () => focusOn(typeof fallback === 'function' ? fallback() : fallback && 'current' in fallback ? fallback.current : fallback);
+
+      // Nothing had the focus when the layer opened (Ctrl+K on a page just
+      // loaded, a drawer opened from a link): there is no opener to go back
+      // to, but <body> is no place either. `returnFocus`, else the page's
+      // main region; after the same short wait for a page that places the
+      // focus itself.
+      if (!previous || previous === document.body) {
+        if (root) handedBack.set(root, { previous: null, trail: [], at: Date.now() });
+        setTimeout(() => {
+          if (adrift() && !toFallback()) focusMain(main);
+        }, FOCUS_SETTLE_MS);
+        return;
+      }
+      if (root) handedBack.set(root, { previous, trail, at: Date.now() });
       if (!adrift()) return;
 
-      const fallback = returnRef.current;
       const elsewhere = () => {
-        if (focusOn(typeof fallback === 'function' ? fallback() : fallback && 'current' in fallback ? fallback.current : fallback)) return;
+        if (toFallback()) return;
         // The opener may have been inside a layer that has closed since (the
         // menu item that opened this dialog): go where that layer sent focus.
         for (const node of [previous, ...trail]) {
           const earlier = handedBack.get(node);
           if (earlier && (focusOn(earlier.previous) || focusNear(earlier.trail))) return;
         }
-        focusNear(trail);
+        if (!focusNear(trail)) focusMain(main);
       };
       // The opener is gone, and whatever removed it may be about to say
       // where the keyboard goes (those pages focus on a timer or a frame).

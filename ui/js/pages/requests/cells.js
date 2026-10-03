@@ -17,10 +17,10 @@
 import { Component, h, html, useEffect, useLayoutEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Badge, Icon, Portal, StatusLamp, toneForStatus } from '../../components/index.js';
 import { placeFloating } from '../../lib/dom.js';
-import { DASH, formatCurrency, formatDuration, formatRelativeTime, formatTime, formatTokens, plural } from '../../lib/format.js';
+import { DASH, formatCurrency, formatDuration, formatRelativeTime, formatTime, formatTimestamp, formatTokens, plural } from '../../lib/format.js';
 import { useNow } from '../../lib/hooks.js';
 import { shallowEqual } from '../../lib/store.js';
-import { MODES, NO_MODEL, durationTip, formatTimestamp, modelTip, providerTip, routeTip, statusTip, usageCounted, usageTip } from './record.js';
+import { MODES, NO_MODEL, durationTip, modelTip, providerTip, routeTip, statusTip, usageCounted, usageTip } from './record.js';
 
 // ---------------------------------------------------------------------------
 // Pieces
@@ -65,9 +65,16 @@ export function Elapsed({ since }) {
   return formatDuration(Math.max(0, now - since));
 }
 
-/** Lamp tone of a finished request. */
+/**
+ * Lamp tone of a finished request. `ok` decides, not the status alone: a
+ * relayed WebSocket session ends with status 101 whether it was closed in
+ * order (clear) or broke off (stop), and a stream that failed after its 200
+ * is not a success either.
+ */
 export function statusTone(record) {
-  return record.ok ? 'clear' : toneForStatus(record.status);
+  if (record.ok) return 'clear';
+  const tone = toneForStatus(record.status);
+  return tone === 'clear' ? 'stop' : tone;
 }
 
 export function ModeBadge({ mode }) {
@@ -110,7 +117,8 @@ const none = () => html`<span class="req-two req-none"><span class="req-l1 faint
 // Column widths are not set here: css/pages/requests.css lays every row out
 // on one grid (--req-cols) and decides what fits the panel. The stylesheet
 // addresses the cells by position, so keep the order in step with it.
-const COLUMNS = [
+/** The columns of the request table, in display order. */
+export const COLUMNS = [
   {
     key: 'started_at',
     header: 'Time',
@@ -219,11 +227,6 @@ const COLUMNS = [
   },
 ];
 
-/** The columns of the request table, in display order. */
-export default function requestColumns() {
-  return COLUMNS;
-}
-
 // ---------------------------------------------------------------------------
 // One tooltip for the whole table
 // ---------------------------------------------------------------------------
@@ -234,9 +237,9 @@ const TIP_DELAY_MS = 400;
  * Shows the `data-tip` text of whatever the pointer rests on inside it. One
  * listener and one floating element serve every cell. The text may contain
  * line breaks. Touch pointers are ignored: there, the detail drawer is the
- * way to the same information. `boxRef` is given the wrapping element.
+ * way to the same information.
  */
-export function HoverTips({ class: className, boxRef, children }) {
+export function HoverTips({ class: className, children }) {
   const [tip, setTip] = useState(null); // { text, rect, warm }
   const [pos, setPos] = useState(null);
   const box = useRef(null);
@@ -291,7 +294,7 @@ export function HoverTips({ class: className, boxRef, children }) {
   useEffect(() => () => clearTimeout(timer.current), []);
 
   return html`
-    <div ref=${boxRef} class=${className} onPointerOver=${onOver} onPointerLeave=${hide} onPointerDown=${hide}>${children}</div>
+    <div class=${className} onPointerOver=${onOver} onPointerLeave=${hide} onPointerDown=${hide}>${children}</div>
     ${tip &&
     tip.text &&
     html`

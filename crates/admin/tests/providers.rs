@@ -777,3 +777,44 @@ async fn a_credential_switched_off_at_runtime_is_switched_on_through_the_api() {
     // Nothing had to be written for that.
     assert_eq!(app.file(), BASE);
 }
+
+/// Regression (CFG-1): two keys of up to 11 characters both show as
+/// `••••••••`. Deleting the first one and saving kept the deleted key and
+/// dropped the good one; giving the second a label was refused as "the same
+/// key is listed twice".
+#[tokio::test]
+async fn keys_that_mask_alike_are_never_mixed_up_on_save() {
+    let config = format!(
+        "{BASE}\n[[providers]]\nname = \"local-vllm\"\nkind = \"openai-compat\"\n\
+         base_url = \"http://127.0.0.1:1/v1\"\ndiscover = false\n\
+         api_keys = [\"old-leaked\", \"new-good\"]\n"
+    );
+    let app = App::start_config(&config).await;
+    let view = app.get_ok("/providers/local-vllm").await;
+    let entry = view["config"].clone();
+    let mask = entry["api_keys"][0].clone();
+    assert_eq!(mask, entry["api_keys"][1]);
+
+    // Row 1 deleted: refused, nothing written.
+    let mut deleted = entry.clone();
+    deleted["api_keys"] = json!([mask]);
+    let (status, body) = app.put("/providers/local-vllm", deleted).await;
+    assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
+    assert_eq!(body["error"]["issues"][0]["path"], "api_keys[0]", "{body}");
+    assert!(
+        app.file()
+            .contains("api_keys = [\"old-leaked\", \"new-good\"]")
+    );
+
+    // Row 2 gets a label: each key stays with its row.
+    let mut labelled = entry.clone();
+    labelled["api_keys"] = json!([mask]);
+    labelled["credentials"] = json!([{"api_key": mask, "label": "second"}]);
+    let (status, body) = app.put("/providers/local-vllm", labelled).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let stored = app.gateway.config();
+    let provider = stored.provider("local-vllm").unwrap();
+    assert_eq!(provider.api_keys, ["old-leaked"]);
+    assert_eq!(provider.credentials[0].api_key, "new-good");
+    assert_eq!(provider.credentials[0].label, "second");
+}

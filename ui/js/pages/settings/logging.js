@@ -5,12 +5,18 @@ import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { Notice, Panel } from '../../components/index.js';
 import { NumberRow, OptionRow, Rows, SelectRow, SettingsForm, SwitchRow, useEdits, useSettingsSave } from './common.js';
 
+// What each level adds, as the gateway logs it: every request and every
+// failed upstream call is a debug line (switchyard_server::app "request",
+// switchyard_gateway::generate "request failed"); info has start-up,
+// configuration changes and model discovery; trace adds the HTTP client's
+// own lines. The Requests page lists every request at any level. The labels
+// stay short enough for the closed select (about 34 characters).
 const LEVELS = [
-  { value: 'trace', label: 'Trace: everything, very noisy' },
-  { value: 'debug', label: 'Debug: routing decisions and retries' },
-  { value: 'info', label: 'Info: requests, reloads, failures' },
-  { value: 'warn', label: 'Warn: problems only' },
-  { value: 'error', label: 'Error: failures only' },
+  { value: 'trace', label: 'Trace: also HTTP internals, noisy' },
+  { value: 'debug', label: 'Debug: every request and failure' },
+  { value: 'info', label: 'Info: start-up and config changes' },
+  { value: 'warn', label: 'Warn: warnings and errors only' },
+  { value: 'error', label: 'Error: internal errors only' },
 ];
 
 const CAPTURE = [
@@ -19,11 +25,11 @@ const CAPTURE = [
   { value: 'all', label: 'Every request', description: 'Stores the request and response bodies of every request: prompts, completions, tool calls and attachments.' },
 ];
 
-export function LoggingTab({ config, status }) {
+export function LoggingTab({ config, status, onDiskInvalid }) {
   const live = config.data.config;
   const base = useMemo(() => ({ logging: live.logging, usage: live.usage }), [live]);
   const form = useEdits(base);
-  const saver = useSettingsSave({ form, config, name: 'Logging and usage' });
+  const saver = useSettingsSave({ form, config, name: 'Logging and usage', onDiskInvalid });
   const { issues } = saver;
 
   const capture = form.value('logging.request_log');
@@ -38,7 +44,7 @@ export function LoggingTab({ config, status }) {
     <${SettingsForm} form=${form} saver=${saver} what="logging and usage settings">
       <${Panel} title="Application log" description="What the gateway says about its own work. Shown live on the Logs page.">
         <${Rows}>
-          <${SelectRow} form=${form} issues=${issues} path="logging.level" label="Level" options=${LEVELS} description="Lines below this level are dropped. Takes effect at once." />
+          <${SelectRow} form=${form} issues=${issues} path="logging.level" label="Level" options=${LEVELS} description=${html`Lines below this level are dropped. Takes effect at once. Requests and failed upstream calls are logged at Debug; the <a href="#/requests">Requests</a> page lists every request at any level.`} />
           <${SwitchRow}
             form=${form}
             issues=${issues}
@@ -118,6 +124,3 @@ export function LoggingTab({ config, status }) {
     <//>
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default LoggingTab;

@@ -12,7 +12,7 @@ import { Button, CodeBlock, Field, Icon, Segmented, Skeleton, Tabs, TagInput, To
 import { cx } from '../../lib/dom.js';
 import { plural } from '../../lib/format.js';
 import { useLocalStorage } from '../../lib/hooks.js';
-import { SHELLS, buildExamples, cleanPatterns, defaultShell, exampleModel, gatewayAddresses, matchModels } from './util.js';
+import { SHELLS, buildExamples, defaultShell, exampleModel, gatewayAddresses, matchModels, servedNames } from './util.js';
 
 // How many matching model names the preview lists before "Show all".
 const PREVIEW_CHIPS = 8;
@@ -23,7 +23,7 @@ const PREVIEW_CHIPS = 8;
 
 function ModelPreview({ patterns, models }) {
   const [expanded, setExpanded] = useState(false);
-  const names = useMemo(() => (models.data ?? []).map((model) => model.name), [models.data]);
+  const names = useMemo(() => servedNames(models.data), [models.data]);
   const result = useMemo(() => matchModels(patterns, names), [patterns, names]);
 
   if (models.loading && !models.data) {
@@ -133,8 +133,7 @@ export function ModelPatternsField({ value, onChange, models, error, disabled = 
  * never the only copy. The summary is a tab stop: the tooltip opens on
  * keyboard focus as it does on hover.
  */
-export function PatternSummary({ patterns: raw, names }) {
-  const patterns = cleanPatterns(raw);
+export function PatternSummary({ patterns, names }) {
   if (patterns.length === 0) return html`<span class="muted">All models</span>`;
   const result = names ? matchModels(patterns, names) : null;
   const tip = html`
@@ -186,16 +185,20 @@ export function SecretText({ value, label = 'Key', class: className }) {
  * patterns  the key's allow-list, to pick a model the key may use
  * models    current models (array) or undefined while unknown
  * listen    status.listen
+ * tls       status.tls
  */
-export function ConnectExamples({ keyText, patterns, models, listen }) {
+export function ConnectExamples({ keyText, patterns, models, listen, tls }) {
   const [tab, setTab] = useState('request');
   const [shell, setShell] = useLocalStorage('keys.shell', defaultShell());
   const [origin, setOrigin] = useState('page');
-  const addresses = useMemo(() => gatewayAddresses(listen), [listen]);
+  const addresses = useMemo(() => gatewayAddresses(listen, tls), [listen, tls]);
   const base = origin === 'listen' && addresses.listen ? addresses.listen : addresses.page;
   const model = useMemo(() => exampleModel(patterns, models), [patterns, models]);
   const examples = useMemo(() => buildExamples({ base, key: keyText, model, shell }), [base, keyText, model, shell]);
   const current = examples.find((example) => example.id === tab) ?? examples[0];
+  // The code block gets a title so its wrap and copy buttons sit in a bar
+  // above the code: floating, they would cover the end of the first line.
+  const shellLabel = (SHELLS.find((option) => option.value === shell) ?? SHELLS[0]).label;
 
   return html`
     <div class="keys-examples">
@@ -218,11 +221,9 @@ export function ConnectExamples({ keyText, patterns, models, listen }) {
           />
         <//>
       `}
-      <${CodeBlock} language="text" value=${current.code} note=${current.note} maxHeight="240px" />
+      <${CodeBlock} language="text" title=${`${current.id === 'request' ? 'Command' : 'Environment variables'}, ${shellLabel}`} value=${current.code} note=${current.note} maxHeight="240px" />
       ${addresses.wildcard &&
       html`<p class="field-hint">The gateway accepts connections on every interface (<span class="mono">${addresses.wildcard}</span>). From another machine, replace the host in these examples with this machine's name or address.</p>`}
     </div>
   `;
 }
-
-export default ModelPatternsField;

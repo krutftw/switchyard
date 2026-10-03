@@ -5,7 +5,7 @@
 // and the two-way mapping between a provider's configuration entry and the
 // editor's draft. Pure functions: no DOM, no network.
 
-import { formatDuration, plural } from '../../lib/format.js';
+import { formatCountdownWords, formatRelativeTime, plural, sentence } from '../../lib/format.js';
 
 // ---------------------------------------------------------------------------
 // Kinds and presets
@@ -69,6 +69,18 @@ export function kindInfo(kind) {
 
 /** Kinds that speak an OpenAI wire API and so have its options. */
 export const isOpenAiKind = (kind) => kind === 'openai' || kind === 'openai-compat';
+
+/**
+ * Kinds the gateway's built-in catalog has models for (GET /catalog), so a
+ * provider of one serves the catalog's models when it neither discovers nor
+ * lists any. An OpenAI-compatible provider has no catalog: with discovery off
+ * and an empty explicit list it serves nothing. The mock provider's models
+ * are built in whatever its settings say.
+ */
+export const hasCatalog = (kind) => kind === 'openai' || kind === 'anthropic' || kind === 'gemini' || kind === 'vertex';
+
+/** True when a provider of this kind, as configured, can be left with no models at all: no discovery, no explicit list, no catalog. */
+export const servesNothing = ({ kind, discover, explicit }) => kind !== 'mock' && !hasCatalog(kind) && discover === false && explicit === 0;
 
 /** Well-known OpenAI-compatible endpoints. A preset only prefills. */
 export const COMPAT_PRESETS = [
@@ -174,18 +186,22 @@ const REASONS = {
   request: { noun: 'Request refused', clause: 'request refused', advice: '' },
 };
 
+/**
+ * Failure classes that are about the model asked for, not the credential or
+ * the upstream: the scheduler rests only that model on the credential.
+ * (`transport` rests only the model too, but "could not connect" holds for
+ * every model; `auth` and `quota` rest the whole credential.)
+ */
+const MODEL_SCOPED = new Set(['server', 'model_not_found', 'rate_limit']);
+
 export function reasonNoun(reason) {
   return REASONS[reason]?.noun ?? (reason ? String(reason).replace(/_/g, ' ') : 'Failure');
 }
 
 const capital = (text) => (text ? text[0].toUpperCase() + text.slice(1) : text);
 
-/** A countdown that ticks in whole seconds: "42s", "29m 41s", "1h 02m". */
-export function formatRest(ms) {
-  if (typeof ms !== 'number' || !Number.isFinite(ms)) return formatDuration(null);
-  const seconds = Math.max(0, Math.ceil(ms / 1000));
-  return seconds < 60 ? `${seconds}s` : formatDuration(seconds * 1000);
-}
+/** What is left until a moment on the gateway's clock, in words: "42s", "29m 41s", "1h 02m". */
+const restUntil = (until, now) => formatCountdownWords((until - now) / 1000);
 
 /**
  * Why something rests and for how long, as a sentence:
@@ -199,7 +215,7 @@ export function explainCooldown({ reason, until, status = 0 }, now) {
   const known = REASONS[reason];
   const what = known ? known.clause : reason ? String(reason).replace(/_/g, ' ') : 'failed';
   const code = status > 0 ? ` (${status})` : '';
-  const left = until != null ? ` — resting ${formatRest(until - now)}` : '';
+  const left = until != null ? ` — resting ${restUntil(until, now)}` : '';
   const advice = known?.advice ? `; ${known.advice}` : '';
   return `${capital(what)}${code}${left}${advice}`;
 }
@@ -213,27 +229,41 @@ const TONE = { ready: 'clear', cooling: 'caution', unusable: 'stop', disabled: '
 /**
  * What a credential is doing right now, in the page's words.
  *
- * key: "ready" | "cooling" | "disabled" | "unusable" | "idle" (its provider
- *      is switched off) | "unknown" (the scheduler has not seen it yet)
+ * key: "ready" | "cooling" | "disabled" (its own switch is off) | "unusable"
+ *      | "idle" (its provider is switched off) | "unknown" (the scheduler has
+ *      not seen it yet)
  * tone, label: for the lamp
  * text: one sentence of explanation, or null
  * until, reason: of the cooldown that makes it rest, else null
  * resting: per-model cooldowns still running: [{ model, until, reason }]
+ *
+ * What takes a credential out of rotation is the gateway's `disabled_by`:
+ * "provider", "credential" (off in the configuration) or "runtime" (off
+ * until the gateway restarts). `provider.enabled` stands in for it while the
+ * page has moved the provider's switch and the gateway has not answered yet.
  */
 export function credentialState(credential, provider, now) {
   const resting = (credential.model_cooldowns ?? []).filter((m) => m && m.until > now).sort((a, b) => a.until - b.until);
   const statusFor = (reason) => (credential.last_error && credential.last_error.class === reason ? credential.last_error.status : 0);
   const make = (key, label, text, extra = {}) => ({ id: credential.id, key, tone: TONE[key], label, text, until: null, reason: null, resting, ...extra });
 
-  if (credential.disabled || credential.status === 'disabled') {
-    return make('disabled', 'Disabled', 'Switched off. It takes no requests until it is enabled.');
+  if (credential.disabled_by === 'provider' || (provider && provider.enabled === false)) {
+    return make(
+      'idle',
+      'Provider disabled',
+      credential.disabled
+        ? 'The provider is switched off. This credential is switched off as well, and stays off when the provider is enabled.'
+        : 'The provider is switched off, so this credential takes no requests.',
+    );
+  }
+  if (credential.disabled_by === 'runtime') {
+    return make('disabled', 'Disabled at runtime', 'Switched off in the running gateway only: the configuration still has it enabled, so a restart brings it back. Enable it to use it again now.');
+  }
+  if (credential.disabled_by === 'credential' || credential.disabled || credential.status === 'disabled') {
+    return make('disabled', 'Disabled', 'Switched off in the configuration. It takes no requests until it is enabled.');
   }
   if (credential.usable === false || credential.status === 'unusable') {
-    const why = credential.unusable_reason ? `${capital(String(credential.unusable_reason))}.` : 'It cannot be used as configured.';
-    return make('unusable', 'Unusable', why);
-  }
-  if (provider && provider.enabled === false) {
-    return make('idle', 'Provider disabled', 'The provider is switched off, so this credential takes no requests.');
+    return make('unusable', 'Unusable', credential.unusable_reason ? sentence(credential.unusable_reason) : 'It cannot be used as configured.');
   }
   if (credential.cooldown_until != null && credential.cooldown_until > now) {
     const reason = credential.cooldown_reason;
@@ -244,7 +274,7 @@ export function credentialState(credential, provider, now) {
   }
   if (credential.status === 'cooling' && resting.length > 0) {
     // Every model on it rests; the credential is back when the first one is.
-    return make('cooling', 'Cooling down', `Every model on it is resting. The first is back in ${formatRest(resting[0].until - now)}.`, {
+    return make('cooling', 'Cooling down', `Every model on it is resting. The first is back in ${restUntil(resting[0].until, now)}.`, {
       until: resting[0].until,
       reason: resting[0].reason,
     });
@@ -294,6 +324,22 @@ export function providerHealth(provider, now) {
   const restingModels = new Set();
   for (const s of states) if (s.key === 'ready') for (const m of s.resting) restingModels.add(m.model);
 
+  // What the failures of the credentials in rotation are about. A failure of
+  // a model-scoped class names one model and says nothing about the others
+  // (the scheduler rests only that model); a failure to connect, or one with
+  // no model, is about the upstream as a whole.
+  const failedModels = new Set(restingModels);
+  let upstreamFailure = false;
+  states.forEach((s, i) => {
+    const c = credentials[i];
+    if (s.key !== 'ready' || !((c.failures ?? 0) > 0)) return;
+    const last = c.last_error;
+    if (last?.model && MODEL_SCOPED.has(last.class)) failedModels.add(last.model);
+    else upstreamFailure = true;
+  });
+  // Every failure seen points at this one model.
+  const onlyFailedModel = !upstreamFailure && failedModels.size === 1 ? [...failedModels][0] : null;
+
   const total = credentials.length;
   const broken = counts.cooling + counts.unusable;
   let rank;
@@ -304,26 +350,41 @@ export function providerHealth(provider, now) {
     [rank, tone, label] = [5, 'off', 'Disabled'];
   } else if (total === 0) {
     [rank, tone, label, detail] = [0, 'stop', 'No credentials', 'add a key'];
-  } else if (counts.ready > 0 && broken === 0 && successes === 0 && failures > 0) {
+  } else if (counts.ready > 0 && broken === 0 && successes === 0 && failures > 0 && !onlyFailedModel) {
     // In rotation by the scheduler's book, yet nothing sent to it has worked.
     // A credential that has not been tried yet (a key added a moment ago)
     // does not make the provider healthy: it is failing until something
-    // succeeds.
+    // succeeds. Unless every failure was one model's: that is the model's
+    // trouble, and the line below names it.
     [rank, tone, label, detail] = [2, 'caution', 'Failing', 'no request has succeeded'];
   } else if (counts.ready > 0 && broken === 0) {
-    if (restingModels.size > 0) [rank, tone, label, detail] = [3, 'clear', 'Serving', `${plural(restingModels.size, 'model')} resting`];
+    // Nothing has worked yet, and the one model tried failed: the
+    // credentials are ready for the others, which have not been asked.
+    if (successes === 0 && failures > 0) [rank, tone, label, detail] = [3, 'clear', 'Ready', `${onlyFailedModel} ${restingModels.size > 0 ? 'resting' : 'failed'}`];
+    else if (restingModels.size > 0) [rank, tone, label, detail] = [3, 'clear', 'Serving', restingModels.size === 1 ? `${[...restingModels][0]} resting` : `${plural(restingModels.size, 'model')} resting`];
     else [rank, tone, label] = [4, 'clear', 'Serving'];
   } else if (counts.ready > 0) {
     [rank, tone, label, detail] = [2, 'caution', 'Degraded', `${counts.ready} of ${total} ready`];
   } else if (counts.cooling > 0) {
     const first = states.filter((s) => s.key === 'cooling' && s.until != null).sort((a, b) => a.until - b.until)[0];
-    [rank, tone, label, detail] = [1, 'caution', 'Cooling down', first ? `back in ${formatRest(first.until - now)}` : null];
+    [rank, tone, label, detail] = [1, 'caution', 'Cooling down', first ? `back in ${restUntil(first.until, now)}` : null];
   } else if (counts.unusable > 0) {
     [rank, tone, label] = [0, 'stop', 'No usable credential'];
   } else if (counts.disabled > 0) {
     [rank, tone, label] = [0, 'off', 'Credentials disabled'];
   } else {
     [rank, tone, label] = [3, 'off', 'Starting'];
+  }
+
+  // Credentials in rotation and nothing to route to them: the provider has
+  // no models. The state of its model list says whether that is a matter of
+  // waiting or of something to fix.
+  if (tone === 'clear' && provider.model_count === 0) {
+    const listing = provider.discovery?.state;
+    if (listing === 'pending') [rank, tone, label, detail] = [3, 'off', 'Starting', 'fetching the model list'];
+    else if (listing === 'failed') [rank, tone, label, detail] = [2, 'caution', 'No models', 'model list not fetched'];
+    else if (servesNothing({ kind: provider.kind, discover: provider.discover, explicit: provider.config?.models?.length ?? 0 })) [rank, tone, label, detail] = [2, 'caution', 'No models', 'discovery is off'];
+    else [rank, tone, label, detail] = [2, 'caution', 'No models', null];
   }
 
   return {
@@ -357,6 +418,63 @@ export function summarizeCounts(counts, total) {
   return parts.join(' · ');
 }
 
+// ---------------------------------------------------------------------------
+// The model list a provider is asked for
+// ---------------------------------------------------------------------------
+
+/**
+ * Where the discovery of a provider's model list stands, in the page's
+ * words, from the `discovery` of its view.
+ *
+ * state   "off" | "pending" | "ok" | "failed"
+ * short   a few words, for the list
+ * text    a sentence, for the detail drawer
+ * error   failed: what the gateway says went wrong (one line, secrets masked)
+ * models  how many models the upstream's list in use holds: the latest one
+ *         that arrived, which a failed listing keeps
+ * at      when the latest listing succeeded, failed or was started
+ */
+export function discoveryInfo(provider, now) {
+  const discovery = provider?.discovery ?? {};
+  const models = discovery.models ?? 0;
+  const at = discovery.at ?? null;
+  const when = at != null ? formatRelativeTime(at, now) : null;
+
+  if (discovery.state === 'pending') {
+    return { state: 'pending', short: 'fetching the list', text: 'Fetching the model list…', error: null, models, at };
+  }
+  if (discovery.state === 'ok') {
+    return { state: 'ok', short: when ? `fetched ${when}` : 'fetched', text: `${plural(models, 'model')}${when ? `, fetched ${when}` : ''}`, error: null, models, at };
+  }
+  if (discovery.state === 'failed') {
+    return { state: 'failed', short: 'list not fetched', text: 'Could not fetch the model list', error: discovery.error ? String(discovery.error) : null, models, at };
+  }
+
+  // Off: the upstream is not asked. The view says why.
+  const explicit = provider?.config?.models?.length ?? 0;
+  let short;
+  let text;
+  if (provider?.kind === 'mock') {
+    [short, text] = ['built in', 'Built into the gateway: the mock provider has no upstream to ask.'];
+  } else if (explicit > 0) {
+    [short, text] = ['explicit list', `Not fetched: the provider serves its explicit list of ${plural(explicit, 'model')}.`];
+  } else if (provider?.enabled === false) {
+    [short, text] = ['not fetched', 'Not fetched while the provider is disabled.'];
+  } else if (provider?.discover === false && hasCatalog(provider?.kind)) {
+    [short, text] = ['catalog', 'Not fetched: discovery is off, so the built-in catalog for this kind is used.'];
+  } else if (provider?.discover === false) {
+    [short, text] = ['discovery off', 'Not fetched: discovery is off and the explicit list is empty. This kind has no built-in catalog, so the provider serves no models: add them to its explicit list, or switch discovery on.'];
+  } else {
+    [short, text] = ['not fetched', 'Not fetched.'];
+  }
+  return { state: 'off', short, text, error: null, models: 0, at: null };
+}
+
+/** True while the gateway is asking any provider for its model list (no live event says when it is done). */
+export function hasPendingDiscovery(providers) {
+  return (providers ?? []).some((p) => p.discovery?.state === 'pending');
+}
+
 /** True while anything on screen counts down, so the page ticks every second only then. */
 export function hasCountdown(providers) {
   return (providers ?? []).some((p) => (p.credentials ?? []).some((c) => c.cooldown_until != null || (c.model_cooldowns ?? []).length > 0));
@@ -366,7 +484,7 @@ export function hasCountdown(providers) {
 // Live frames
 // ---------------------------------------------------------------------------
 
-const FRAME_NULLABLE = ['cooldown_until', 'cooldown_reason', 'latency_ms', 'last_used_at', 'last_error', 'unusable_reason'];
+const FRAME_NULLABLE = ['cooldown_until', 'cooldown_reason', 'latency_ms', 'last_used_at', 'last_error', 'unusable_reason', 'disabled_by'];
 
 /**
  * Fold a "credential" live frame into the provider list. The frame carries
@@ -523,7 +641,6 @@ export function emptyDraft(kind = 'openai', preset = null) {
     wire_api: 'auto',
     legacy_max_tokens: null,
     stream_usage: null,
-    websocket: false,
     project: '',
     location: '',
     discover: true,
@@ -550,7 +667,6 @@ export function draftFromConfig(config) {
     wire_api: config.wire_api ?? 'auto',
     legacy_max_tokens: config.legacy_max_tokens ?? null,
     stream_usage: config.stream_usage ?? null,
-    websocket: config.websocket === true,
     project: config.project ?? '',
     location: config.location ?? '',
     discover: config.discover !== false,
@@ -615,6 +731,11 @@ function thinkingOf(row) {
  * configured under `credentials`) onward everything is a `credentials`
  * entry. A row with neither key nor settings is dropped. Secrets follow the
  * API's mask rule: an untouched row sends back exactly what it was shown.
+ * A `credentials` entry always says what its key is: the key, or `null` for
+ * "this credential has no key". It is never left out or sent empty, which
+ * would ask the gateway to keep a stored key and let it pick which one (by
+ * label, else by position: the key of a credential removed in the same
+ * save could end up on another one).
  *
  * `resetForKind`: options that belong to another kind go back to their
  * defaults (used when the kind was changed in this form).
@@ -640,8 +761,7 @@ export function configFromDraft(draft, { resetForKind = false } = {}) {
       apiKeys.push(key);
       return;
     }
-    const entry = {};
-    if (key) entry.api_key = key;
+    const entry = { api_key: key || null };
     if (row.label.trim()) entry.label = row.label.trim();
     if (row.disabled) entry.disabled = true;
     if (row.weight != null) entry.weight = row.weight;
@@ -694,95 +814,20 @@ export function configFromDraft(draft, { resetForKind = false } = {}) {
     wire_api: keep(openai, draft.wire_api, 'auto'),
     legacy_max_tokens: keep(openai, draft.legacy_max_tokens, null),
     stream_usage: keep(openai, draft.stream_usage, null),
-    websocket: keep(draft.kind === 'openai', draft.websocket, false),
     project: keep(draft.kind === 'vertex', draft.project.trim(), ''),
     location: keep(draft.kind === 'vertex', draft.location.trim(), ''),
   };
   return { config, paths };
 }
 
-// ---------------------------------------------------------------------------
-// Keyless credentials
-// ---------------------------------------------------------------------------
-//
-// In an update, an empty `credentials[].api_key` means "keep the stored
-// key", and the gateway decides which stored entry that is: the one with the
-// same label, else the one at the same position. A keyless entry that is
-// new, relabelled or moved can therefore be handed the key of an entry that
-// was removed in the same save, and nothing in the request can say "no key".
-//
-// What the gateway never does is hand out a key that another entry of the
-// same request claims (by its mask, or by the key written in full). So a
-// save with entries at risk goes in two requests: first without them, which
-// drops the removed keys from the stored configuration; then whole, when
-// every stored key is claimed and there is nothing left to inherit.
-
-const keylessEntry = (entry) => !String(entry?.api_key ?? '').trim();
-
 /**
- * Indexes of `config.credentials` whose empty key the gateway could fill
- * from `stored` (the provider's entry as last read, secrets masked). It errs
- * on the side of naming an entry: the gateway's rule has more exceptions
- * than are followed here, and each of them only ever leaves a field empty.
+ * A provider's `config` as read from the gateway, ready to be sent back with
+ * a change: the view leaves `api_key` out of a credential that has none, and
+ * a request has to say so (`null`), or the gateway would look for a stored
+ * key to keep.
  */
-export function keylessAtRisk(config, stored) {
-  const incoming = config?.credentials ?? [];
-  const have = stored?.credentials ?? [];
-  // How many stored entries carry each key (as masked) beyond those an
-  // incoming entry sends back, and so claims.
-  const spare = new Map();
-  for (const entry of have) if (!keylessEntry(entry)) spare.set(entry.api_key, (spare.get(entry.api_key) ?? 0) + 1);
-  for (const entry of incoming) if (!keylessEntry(entry) && spare.has(entry.api_key)) spare.set(entry.api_key, spare.get(entry.api_key) - 1);
-  const unclaimed = (entry) => entry != null && !keylessEntry(entry) && (spare.get(entry.api_key) ?? 0) > 0;
-  const fileOf = (entry) => String(entry?.service_account_file ?? '').trim();
-  const labelOf = (entry) => String(entry?.label ?? '').trim();
-
-  const risky = [];
-  incoming.forEach((entry, index) => {
-    if (!keylessEntry(entry)) return;
-    const file = fileOf(entry);
-    const label = labelOf(entry);
-    // By identity: the stored entry with the same service-account file, else the same label.
-    const byIdentity = file ? have.some((other) => fileOf(other) === file && unclaimed(other)) : label !== '' && have.some((other) => labelOf(other) === label && unclaimed(other));
-    // By position: the stored entry at the same index, when it is of the same sort.
-    const byPosition = unclaimed(have[index]) && fileOf(have[index]) === file;
-    if (byIdentity || byPosition) risky.push(index);
-  });
-  return risky;
-}
-
-/**
- * The first of the two requests: `config` without the keyless credentials
- * at risk, or null when one request is enough. Leaving an entry out moves
- * the ones after it, so the check runs until nothing more is at risk.
- */
-export function withoutRiskyKeyless(config, stored) {
-  let credentials = config?.credentials ?? [];
-  let dropped = 0;
-  for (;;) {
-    const risky = keylessAtRisk({ credentials }, stored);
-    if (risky.length === 0) break;
-    credentials = credentials.filter((_, index) => !risky.includes(index));
-    dropped += risky.length;
-  }
-  return dropped > 0 ? { ...config, credentials } : null;
-}
-
-/**
- * After a save: indexes of the credentials that were sent without a key and
- * came back with one. `view` is the gateway's answer; its `config` lists the
- * entries in the order they were sent.
- */
-export function filledKeyless(config, view) {
-  const sent = config?.credentials ?? [];
-  const saved = view?.config?.credentials ?? [];
-  if (saved.length !== sent.length) return [];
-  return sent.map((entry, index) => (keylessEntry(entry) && !keylessEntry(saved[index]) ? index : -1)).filter((index) => index !== -1);
-}
-
-/** How a credentials entry is named in a message: its label, its file, else its place. */
-export function credentialName(entry, index) {
-  return String(entry?.label ?? '').trim() || String(entry?.service_account_file ?? '').trim() || `credential ${index + 1}`;
+export function entryToSend(config, changes = {}) {
+  return { ...config, credentials: (config.credentials ?? []).map((entry) => ({ ...entry, api_key: entry.api_key || null })), ...changes };
 }
 
 /** What the browser can check before sending: [{ path, message }]. */
@@ -809,34 +854,20 @@ export function localIssues(draft, { takenNames = [] } = {}) {
 // Validation issues from the gateway
 // ---------------------------------------------------------------------------
 
-const ownPath = (path) => String(path ?? '').replace(/^providers\[\d+\]\.?/, '');
+// The gateway names a field by its place in the request body, on every
+// status: "name", "base_url", "headers.X-Team", "api_keys[1]",
+// "credentials[0].api_key", "models[2].thinking". That is how the form knows
+// its fields, so the issues are used as they come. The one answer whose
+// issues are not about the body is the 409 for a configuration file that is
+// broken on disk: its paths are places in the file ("line 53, column 8",
+// "providers[1].base_url"), match no field, and are listed under the form.
 
-/**
- * The gateway names a field by its place in the whole configuration
- * ("providers[2].base_url"); the form knows it as "base_url". Returns the
- * error with paths, and the paths quoted in its message, made relative to
- * the provider entry. Not an ApiError any more, but everything FormError and
- * useIssues read is there.
- */
-export function rebaseError(error) {
-  if (!error) return null;
-  return {
-    status: error.status,
-    code: error.code,
-    aborted: error.aborted === true,
-    // Set by the editor when the first of two requests went through and the second did not.
-    partial: error.partial != null,
-    message: String(error.message ?? '').replace(/providers\[\d+\]\./g, ''),
-    issues: (error.issues ?? []).map((issue) => ({ path: ownPath(issue.path), message: issue.message })),
-  };
-}
-
-/** Which form section an issue path belongs to. */
+/** Which form section an issue path belongs to (null: none, it is not a field of the entry). */
 export function sectionOfPath(path) {
   const head = String(path ?? '').split(/[.[]/)[0];
   if (['name', 'kind', 'enabled', 'base_url', 'project', 'location'].includes(head)) return 'basics';
   if (head === 'api_keys' || head === 'credentials') return 'credentials';
-  if (['prefix', 'priority', 'proxy', 'wire_api', 'legacy_max_tokens', 'stream_usage', 'websocket', 'headers'].includes(head)) return 'routing';
+  if (['prefix', 'priority', 'proxy', 'wire_api', 'legacy_max_tokens', 'stream_usage', 'headers'].includes(head)) return 'routing';
   if (['models', 'exclude', 'discover'].includes(head)) return 'models';
   return null;
 }
@@ -849,7 +880,3 @@ export function freeName(base, takenNames) {
   for (let n = 2; n < 1000; n += 1) if (!takenNames.includes(`${clean}-${n}`)) return `${clean}-${n}`;
   return clean;
 }
-
-// Page modules need a default export (tests/check.mjs); this one's is the
-// function the rest of the page is built around.
-export default providerHealth;

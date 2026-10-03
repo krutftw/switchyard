@@ -13,7 +13,7 @@ const { html, render, useRef, useState } = await import('../vendor/preact-htm.js
 const { useAsync, useHotkey, useNow, useResource, useSize } = await import('../js/lib/hooks.js');
 const { overlayLocked, topOverlay } = await import('../js/lib/dom.js');
 const { formatCountdown } = await import('../js/lib/format.js');
-const { ApiError, auth } = await import('../js/lib/api.js');
+const { ApiError, api, auth, watchOtherTabs } = await import('../js/lib/api.js');
 const { live, liveState, useLive, useLiveGap, TOPICS } = await import('../js/lib/live.js');
 const { Button, IconButton } = await import('../js/components/button.js');
 const { Tabs, Segmented } = await import('../js/components/nav.js');
@@ -195,6 +195,33 @@ function mount(vnode) {
   document.querySelector('.drawer [aria-label="Close"]').click();
   assert.deepEqual(closed, ['drawer:button']);
   await view.unmount();
+}
+
+// ---- Drawer: a long title wraps beside its buttons, never over them -------
+// The stub has no layout, so this holds the structure and the rules that
+// give it: a header of a long provider name once squeezed "Actions" and
+// "Close" to 18px each, on top of one another.
+{
+  const view = mount(html`
+    <${Drawer} open=${true} onClose=${() => {}} title="a-very-long-provider-name-for-layout-testing-purposes-1234567890"
+      actions=${html`<${Menu} label="Actions for the provider" items=${[{ label: 'Delete', onSelect: () => {} }]} />`}>body<//>
+  `);
+  const head = await until(() => document.querySelector('.drawer .overlay-head'), 'the drawer');
+  const group = head.querySelector('.overlay-head-actions');
+  assert.ok(group, 'the actions and the close button sit in .overlay-head-actions');
+  const labels = group.querySelectorAll('button').map((b) => b.getAttribute('aria-label'));
+  assert.equal(labels.length, 2, labels.join(' | '));
+  assert.match(labels[0], /^Actions for the provider/);
+  assert.equal(labels[1], 'Close');
+  await view.unmount();
+  const { readFileSync } = await import('node:fs');
+  const css = readFileSync(new URL('../css/components.css', import.meta.url), 'utf8').replace(/\/\*[\s\S]*?\*\//g, '');
+  const rule = (selector) => new RegExp(`(^|\\n)${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`).exec(css)?.[2] ?? '';
+  assert.match(rule('.overlay-head-actions'), /flex:\s*none/, 'the buttons keep their width');
+  assert.match(rule('.overlay-head-text'), /flex:\s*1 1 auto/, 'the title takes what is left');
+  assert.match(rule('.overlay-head-text'), /min-width:\s*0/);
+  assert.match(rule('.overlay-title'), /overflow-wrap:\s*anywhere/, 'and wraps even without a space to break at');
+  assert.match(rule('.icon-btn'), /flex-shrink:\s*0/, 'an icon button is never squeezed by a flex row');
 }
 
 // ---- Tabs and Segmented: arrows never strand on a disabled item ----------
@@ -715,6 +742,28 @@ function mount(vnode) {
   }, 0);
   await sleep(300);
   assert.ok(document.activeElement === document.querySelector('#add'), `the watch does not get ahead of a page that focuses the neighbour itself; focus is on ${where()}`);
+
+  // Nothing had the focus when the layer opened (Ctrl+K on a page just
+  // loaded, a drawer opened from a link): it does not leave it on <body>
+  // either, but on the page's main region, or on returnFocus when given.
+  const fromNowhere = async (closed) => {
+    render(html`<${Host} open=${false} opener="button" />`, view.root);
+    await sleep(120);
+    document.activeElement.blur();
+    assert.ok(document.activeElement === document.body);
+    render(html`<${Host} open=${true} />`, view.root);
+    await until(inDialog);
+    await sleep(120);
+    render(closed, view.root);
+  };
+  await fromNowhere(html`<${Host} open=${false} opener="button" />`);
+  await until(() => document.activeElement === document.querySelector('#main'), 'a layer opened with nothing focused to hand the focus to <main>, not <body>');
+  await fromNowhere(html`<${Host} open=${false} opener="button" returnFocus=${() => document.querySelector('#add')} />`);
+  await until(() => document.activeElement === document.querySelector('#add'), 'and to returnFocus when there is one');
+  await fromNowhere(html`<${Host} open=${false} opener="button" />`);
+  setTimeout(() => document.querySelector('#row').focus(), 0);
+  await sleep(300);
+  assert.ok(document.activeElement === document.querySelector('#row'), `a focus the page places itself still wins; it is on ${where()}`);
   await view.unmount();
 }
 
@@ -1343,6 +1392,96 @@ function mount(vnode) {
   }
 }
 
+// ---- Session: a resumed tab keeps its secret; signing out reaches every tab --
+{
+  const TOKEN = 'sy.admin.token';
+  watchOtherTabs(); // at load in a browser; this module was loaded before the window
+  const realFetch = globalThis.fetch;
+  const sent = [];
+  let delay = 0;
+  // The live client asks for tickets on its own once signed in: only /status counts.
+  const lastStatus = () => sent.filter((s) => s.url.endsWith('/status')).at(-1)?.auth;
+  globalThis.fetch = async (url, init) => {
+    sent.push({ url: String(url), auth: new Headers(init.headers).get('authorization') });
+    if (delay) await sleep(delay);
+    return new Response('{}', { status: 200 });
+  };
+  // Another tab of the same browser.
+  const other = new BroadcastChannel('sy.admin.session');
+  const heard = [];
+  other.onmessage = (event) => heard.push(event.data);
+  try {
+    // A tab opened on a remembered session reads the secret from localStorage.
+    localStorage.setItem(TOKEN, 'remembered-secret');
+    sessionStorage.removeItem(TOKEN);
+    auth.set({ status: 'unknown', reason: null });
+    assert.equal(await api.resume(), true);
+    assert.equal(sessionStorage.getItem(TOKEN), 'remembered-secret', 'the resumed tab keeps a copy of its own');
+    // Another tab signs in without "Remember", which removes the stored copy.
+    localStorage.removeItem(TOKEN);
+    await api.get('/status');
+    assert.equal(lastStatus(), 'Bearer remembered-secret', 'requests still carry the secret');
+    assert.equal(auth.get().status, 'authenticated');
+
+    // Another tab signs out: this one does too, and says where it happened.
+    other.postMessage({ type: 'signed-out' });
+    await until(() => auth.get().status === 'anonymous', 'a sign-out in another tab to reach this one');
+    assert.deepEqual(auth.get(), { status: 'anonymous', reason: 'signed-out', elsewhere: true });
+    assert.equal(sessionStorage.getItem(TOKEN), null, 'and drops its copy of the secret');
+    await api.get('/status');
+    assert.equal(lastStatus(), null, 'nothing is sent with the secret afterwards');
+
+    // Browsers without BroadcastChannel hear it through the storage event.
+    await api.login('second-secret');
+    assert.equal(auth.get().elsewhere, false);
+    dispatch(window, 'storage', { key: 'sy.admin.signedOutAt', newValue: String(Date.now()), bubbles: false });
+    assert.deepEqual(auth.get(), { status: 'anonymous', reason: 'signed-out', elsewhere: true });
+    dispatch(window, 'storage', { key: 'sy.admin.signedOutAt', newValue: null, bubbles: false });
+    dispatch(window, 'storage', { key: TOKEN, newValue: null, bubbles: false });
+
+    // Signing out here tells the other tabs, both ways.
+    await api.login('third-secret');
+    const written = [];
+    const realSet = localStorage.setItem;
+    localStorage.setItem = (key, value) => {
+      written.push(key);
+      realSet(key, value);
+    };
+    try {
+      api.logout();
+    } finally {
+      localStorage.setItem = realSet;
+    }
+    assert.deepEqual(auth.get(), { status: 'anonymous', reason: 'signed-out', elsewhere: false });
+    await until(() => heard.length === 1, 'the other tab to hear the sign-out');
+    assert.deepEqual(heard[0], { type: 'signed-out' });
+    assert.ok(written.includes('sy.admin.signedOutAt'), 'the storage key for browsers without BroadcastChannel');
+    assert.equal(localStorage.getItem('sy.admin.signedOutAt'), null, 'and it is not left behind');
+    // Dropping a stored secret that could not be checked concerns this tab only.
+    await api.login('fourth-secret');
+    api.logout({ allTabs: false });
+    await sleep(30);
+    assert.equal(heard.length, 1, 'logout({ allTabs: false }) tells nobody');
+
+    // A sign-out heard while the stored secret is being checked wins.
+    localStorage.setItem(TOKEN, 'remembered-secret');
+    auth.set({ status: 'unknown', reason: null, elsewhere: false });
+    delay = 60;
+    const resumed = api.resume();
+    await sleep(10);
+    other.postMessage({ type: 'signed-out' });
+    assert.equal(await resumed, false);
+    assert.equal(auth.get().status, 'anonymous', 'the check that landed afterwards does not sign the tab back in');
+    assert.equal(sessionStorage.getItem(TOKEN), null);
+  } finally {
+    delay = 0;
+    other.close();
+    globalThis.fetch = realFetch;
+    api.logout({ allTabs: false });
+    auth.set({ status: 'anonymous', reason: null, elsewhere: false });
+  }
+}
+
 // ---- Router: leave guards -------------------------------------------------
 //
 // Against a stub of location and history: entries, pushState, replaceState,
@@ -1550,6 +1689,56 @@ function mount(vnode) {
   await view.unmount();
   navigate('/keys');
   await until(() => shown() === '/keys', 'no guard is left behind by an unmounted view');
+
+  // useQueryParam: what is typed replaces the entry, what is picked with
+  // { push: true } is a step Back can return to (Settings tabs, Usage ranges).
+  {
+    const { useQueryParam } = router;
+    let setTab;
+    let setQ;
+    function Probe() {
+      [, setTab] = useQueryParam('tab', 'general', { push: true });
+      [, setQ] = useQueryParam('q', '');
+      return null;
+    }
+    const probe = mount(html`<${Probe} />`);
+    await sleep(20);
+    const start = at;
+    setTab('routing');
+    await until(() => shown() === '/keys?tab=routing', 'a picked tab');
+    setTab('pricing');
+    await until(() => shown() === '/keys?tab=pricing');
+    assert.equal(at, start + 2, 'each pick is a history entry');
+    setTab('pricing');
+    await sleep(20);
+    assert.equal(at, start + 2, 'picking what is shown is not a step');
+    setQ('g');
+    setQ('gp');
+    await until(() => shown() === '/keys?tab=pricing&q=gp', 'typing');
+    assert.equal(at, start + 2, 'typing replaces the entry');
+    // A form control hands the setter its DOM event as a second argument:
+    // that is not an options object.
+    class InputEvent {
+      constructor() {
+        this.replace = false;
+        this.target = {};
+      }
+    }
+    setQ('gpt', new InputEvent());
+    await until(() => shown() === '/keys?tab=pricing&q=gpt');
+    assert.equal(at, start + 2, 'an event passed along does not turn typing into steps');
+    setTab('general', new InputEvent());
+    await until(() => shown() === '/keys?q=gpt', 'the default value leaves the address');
+    assert.equal(at, start + 3);
+    history.back();
+    await until(() => shown() === '/keys?tab=pricing&q=gpt', 'Back to return to the previous tab');
+    history.back();
+    await until(() => shown() === '/keys?tab=routing', 'and to the one before');
+    setTab('raw', { replace: true });
+    await until(() => shown() === '/keys?tab=raw');
+    assert.equal(at, start + 1, 'a call may still ask to replace');
+    await probe.unmount();
+  }
 }
 
 // ---- Table: where the header sticks ---------------------------------------
@@ -1621,6 +1810,48 @@ function mount(vnode) {
     await until(() => !document.querySelector('.palette'), 'Ctrl+K inside the palette to close it');
     await until(() => document.activeElement === inside, 'focus to return into the dialog');
     await view.unmount();
+  } finally {
+    globalThis.fetch = realFetch;
+  }
+}
+
+// ---- Shell: the focus after signing in, and what the palette lists -------
+{
+  const { Shell } = await import('../js/shell/shell.js');
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{"version":"0.0.0"}', { status: 200 });
+  const mainRegion = () => document.querySelector('main#main');
+  try {
+    // app.js swaps the sign-in form for the shell: the focused field goes.
+    function Gate({ signedIn }) {
+      return signedIn ? html`<${Shell} takeFocus=${true} />` : html`<div class="login"><input id="login-secret" /></div>`;
+    }
+    const view = mount(html`<${Gate} signedIn=${false} />`);
+    document.querySelector('#login-secret').focus();
+    render(html`<${Gate} signedIn=${true} />`, view.root);
+    await until(() => mainRegion() && document.activeElement === mainRegion(), 'the shell to take the focus the sign-in form dropped, not leave it on <body>');
+    await view.unmount();
+
+    // A plain load of a remembered session: the first Tab still reaches
+    // "Skip to content", so nothing is focused for the user.
+    document.activeElement.blur();
+    const plain = mount(html`<${Shell} />`);
+    await until(() => mainRegion(), 'the shell');
+    await sleep(60);
+    assert.ok(document.activeElement === document.body, `a plain load leaves the focus where the browser has it; it is on ${document.activeElement.localName}#${document.activeElement.id}`);
+
+    // Ctrl+K there: the palette lists the pages operators use, not the kit.
+    dispatch(document.body, 'keydown', { key: 'k', ctrlKey: true });
+    const field = await until(() => document.querySelector('.palette input'), 'the palette');
+    await until(() => document.activeElement === field);
+    const labels = document.querySelectorAll('.palette-item .palette-item-label').map((node) => text(node));
+    assert.ok(labels.includes('Overview') && labels.includes('About'), labels.join(', '));
+    assert.ok(!labels.includes('Component kit'), 'the component kit is for page authors, opened by its address');
+    // Closed with nothing focused before: the focus goes to the page, not <body>.
+    dispatch(field, 'keydown', { key: 'Escape' });
+    await until(() => !document.querySelector('.palette'), 'Escape to close the palette');
+    await until(() => document.activeElement === mainRegion(), 'the palette opened on a page just loaded to hand the focus to <main>');
+    await plain.unmount();
   } finally {
     globalThis.fetch = realFetch;
   }

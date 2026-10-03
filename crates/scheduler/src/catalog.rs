@@ -370,6 +370,50 @@ mod tests {
         );
     }
 
+    /// Regression (MOD-1): wrong limits and release dates in the catalog —
+    /// 128K context for two 200K Claude models, 8K output for 3.7 Sonnet
+    /// with a 128K thinking budget, Gemini 3 Pro dated January 2025.
+    #[test]
+    fn limits_and_dates_match_the_vendors() {
+        let c = catalog();
+        let haiku = c.lookup("claude-3-5-haiku-20241022").unwrap();
+        assert_eq!(
+            (haiku.context_window, haiku.max_output_tokens),
+            (Some(200_000), Some(8_192))
+        );
+        let sonnet = c.lookup("claude-3-7-sonnet-20250219").unwrap();
+        assert_eq!(
+            (sonnet.context_window, sonnet.max_output_tokens),
+            (Some(200_000), Some(64_000))
+        );
+        // Gemini 3 Pro: 18 November 2025 (the image model two days later),
+        // so it sorts after Gemini 2.5 and before Gemini 3 Flash.
+        for (id, date) in [
+            ("gemini-3-pro-preview", 1_763_424_000),
+            ("gemini-3-pro", 1_763_424_000),
+            ("gemini-3-pro-image-preview", 1_763_596_800),
+            ("gemini-3-pro-image", 1_763_596_800),
+        ] {
+            assert_eq!(c.lookup(id).unwrap().created, Some(date), "{id}");
+        }
+        let flash = c.lookup("gemini-3-flash-preview").unwrap().created.unwrap();
+        let older = c.lookup("gemini-2.5-pro").unwrap().created.unwrap();
+        assert!((older..flash).contains(&1_763_424_000));
+
+        // A thinking budget is part of the output: never above its limit.
+        for entry in c.entries() {
+            let info = &entry.info;
+            if let (Some(t), Some(limit)) = (&info.thinking, info.max_output_tokens) {
+                assert!(
+                    u64::from(t.max) <= limit,
+                    "{}: thinking budget up to {} above the output limit {limit}",
+                    info.id,
+                    t.max
+                );
+            }
+        }
+    }
+
     #[test]
     fn catalog_contains_only_the_three_api_families() {
         let c = catalog();
@@ -401,7 +445,7 @@ mod tests {
             m.thinking,
             Some(ThinkingSupport {
                 min: 1024,
-                max: 128_000,
+                max: 64_000,
                 zero_allowed: true,
                 dynamic_allowed: false,
                 levels: vec![],

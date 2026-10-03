@@ -29,11 +29,10 @@ import {
 import { api } from '../../lib/api.js';
 import { formatCurrency, formatDateTime, formatNumber, formatPercent, formatRelativeTime } from '../../lib/format.js';
 import { useAsync, useNow, useUid } from '../../lib/hooks.js';
-import { href } from '../../lib/router.js';
+import { href, useLeaveGuard } from '../../lib/router.js';
 import { NAME_MAX, RPM_MAX, nameProblem } from './create.js';
-import { useLeaveGuard } from './guard.js';
 import { ConnectExamples, ModelPatternsField, SecretText } from './parts.js';
-import { cleanPatterns, referenceName, sameList, sentence } from './util.js';
+import { referenceName, sameList } from './util.js';
 
 /** How long a revealed key stays on screen. */
 export const REVEAL_MS = 30_000;
@@ -68,8 +67,9 @@ export async function deleteKey(entry, authRequired) {
 /** Whole seconds until `until`, never more than the reveal lasts. */
 const secondsLeft = (until) => Math.min(REVEAL_MS / 1000, Math.max(0, Math.ceil((until - Date.now()) / 1000)));
 
-// Its own clock, read from Date.now(): the shared one is a second coarse and
-// would start this at 31.
+// Its own clock, read four times a second: the shared one ticks once a
+// second at a phase of its own, and the figure would run up to a second
+// behind the moment the key is hidden.
 function Countdown({ until }) {
   const [left, setLeft] = useState(() => secondsLeft(until));
   useEffect(() => {
@@ -158,14 +158,106 @@ function KeyReveal({ entry, secret, onSecret }) {
 // Editor
 // ---------------------------------------------------------------------------
 
-// The stored values in the form the gateway's own writes would give them. A
-// hand-edited file can hold a padded name or a repeated pattern; starting the
-// draft from these, and comparing it with them, keeps an untouched form from
-// counting as edited.
-const storedOf = (entry) => ({ name: String(entry.name ?? '').trim(), models: cleanPatterns(entry.models), rpm: entry.rate_limit_rpm ?? null });
+// The stored values as the form holds them. GET /keys gives the name trimmed
+// and the patterns without blanks and repeats, also for a file edited by
+// hand, so an untouched form compares equal to them.
+const storedOf = (entry) => ({ name: entry.name, models: entry.models, rpm: entry.rate_limit_rpm ?? null });
 
-function KeyEditor({ entry, active, formId, others, models, listen, authRequired, toggling, onToggle, onSaved, onState }) {
+const FIELDS = ['name', 'models', 'rpm'];
+const FIELD_LABELS = { name: 'Name', models: 'Allowed models', rpm: 'Rate limit' };
+
+/** Two values of one field are the same setting (a name is compared trimmed). */
+export function sameValue(field, a, b) {
+  if (field === 'models') return sameList(a ?? [], b ?? []);
+  if (field === 'name') return String(a ?? '').trim() === String(b ?? '').trim();
+  return (a ?? null) === (b ?? null);
+}
+
+/**
+ * Bring a draft up to date with the stored key after it changed elsewhere
+ * (the API, another tab, a hand edit of the file).
+ *
+ * `base` is what the draft was taken from. A field the operator has not
+ * edited (draft equals base) takes the stored value; so does one whose
+ * edit the gateway now holds anyway. An edited field the gateway changed
+ * as well is a conflict: it keeps the operator's value and its old base,
+ * so it still counts as edited.
+ *
+ * Returns { draft, base, refreshed, conflicts }; `refreshed` names the
+ * fields that took a new stored value while the operator had edits
+ * elsewhere in the form, `conflicts` the edited fields the gateway changed.
+ */
+export function mergeStored(draft, base, stored) {
+  const next = { draft: { ...draft }, base: { ...base }, refreshed: [], conflicts: [] };
+  const edits = FIELDS.some((field) => !sameValue(field, draft[field], base[field]));
+  for (const field of FIELDS) {
+    if (sameValue(field, stored[field], base[field])) continue;
+    const edited = !sameValue(field, draft[field], base[field]);
+    if (!edited || sameValue(field, draft[field], stored[field])) {
+      if (!edited) {
+        next.draft[field] = stored[field];
+        if (edits) next.refreshed.push(field);
+      }
+      next.base[field] = stored[field];
+    } else {
+      next.conflicts.push(field);
+    }
+  }
+  return next;
+}
+
+/** The fields to send: edited by the operator and not already stored. */
+export function pendingFields(draft, base, stored) {
+  return FIELDS.filter((field) => !sameValue(field, draft[field], base[field]) && !sameValue(field, draft[field], stored[field]));
+}
+
+/** A stored value in words, for the notice about a key changed elsewhere. */
+function storedText(field, value) {
+  if (field === 'models') return value.length === 0 ? 'every model' : value.join(', ');
+  if (field === 'rpm') return value == null ? 'no limit' : `${formatNumber(value)} rpm`;
+  return value || 'no name';
+}
+
+/** "Name", "Name and Rate limit", "Name, Allowed models and Rate limit". */
+function fieldList(fields) {
+  const labels = fields.map((field) => FIELD_LABELS[field]);
+  return labels.length < 2 ? labels.join('') : `${labels.slice(0, -1).join(', ')} and ${labels[labels.length - 1]}`;
+}
+
+/**
+ * Says that the key changed elsewhere while the operator had edits open.
+ * conflicts  fields edited here that the gateway changed as well
+ * refreshed  fields not edited here that now show the new stored value
+ */
+function ChangedNotice({ conflicts, refreshed, stored, onLoad }) {
+  if (conflicts.length === 0 && refreshed.length === 0) return null;
+  const action = html`<${Button} size="sm" onClick=${onLoad}>Load the new version<//>`;
+  const followed = refreshed.length > 0 && html`<span> ${fieldList(refreshed)} ${refreshed.length === 1 ? 'shows' : 'show'} the new stored ${refreshed.length === 1 ? 'value' : 'values'}.</span>`;
+  if (conflicts.length === 0) {
+    return html`
+      <${Notice} tone="info" title="This key changed while the form was open" action=${action}>
+        ${followed}<span> Saving sends only the fields you edited.</span>
+      <//>
+    `;
+  }
+  return html`
+    <${Notice} tone="caution" title="This key changed while the form was open" action=${action}>
+      ${conflicts.map(
+        (field) => html`<span key=${field}>${FIELD_LABELS[field]} is now <span class=${field === 'rpm' ? undefined : 'mono'}>${storedText(field, stored[field])}</span> on the gateway. </span>`,
+      )}
+      <span>Saving replaces ${conflicts.length === 1 ? 'it' : 'them'} with what is shown here.</span>${followed}
+    <//>
+  `;
+}
+
+function KeyEditor({ entry, active, formId, others, models, listen, tls, authRequired, toggling, onToggle, onSaved, onState }) {
   const [draft, setDraft] = useState(() => storedOf(entry));
+  // The stored values the draft was taken from. What differs from them is
+  // what the operator changed, and only that is sent: a field changed
+  // elsewhere while the form was open is never put back.
+  const [base, setBase] = useState(() => storedOf(entry));
+  // Fields that took a new stored value while the operator had edits.
+  const [refreshed, setRefreshed] = useState([]);
   const [problems, setProblems] = useState({});
   const [touched, setTouched] = useState({});
   const [secret, setSecret] = useState(null);
@@ -182,11 +274,23 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
 
   const stored = storedOf(entry);
   const name = draft.name.trim();
-  const renamed = name !== stored.name;
-  const modelsChanged = !sameList(draft.models, stored.models);
-  const rpmChanged = (draft.rpm ?? null) !== stored.rpm;
-  const changed = renamed || modelsChanged || rpmChanged;
+  const pending = pendingFields(draft, base, stored);
+  const renamed = pending.includes('name');
+  const changed = pending.length > 0;
   const dirty = changed || typing;
+  // Edited here and changed on the gateway too: saving would replace theirs.
+  const conflicts = pending.filter((field) => !sameValue(field, stored[field], base[field]));
+
+  // The key changed elsewhere (live events and polling refresh the list):
+  // fields the operator has not edited follow it.
+  const storedKey = JSON.stringify(stored);
+  useEffect(() => {
+    const next = mergeStored(draft, base, stored);
+    if (FIELDS.every((field) => sameValue(field, next.base[field], base[field]))) return;
+    setDraft(next.draft);
+    setBase(next.base);
+    if (next.refreshed.length > 0) setRefreshed((list) => [...new Set([...list, ...next.refreshed])]);
+  }, [storedKey]);
 
   useEffect(() => {
     onState({ dirty, saving: save.loading });
@@ -228,11 +332,13 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
       focusInvalid.current = true;
       return;
     }
+    // Only what the operator changed: a field changed elsewhere while the
+    // form was open (a new allow-list, a rename) is left as it is stored.
     const patch = {};
     if (renamed) patch.name = name;
-    if (modelsChanged) patch.models = draft.models;
+    if (pending.includes('models')) patch.models = draft.models;
     // An emptied limit is sent as null: that is how the gateway removes it.
-    if (rpmChanged) patch.rate_limit_rpm = draft.rpm ?? null;
+    if (pending.includes('rpm')) patch.rate_limit_rpm = draft.rpm ?? null;
     setTouched({});
     const updated = await save.run(patch);
     if (!updated) {
@@ -242,12 +348,26 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
     }
     toast.success('Key saved');
     setDraft(storedOf(updated));
+    setBase(storedOf(updated));
+    setRefreshed([]);
     save.reset();
     onSaved(updated);
   };
 
-  const conflict = save.error?.status === 409;
-  const nameError = problems.name ?? (touched.name || !save.error ? undefined : (issues.at('name') ?? (conflict ? sentence(save.error.message) : undefined)));
+  // Drop the edits and show the key as it is stored now.
+  const loadStored = () => {
+    setDraft(stored);
+    setBase(stored);
+    setRefreshed([]);
+    setProblems({});
+    setTouched({});
+    save.reset();
+    // The button goes with its notice: the keyboard carries on in the form.
+    setTimeout(() => formRef.current?.querySelector('input')?.focus(), 0);
+  };
+
+  // The gateway names the field in every refusal (400, 409 and 422 alike).
+  const nameError = problems.name ?? (touched.name ? undefined : issues.at('name'));
   const modelIssues = touched.models ? [] : issues.under('models');
   const rpmError = touched.rpm ? undefined : issues.at('rate_limit_rpm');
   const variable = entry.is_reference ? referenceName(entry.masked) : null;
@@ -255,19 +375,13 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
   const usage = entry.usage ?? {};
   const lastUsed = usage.last_used_at
     ? `${formatRelativeTime(usage.last_used_at, now)} (${formatDateTime(usage.last_used_at)})`
-    : usage.requests > 0
-      ? 'Not among the recent requests the gateway keeps in memory'
-      : 'No requests in the last 30 days';
+    : 'No request on record in the last 30 days';
 
   return html`
     <div class="keys-drawer">
       ${entry.is_reference &&
       entry.resolved === false &&
       html`<${Notice} tone="caution" title=${`${variable ?? 'The variable'} is not set`}>This key reads its value from that environment variable, and the gateway does not have it. No client can use the key until it is set where the gateway runs and the gateway is restarted.<//>`}
-
-      ${entry.enabled &&
-      stored.rpm === 0 &&
-      html`<${Notice} tone="caution" title="The rate limit is 0">Every request with this key is refused with 429. Raise the limit under Settings below, or empty the field to remove it.<//>`}
 
       <${Switch}
         label="Enabled"
@@ -310,6 +424,7 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
 
       <section class="keys-section" aria-labelledby=${`${formId}-settings`}>
         <h3 id=${`${formId}-settings`}>Settings</h3>
+        <${ChangedNotice} conflicts=${conflicts} refreshed=${changed ? refreshed.filter((field) => !pending.includes(field)) : []} stored=${stored} onLoad=${loadStored} />
         <div ref=${formRef}>
           <${Form} id=${formId} onSubmit=${submit}>
             <${Input}
@@ -319,7 +434,7 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
               maxLength=${NAME_MAX}
               error=${nameError}
               hint=${renamed
-                ? 'Requests and usage are shown under this name. Requests made so far stay listed under the old one.'
+                ? 'New requests are shown under this name. Those made so far stay under the old one on the Requests and Usage pages; the numbers above stay with the key.'
                 : 'Requests and usage are shown under this name.'}
             />
             <div class="keys-field-wrap" onInput=${watchTyping} onKeyUp=${watchTyping} onBlurCapture=${watchTyping}>
@@ -335,17 +450,15 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
               optional
               value=${draft.rpm}
               onChange=${set('rpm')}
-              min=${stored.rpm === 0 ? 0 : 1}
+              min=${1}
               max=${Math.max(RPM_MAX, stored.rpm ?? 0)}
               step=${1}
               unit="rpm"
               placeholder="No limit"
-              hint=${draft.rpm === 0
-                ? 'A limit of 0 refuses every request with this key. Empty the field to remove the limit.'
-                : 'Requests per minute. Requests over the limit are refused with 429. Empty the field to remove the limit.'}
+              hint="Requests per minute. Requests over the limit are refused with 429. Empty the field to remove the limit."
               error=${rpmError}
             />
-            ${!(conflict && !touched.name) && html`<${FormError} error=${save.error} issues=${issues} title="Could not save the key" />`}
+            <${FormError} error=${save.error} issues=${issues} title="Could not save the key" />
           <//>
         </div>
       </section>
@@ -362,6 +475,7 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
           patterns=${stored.models}
           models=${models.data}
           listen=${listen}
+          tls=${tls}
         />
         ${!entry.is_reference && secret == null && html`<p class="field-hint">The examples say <span class="mono">YOUR_KEY</span> where the key goes. Reveal the key above to have it filled in.</p>`}
       </section>
@@ -377,7 +491,7 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
  * id            the key's id from the URL, "" when closed
  * keys          useResource('/keys')
  * models        useResource('/models')
- * listen        status.listen
+ * listen, tls   status.listen and status.tls
  * authRequired  status.auth_required
  * toggling      Set of key ids with an enable/disable in flight
  * onToggle      (entry, enabled) => void
@@ -385,7 +499,7 @@ function KeyEditor({ entry, active, formId, others, models, listen, authRequired
  * onDeleted     (id) => void
  * onClose       () => void
  */
-export function KeyDrawer({ id, keys, models, listen, authRequired, toggling, onToggle, onSaved, onDeleted, onClose }) {
+export function KeyDrawer({ id, keys, models, listen, tls, authRequired, toggling, onToggle, onSaved, onDeleted, onClose }) {
   const formId = useUid('keys-edit');
   // The id of the key being closed. The address may follow a moment later
   // (closing can be a step back in history); the drawer leaves at once.
@@ -424,14 +538,18 @@ export function KeyDrawer({ id, keys, models, listen, authRequired, toggling, on
     confirm({
       danger: true,
       title: 'Discard unsaved changes?',
-      message: `Your changes to ${entry?.name?.trim() || 'this key'} have not been saved.`,
+      message: `Your changes to ${entry?.name || 'this key'} have not been saved.`,
       confirmLabel: 'Discard changes',
       cancelLabel: 'Keep editing',
     });
 
-  // Back, a link or the command palette would otherwise take the drawer away
-  // without the question its own Close asks.
-  const guard = useLeaveGuard(open && editor.dirty, { ask: confirmDiscard });
+  // Back, a link, the command palette or signing out would otherwise take
+  // the drawer away without the question its own Close asks. The drawer is
+  // part of the address (?open=), so another key there is leaving as well.
+  const guard = useLeaveGuard(open && editor.dirty, {
+    ask: confirmDiscard,
+    matters: (to, from) => !to || to.path !== from.path || to.query.open !== from.query.open,
+  });
 
   const close = () => {
     guard.release();
@@ -464,6 +582,7 @@ export function KeyDrawer({ id, keys, models, listen, authRequired, toggling, on
         others=${(list ?? []).filter((key) => key.id !== entry.id)}
         models=${models}
         listen=${listen}
+        tls=${tls}
         authRequired=${authRequired}
         toggling=${toggling.has(entry.id)}
         onToggle=${onToggle}
@@ -506,5 +625,3 @@ export function KeyDrawer({ id, keys, models, listen, authRequired, toggling, on
     <//>
   `;
 }
-
-export default KeyDrawer;

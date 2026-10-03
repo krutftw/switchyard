@@ -131,7 +131,7 @@ export function Drawer({ open, onClose, title, subtitle, actions, footer, width,
             ${title && html`<h2 class="overlay-title" id=${titleId}>${title}</h2>`}
             ${subtitle && html`<p class="overlay-desc mono">${subtitle}</p>`}
           </div>
-          <div class="row" style="--gap:var(--space-1)">
+          <div class="overlay-head-actions">
             ${actions}
             <${IconButton} icon="x" label="Close" tooltip=${false} disabled=${!dismissable} onClick=${() => onClose?.('button')} />
           </div>

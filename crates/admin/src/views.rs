@@ -8,7 +8,8 @@
 use crate::state::AdminState;
 use serde_json::{Map, Value, json};
 use std::collections::HashMap;
-use switchyard_config_store::{client_key_id, mask_config};
+use std::time::UNIX_EPOCH;
+use switchyard_config_store::{ConfigStore, Rejection, client_key_id, mask_config};
 use switchyard_core::Config;
 use switchyard_core::config::{
     AliasConfig, ClientKey, CredentialConfig, PayloadConfig, PayloadRule, PriceConfig,
@@ -19,14 +20,74 @@ use switchyard_gateway::DiscoveryState;
 use switchyard_scheduler::{CredentialSnapshot, ModelEntry, ProviderSnapshot};
 use switchyard_telemetry::Totals;
 
-/// `{"config", "path", "restart_required"}` — the answer of `GET /config`
-/// and of every mutation that returns the whole configuration.
+/// `{"config", "path", "restart_required", "command_line_overrides",
+/// "config_rejected"}` — the answer of `GET /config` and of every mutation
+/// that returns the whole configuration.
 pub(crate) fn config_view(state: &AdminState, config: &Config) -> Value {
     let store = state.gateway.config_store();
     json!({
         "config": to_value(&mask_config(config)),
         "path": store.path().display().to_string(),
-        "restart_required": store.restart_required(),
+        "restart_required": restart_required(state),
+        "command_line_overrides": state.options.command_line,
+        "config_rejected": rejection_view(store),
+    })
+}
+
+/// The settings that were changed and only take effect after a restart —
+/// leaving out those the command line fixes (`--host`, `--port`): a restart
+/// with the same command line does not apply the file's value of those.
+pub(crate) fn restart_required(state: &AdminState) -> Vec<String> {
+    let overridden = &state.options.command_line;
+    state
+        .gateway
+        .config_store()
+        .restart_required()
+        .into_iter()
+        .filter(|setting| !overridden.contains(setting))
+        .collect()
+}
+
+/// Issues of a refused file quoted in its message; the rest are counted.
+const REJECTION_ISSUES_SHOWN: usize = 3;
+
+/// The sentence that says the file on disk is refused, naming its first
+/// issues. Also listed in `warnings` of `GET /status`.
+pub(crate) fn rejection_message(rejection: &Rejection) -> String {
+    let mut message = String::from(
+        "configuration file: the file on disk was refused and is not in effect; the gateway \
+         keeps running on the last valid configuration until the file is fixed",
+    );
+    let issues = &rejection.issues;
+    for (index, issue) in issues.iter().take(REJECTION_ISSUES_SHOWN).enumerate() {
+        message.push_str(if index == 0 { ": " } else { "; " });
+        message.push_str(&issue.to_string());
+    }
+    if issues.len() > REJECTION_ISSUES_SHOWN {
+        message.push_str(&format!(
+            " (and {} more)",
+            issues.len() - REJECTION_ISSUES_SHOWN
+        ));
+    }
+    message
+}
+
+/// `config_rejected`: `null` while the file on disk is in effect, else
+/// `{"at", "message", "issues"}` — when it was refused (Unix ms), the
+/// sentence of [`rejection_message`] and every issue of the file.
+pub(crate) fn rejection_view(store: &ConfigStore) -> Value {
+    let Some(rejection) = store.rejection() else {
+        return Value::Null;
+    };
+    let at = rejection
+        .at
+        .duration_since(UNIX_EPOCH)
+        .map(|since| i64::try_from(since.as_millis()).unwrap_or(i64::MAX))
+        .unwrap_or(0);
+    json!({
+        "at": at,
+        "message": rejection_message(&rejection),
+        "issues": rejection.issues,
     })
 }
 

@@ -29,13 +29,24 @@ import { api } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
 import { loadStyles } from '../lib/dom.js';
 import { DASH, formatCompact, formatDuration, formatNumber, formatPercent, plural } from '../lib/format.js';
-import { useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
-import { href, parseHash, routeStore, setQuery, useQueryParam } from '../lib/router.js';
+import { useInterval, useResource } from '../lib/hooks.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
+import { setQuery, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import ProviderDetail from './providers/detail.js';
 import ProviderEditor from './providers/editor.js';
-import { KINDS, QUICK_STARTS, applyCredentialFrame, hasCountdown, kindInfo, providerHealth, replaceProvider } from './providers/model.js';
+import {
+  KINDS,
+  QUICK_STARTS,
+  applyCredentialFrame,
+  discoveryInfo,
+  entryToSend,
+  hasCountdown,
+  hasPendingDiscovery,
+  kindInfo,
+  providerHealth,
+  replaceProvider,
+} from './providers/model.js';
 import { CredentialLamps, LampLegend, useServerNow } from './providers/parts.js';
 
 await loadStyles('pages/providers.css');
@@ -145,14 +156,12 @@ export default function Providers() {
   });
   useLive('config.reloaded', () => providers.refresh());
   useLive('request.finished', refreshSoon);
+  // Frames sent while the connection was down, or dropped for it, are gone.
+  useLiveGap(() => providers.refresh());
 
-  // Frames sent while the connection was down are gone: refetch when it returns.
-  const wasLive = useRef(isLive);
-  useEffect(() => {
-    if (isLive && !wasLive.current) providers.refresh();
-    wasLive.current = isLive;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [isLive]);
+  // No live event says that the gateway has finished asking a provider for
+  // its model list: while one is being fetched, look again every few seconds.
+  useInterval(() => providers.refresh(), hasPendingDiscovery(list) ? 2500 : null);
 
   // ---- Rows ---------------------------------------------------------------
 
@@ -190,7 +199,7 @@ export default function Providers() {
     try {
       // The freshest entry, so an edit made elsewhere a moment ago is not undone.
       const fresh = await api.get(providerPath(name));
-      const view = await api.put(providerPath(name), { ...fresh.config, enabled });
+      const view = await api.put(providerPath(name), entryToSend(fresh.config, { enabled }));
       providers.mutate((data) => replaceProvider(data, view));
       toast.success(enabled ? `Provider ${name} enabled` : `Provider ${name} disabled`, {
         description: enabled ? 'The router uses it again.' : 'The router skips it until it is enabled.',
@@ -210,6 +219,8 @@ export default function Providers() {
 
   const removeProvider = async (provider) => {
     const credentials = (provider.credentials ?? []).length;
+    const at = sorted.findIndex((row) => row.name === provider.name);
+    const neighbour = at === -1 ? null : ((sorted[at + 1] ?? sorted[at - 1])?.name ?? null);
     const ok = await confirm({
       danger: true,
       title: `Delete provider ${provider.name}?`,
@@ -221,7 +232,36 @@ export default function Providers() {
     toast.success(`Provider ${provider.name} deleted`);
     providers.mutate((data) => (Array.isArray(data) ? data.filter((p) => p.name !== provider.name) : data));
     if (openName === provider.name) setQuery({ open: null, tab: null });
+    // What opened the dialog (the row's menu, the drawer's) goes with the
+    // provider: the keyboard moves to the row that takes its place, else to
+    // the page. Placed here, the closing layers leave it where it is.
+    setTimeout(() => {
+      const row = neighbour ? document.querySelector(`.prov-table tr[data-row-key="${CSS.escape(neighbour)}"]`) : null;
+      (row ?? document.getElementById('main'))?.focus();
+    }, 0);
     providers.refresh();
+  };
+
+  // Ask a provider's upstream for its model list now (the retry of a listing
+  // that failed). The outcome is the provider's new `discovery`.
+  const [fetchingModels, setFetchingModels] = useState(() => new Set());
+  const fetchModels = async (provider) => {
+    const { name } = provider;
+    if (fetchingModels.has(name)) return;
+    setFetchingModels((set) => new Set(set).add(name));
+    try {
+      const found = await api.post(`${providerPath(name)}/discover`, {}, { timeout: 60_000 });
+      toast.success(`Model list of ${name} fetched`, { description: `The provider lists ${plural((found?.models ?? []).length, 'model')}.` });
+    } catch (error) {
+      if (!error?.aborted) toast.error(`Could not fetch the model list of ${name}`, { description: error?.message });
+    } finally {
+      setFetchingModels((set) => {
+        const next = new Set(set);
+        next.delete(name);
+        return next;
+      });
+      providers.refresh();
+    }
   };
 
   // ---- Editor -------------------------------------------------------------
@@ -233,8 +273,8 @@ export default function Providers() {
   const takenNames = useMemo(() => (list ?? []).map((p) => p.name), [list]);
 
   // The form of `edit=<name>` can be carried over to the provider that name
-  // was changed to (elsewhere, or by the first half of a two-part save)
-  // without starting afresh: { from: the name in the URL, to: the provider }.
+  // was changed to elsewhere without starting afresh: { from: the name in
+  // the URL, to: the provider }.
   const [retarget, setRetarget] = useState(null);
   const editing = retarget && retarget.from === editName ? retarget.to : editName;
 
@@ -253,8 +293,8 @@ export default function Providers() {
       goneInfo.current = null;
       editorTarget = { key, mode: 'edit', provider };
     } else if (list && lastEdited.current?.key === key && savingRef.current && goneInfo.current?.key !== key) {
-      // Its own save is on the way and has renamed it (a save can take two
-      // requests): the form stays as it is until the save has answered.
+      // Its own save is on the way and has renamed it (the list can hear of
+      // the change before the save has answered): the form stays as it is.
       editorTarget = { key, mode: 'edit', provider: lastEdited.current.provider };
     } else if (list && lastEdited.current?.key === key && (dirtyRef.current || goneInfo.current?.key === key)) {
       // The provider left the configuration (renamed or deleted elsewhere)
@@ -285,57 +325,16 @@ export default function Providers() {
     setNonce((n) => n + 1);
   };
 
-  // Leaving a form with unsaved changes asks first, whatever the way out:
-  // the Back button, a link, the command palette, another form. The address
-  // has changed by the time anyone can object, so this puts the form's
-  // address back before the router looks (it reads the address on
-  // "hashchange"; "popstate" comes first, for links and for Back alike) and
-  // then asks. Filters and the detail drawer change the address too and
-  // pass: the form stays open under them.
-  const leaveAsked = useRef(false);
-  useEffect(() => {
-    const onAddressChange = (event) => {
-      if (!dirtyRef.current) return;
-      const from = routeStore.get();
-      const to = parseHash(location.hash);
-      if (to.path === from.path && editorParamOf(to.query) === editorParamOf(from.query)) return;
-      // Where "hashchange" is the first to tell, keep it from the router.
-      if (event.type === 'hashchange') event.stopImmediatePropagation();
-      const wanted = location.hash;
-      const url = new URL(location.href);
-      url.hash = href(from.path, from.query);
-      history.replaceState(history.state, '', url);
-      if (leaveAsked.current) return;
-      leaveAsked.current = true;
-      confirm({
-        danger: true,
-        title: 'Discard unsaved changes?',
-        message: 'What you entered in the provider form has not been saved.',
-        confirmLabel: 'Discard changes',
-        cancelLabel: 'Keep editing',
-      }).then((ok) => {
-        leaveAsked.current = false;
-        if (!ok) return;
-        dirtyRef.current = false;
-        lastEdited.current = null;
-        goneInfo.current = null;
-        setRetarget(null);
-        setNonce((n) => n + 1);
-        location.hash = wanted;
-      });
-    };
-    window.addEventListener('popstate', onAddressChange);
-    window.addEventListener('hashchange', onAddressChange, true);
-    return () => {
-      window.removeEventListener('popstate', onAddressChange);
-      window.removeEventListener('hashchange', onAddressChange, true);
-    };
-  }, []);
+  // Which route changes take the form away: another page, or another form
+  // (or none) in this page's address. Filters and the detail drawer change
+  // the address too and pass: the form stays open over them. While the form
+  // has unsaved changes the editor asks before such a change, whatever the
+  // way out (useLeaveGuard: Back, a link, the command palette, signing out).
+  const leavesEditor = (next, shown) => next.path !== shown.path || editorParamOf(next.query) !== editorParamOf(shown.query);
 
-  // The editor's place in the URL went away without closeEditor(). The
-  // listener above stops that while there are unsaved changes; this is what
-  // is left: start the next form fresh, and, should a browser have let the
-  // change through to the router first, bring the form back and ask.
+  // The editor's place in the address went away without closeEditor(): Back,
+  // a link, the palette. What the form held has been given up by then (the
+  // editor asked), so the next form starts fresh.
   const editorParam = editorParamOf({ edit: editName, new: newParam });
   const paramBefore = useRef(editorParam);
   useEffect(() => {
@@ -346,30 +345,26 @@ export default function Providers() {
       closingRef.current = false;
       return;
     }
-    if (!dirtyRef.current) {
-      setNonce((n) => n + 1);
-      return;
-    }
-    const at = before.indexOf('=');
-    setQuery({ [before.slice(0, at)]: before.slice(at + 1) }, { replace: false });
-    confirm({
-      danger: true,
-      title: 'Discard unsaved changes?',
-      message: 'What you entered in the provider form has not been saved.',
-      confirmLabel: 'Discard changes',
-      cancelLabel: 'Keep editing',
-    }).then((ok) => {
-      if (ok) closeEditor();
-    });
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    dirtyRef.current = false;
+    lastEdited.current = null;
+    goneInfo.current = null;
+    setRetarget(null);
+    setNonce((n) => n + 1);
   }, [editorParam]);
 
   // A link to edit a provider that is not there (renamed, deleted), or a
-  // provider that vanished under a form with nothing to lose.
+  // provider that vanished under a form with nothing to lose. The detail
+  // drawer takes the form's place and says so, as it does for `open=` (a
+  // toast alone is gone in a few seconds, and so is the name from the
+  // address). Over the drawer of another provider, a toast does it.
   useEffect(() => {
     if (!editName || !list || editorTarget) return;
-    toast.info(`No provider named ${editName}`, { description: 'It may have been renamed or deleted.' });
-    closeEditor();
+    if (!openName || openName === editName) {
+      closeEditor({ open: editName, tab: null });
+    } else {
+      toast.info(`No provider named ${editName}`, { description: 'It may have been renamed or deleted.' });
+      closeEditor();
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editName, list, editorTarget == null]);
 
@@ -380,14 +375,6 @@ export default function Providers() {
     if (previousName == null) closeEditor({ open: view.name, tab: null });
     else if (openName === previousName && view.name !== previousName) closeEditor({ open: view.name });
     else closeEditor();
-    providers.refresh();
-  };
-
-  // The first of two requests of a save went through and the second did not:
-  // the list shows what is stored, and the form stays with that entry.
-  const onPartial = (view, previousName) => {
-    providers.mutate((data) => replaceProvider(Array.isArray(data) ? data : [], view, previousName));
-    if (view.name !== editName) setRetarget({ from: editName, to: view.name });
     providers.refresh();
   };
 
@@ -411,6 +398,9 @@ export default function Providers() {
 
   // ---- Table --------------------------------------------------------------
 
+  // The order of the columns is also in providers.css: where the list is
+  // narrower than the table, it hides Priority (5th), Latency (7th) and then
+  // Credentials (3rd) by their position. Move one, move it there too.
   const columns = [
     {
       key: 'name',
@@ -422,7 +412,7 @@ export default function Providers() {
           <span class="prov-name mono" title=${provider.name}>${provider.name}</span>
           <div class="prov-id-sub">
             <${Badge} mono>${provider.kind}<//>
-            ${provider.prefix && html`<${Badge} mono outline title=${`Models are also served as ${provider.prefix}/model`}>${provider.prefix}/<//>`}
+            ${provider.prefix && html`<${Badge} class="prov-prefix" mono outline title=${`Models are also served as ${provider.prefix}/model`}><span class="prov-prefix-text">${provider.prefix}/</span><//>`}
             <span class="prov-url mono" title=${provider.effective_base_url}>${provider.effective_base_url || 'No base URL'}</span>
           </div>
         </div>
@@ -436,7 +426,7 @@ export default function Providers() {
       render: ({ health }) => html`
         <div class="prov-state">
           <${StatusLamp} tone=${health.tone} label=${health.label} />
-          ${health.detail && html`<span class="prov-state-detail">${health.detail}</span>`}
+          ${health.detail && html`<span class="prov-state-detail" title=${health.detail}>${health.detail}</span>`}
         </div>
       `,
     },
@@ -452,7 +442,16 @@ export default function Providers() {
       num: true,
       sortable: true,
       sortValue: (row) => row.provider.model_count ?? 0,
-      render: ({ provider }) => formatNumber(provider.model_count ?? 0),
+      // The count, and under it where the provider's model list stands.
+      render: ({ provider }) => {
+        const listing = discoveryInfo(provider, now);
+        return html`
+          <span class="prov-figure">
+            <span>${formatNumber(provider.model_count ?? 0)}</span>
+            <span class="prov-figure-note" data-tone=${listing.state === 'failed' ? 'caution' : undefined} title=${listing.error ?? undefined}>${listing.short}</span>
+          </span>
+        `;
+      },
     },
     {
       key: 'priority',
@@ -474,9 +473,9 @@ export default function Providers() {
       render: ({ health }) =>
         health.requests > 0
           ? html`
-              <span class="prov-traffic">
+              <span class="prov-figure">
                 <span>${formatCompact(health.requests)}</span>
-                <span class="prov-traffic-fail" data-tone=${health.failureRatio >= 0.5 ? 'stop' : health.failureRatio >= 0.1 ? 'caution' : undefined}>
+                <span class="prov-figure-note" data-tone=${health.failureRatio >= 0.5 ? 'stop' : health.failureRatio >= 0.1 ? 'caution' : undefined}>
                   ${health.failures > 0 ? `${formatPercent(health.failureRatio)} failed` : 'none failed'}
                 </span>
               </span>
@@ -508,7 +507,8 @@ export default function Providers() {
     },
     {
       key: 'actions',
-      header: '',
+      header: html`<span class="sr-only">Actions</span>`,
+      label: 'Actions',
       align: 'right',
       render: ({ provider }) => html`
         <${Menu}
@@ -516,6 +516,10 @@ export default function Providers() {
           items=${[
             { label: 'Open details', icon: 'sidebar', onSelect: () => setQuery({ open: provider.name, tab: null }, { replace: false }) },
             { label: 'Edit', icon: 'edit', onSelect: () => openEditor(provider) },
+            // The way out of a model list that could not be fetched.
+            ...(provider.discovery?.state === 'failed'
+              ? [{ label: 'Fetch the model list again', icon: 'refresh', disabled: fetchingModels.has(provider.name), onSelect: () => fetchModels(provider) }]
+              : []),
             { separator: true },
             { label: 'Delete provider', icon: 'trash', danger: true, onSelect: () => removeProvider(provider) },
           ]}
@@ -556,7 +560,7 @@ export default function Providers() {
         <//>
       `}
 
-      <${Panel} flush>
+      <${Panel} flush class="prov-panel">
         ${empty
           ? html`<${FirstProvider} onAdd=${openNew} />`
           : html`
@@ -590,7 +594,9 @@ export default function Providers() {
                 rows=${list != null ? sorted : undefined}
                 loading=${providers.loading}
                 error=${providers.error}
+                errorTitle="Could not load the providers"
                 onRetry=${providers.refresh}
+                sortMenu=${false}
                 sort=${sort}
                 onSort=${(next) => setSortParam(next ? `${next.key}:${next.dir}` : '')}
                 onRowClick=${(row) => setQuery({ open: row.name, tab: null }, { replace: false })}
@@ -630,6 +636,8 @@ export default function Providers() {
         onRetry=${providers.refresh}
         onToggle=${toggleEnabled}
         toggling=${opened ? toggling.has(opened.name) : false}
+        onFetchModels=${fetchModels}
+        fetchingModels=${opened ? fetchingModels.has(opened.name) : false}
       />
 
       <${ProviderEditor}
@@ -637,8 +645,9 @@ export default function Providers() {
         takenNames=${takenNames}
         onClose=${() => closeEditor()}
         onSaved=${onSaved}
-        onPartial=${onPartial}
         onRetarget=${(name) => setRetarget({ from: editName, to: name })}
+        onModelsFetched=${providers.refresh}
+        leaves=${leavesEditor}
         dirtyRef=${dirtyRef}
         savingRef=${savingRef}
       />

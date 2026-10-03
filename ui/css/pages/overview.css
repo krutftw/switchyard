@@ -253,8 +253,8 @@
 
 /* The gateway does not answer: the numbers are the last ones heard. They
    stay readable, and step back. */
-.overview-section[data-stale] .stat-value,
-.overview-section[data-stale] .stat-trend {
+.overview-vitals[data-stale] .stat-value,
+.overview-vitals[data-stale] .stat-trend {
   opacity: 0.55;
 }
 
@@ -657,6 +657,10 @@
   @container overview (max-width: 700px) {
     .overview-board .table-wrap {
       overflow-x: visible;
+    }
+
+    .overview-board .table-wrap[data-page-sticky] {
+      overflow: visible;
     }
 
     .overview-board .table-sortbar {

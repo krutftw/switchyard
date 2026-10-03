@@ -8,6 +8,7 @@
 
 import { niceScale } from '../../components/charts.js';
 import { sortRows } from '../../components/table.js';
+import { formatDate } from '../../lib/format.js';
 
 const MINUTE = 60_000;
 const HOUR = 60 * MINUTE;
@@ -32,33 +33,20 @@ export const DEFAULT_RANGE = '24h';
  * `sortParam` and `filterParam` are where each table keeps its order and its
  * filter in the URL.
  *
- * `unlisted` are names the Requests page cannot filter by. A request that
- * failed before a model name was read is recorded with an empty model; the
- * summary lists those under "unknown", but GET /requests?model=unknown
- * matches nothing. `near` is the closest filter that does include them.
+ * The provider `unknown` holds two kinds of request (API.md, "Names that
+ * stand for none"): those that failed before routing, and those the router
+ * refused because every credential of the model was cooling down. Its note
+ * names both: the second kind is often most of the row.
+ *
+ * The stand-in names are filters too: GET /requests takes `model=unknown`
+ * (no model was read), `provider=unknown` (no provider served it),
+ * `key=anonymous` and `key=dashboard`, so every row opens the list of the
+ * requests it counts.
  */
 export const GROUPS = [
-  {
-    value: 'model',
-    label: 'Model',
-    noun: 'model',
-    plural: 'models',
-    field: 'by_model',
-    param: 'model',
-    sortParam: 'sort',
-    filterParam: 'q',
-    special: { unknown: 'no model resolved' },
-    unlisted: {
-      unknown: {
-        title: 'No filter selects requests without a model',
-        description: 'They failed before a model name was read. They are among the failed requests that reached no provider.',
-        action: 'Show those',
-        near: { provider: 'unknown', status: 'error' },
-      },
-    },
-  },
-  { value: 'provider', label: 'Provider', noun: 'provider', plural: 'providers', field: 'by_provider', param: 'provider', sortParam: 'psort', filterParam: 'pq', special: { unknown: 'failed before routing' }, unlisted: {} },
-  { value: 'key', label: 'Client key', noun: 'client key', plural: 'client keys', field: 'by_key', param: 'key', sortParam: 'ksort', filterParam: 'kq', special: { anonymous: 'no client key', dashboard: 'playground' }, unlisted: {} },
+  { value: 'model', label: 'Model', noun: 'model', plural: 'models', field: 'by_model', param: 'model', sortParam: 'sort', filterParam: 'q', special: { unknown: 'no model resolved' } },
+  { value: 'provider', label: 'Provider', noun: 'provider', plural: 'providers', field: 'by_provider', param: 'provider', sortParam: 'psort', filterParam: 'pq', special: { unknown: 'no provider: failed before routing, or every credential cooling down' } },
+  { value: 'key', label: 'Client key', noun: 'client key', plural: 'client keys', field: 'by_key', param: 'key', sortParam: 'ksort', filterParam: 'kq', special: { anonymous: 'no client key', dashboard: 'playground' } },
 ];
 export const DEFAULT_GROUP = 'model';
 
@@ -77,34 +65,25 @@ const BUCKET_WORDS = {
 };
 export const bucketWords = (bucket) => BUCKET_WORDS[bucket] ?? { per: 'per bucket', column: 'Time' };
 
-const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
-const UTC_SUFFIX = ' UTC';
-
-/** "2 Oct": the UTC calendar date of a moment, whatever the browser's zone. */
-export function utcDate(t) {
-  const d = new Date(t);
-  return Number.isNaN(d.getTime()) ? '' : `${d.getUTCDate()} ${MONTHS[d.getUTCMonth()]}`;
-}
+/** "2 Oct UTC": the UTC calendar day a day bucket covers. */
+const utcDay = (t) => `${formatDate(t, new Date(), { utc: true })} UTC`;
 
 /**
- * The x axis of the time series: { x, xFormat } for the chart components.
+ * The x axis of the time series, as props for the chart components:
+ * { x, utc, tipFormat }.
  *
- * Minute and hour buckets are moments: the charts get their start as epoch
- * milliseconds and print it in local time.
+ * Every bucket goes to the charts as its start in epoch milliseconds. Minute
+ * and hour buckets are moments and are printed in local time.
  *
  * A day bucket is a UTC calendar day. Printed as a local moment it reads as
  * the day before for everyone west of UTC ("1 Oct 20:00" in New York is the
- * start of 2 Oct UTC). So day buckets go to the charts as category labels
- * that name the UTC date: "2 Oct UTC" in the tooltip and the table view,
- * "2 Oct" on the axis, where the panel heading already says UTC.
+ * start of 2 Oct UTC). So the charts print day buckets in UTC (`utc`): "2 Oct"
+ * on the axis, where the panel heading already says UTC, and "2 Oct UTC" in
+ * the tooltip and the table view, as a day and not as its midnight.
  */
 export function bucketAxis(timeseries) {
-  const points = timeseries?.points ?? [];
-  if (timeseries?.bucket !== 'day') return { x: points.map((p) => p.t), xFormat: undefined };
-  return {
-    x: points.map((p) => `${utcDate(p.t)}${UTC_SUFFIX}`),
-    xFormat: (label) => String(label).slice(0, -UTC_SUFFIX.length),
-  };
+  const x = (timeseries?.points ?? []).map((p) => p.t);
+  return timeseries?.bucket === 'day' ? { x, utc: true, tipFormat: utcDay } : { x, utc: false, tipFormat: undefined };
 }
 
 // ---------------------------------------------------------------------------
@@ -132,6 +111,12 @@ const RATE_UNITS = [
  * The average request rate over a span, in a unit that gives a readable
  * number: { value, unit, below }, or null without requests.
  *
+ * `spanMs` is the length of the range (`ms` in RANGES), not `to - from` of
+ * the summary: the range is a whole number of buckets ending with the
+ * current, partial one, so `to - from` falls short of it by up to a bucket
+ * and moves with the clock. Twelve requests in the last hour are "12.0 per
+ * hour" on every refresh, not 12.1 or 12.2 depending on the second.
+ *
  * It starts at `unit` (the range's own) and moves to a longer one while the
  * rate is under one per unit, but never to a unit longer than the span: one
  * request in the last hour is "1 per hour", not "24 per day". `below` is set
@@ -142,15 +127,13 @@ export function averageRate(requests, spanMs, unit = 'minute') {
   if (!(n(requests) > 0) || !(n(spanMs) > 0)) return null;
   let at = Math.max(0, RATE_UNITS.findIndex((u) => u.unit === unit));
   const rate = (i) => requests / (spanMs / RATE_UNITS[i].ms);
-  // A little slack: the gateway's "24h" starts on a whole minute, so it is a
-  // few seconds short of a day.
-  while (rate(at) < 1 && at < RATE_UNITS.length - 1 && RATE_UNITS[at + 1].ms <= spanMs * 1.05) at += 1;
+  while (rate(at) < 1 && at < RATE_UNITS.length - 1 && RATE_UNITS[at + 1].ms <= spanMs) at += 1;
   const value = rate(at);
   return { value, unit: RATE_UNITS[at].unit, below: value < 0.05 ? 0.1 : null };
 }
 
 /** Rows of the breakdown table for one group, in the API's order (most requests first). */
-export default function breakdownRows(summary, group) {
+export function breakdownRows(summary, group) {
   const list = Array.isArray(summary?.[group.field]) ? summary[group.field] : [];
   const total = list.reduce((sum, row) => sum + n(row.requests), 0);
   return list.map((row) => ({
@@ -230,9 +213,11 @@ export const slotColor = (slot) => `var(--series-${slot + 1})`;
 export const OTHER_COLOR = 'var(--series-other)';
 
 /**
- * Shorten a long identifier for legends and table headings, which do not
- * truncate on their own: the start and the end are the parts that tell two
- * model names apart.
+ * Shorten a long identifier for the charts: the legend, the tooltip and the
+ * headings of the table view. The start and the end are the parts that tell
+ * two model names apart, so both are kept. (The shared legend and tooltip
+ * cut a name too, but at its end, and the legend only once the name is wider
+ * than the whole chart; the table view does not cut at all.)
  */
 export function shortName(name, max = 34) {
   const text = String(name ?? '');
@@ -315,27 +300,19 @@ export function tokenSeries(points) {
  * tick label. Returns y formatters that pad the labels of both charts to the
  * same length (with figure spaces, which SVG keeps).
  *
- * charts: [{ max, height, format }], as the chart components see them.
+ * charts: [{ max, height, format }], as the chart components see them. They
+ * count whole things and are drawn with `integer`, so the ticks are worked
+ * out the same way here.
  */
 export function alignedFormats(charts) {
   const widest = Math.max(
     ...charts.map(({ max, height, format }) => {
-      const scale = niceScale(0, countAxisMax(max, height) ?? (max > 0 ? max : 1), height < 160 ? 2 : 4);
+      const scale = niceScale(0, max > 0 ? max : 1, height < 160 ? 2 : 4, { integer: true });
       return Math.max(...scale.ticks.map((tick) => String(format(tick)).length));
     }),
   );
   return charts.map(({ format }) => (value) => String(format(value)).padStart(widest, ' '));
 }
-
-/**
- * The yMax to give a chart of whole things (requests, tokens) so that its
- * axis has no fractional ticks. niceScale has no whole-number mode; with a
- * whole-number maximum the only case it splits into fractions is a maximum
- * of 1 on a four-tick axis (0, 0.5, 1), which is what a chart 160px or
- * taller gets. Reaching for 2 gives 0, 1, 2. Everything else is left to the
- * chart (undefined).
- */
-export const countAxisMax = (max, height = 220) => (height >= 160 && max > 0 && max < 2 ? 2 : undefined);
 
 /** The largest stacked total of a set of series (what the y axis must reach). */
 export function stackMax(series) {

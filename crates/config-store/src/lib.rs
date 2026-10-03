@@ -22,5 +22,5 @@ mod validate;
 pub use error::ConfigStoreError;
 pub use persist::write_new;
 pub use secrets::{client_key_id, mask_config, unmask_into};
-pub use store::{ConfigEvent, ConfigStore, Source, WatchOptions};
+pub use store::{ConfigEvent, ConfigStore, Rejection, Source, WatchOptions};
 pub use validate::validate_text;

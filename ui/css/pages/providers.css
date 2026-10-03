@@ -89,13 +89,30 @@
   align-items: center;
   gap: var(--space-1h);
   min-width: 0;
+  /* Whatever cannot be shortened stays inside the cell, never under the
+     State column next to it. */
+  overflow: hidden;
 }
 
 .prov-id-sub .badge {
   flex: none;
 }
 
+/* A long prefix gives way, after the URL, and ends in an ellipsis (the
+   full prefix is in its title). */
+.prov-id-sub .prov-prefix {
+  flex: 0 1 auto;
+  min-width: 0;
+}
+
+.prov-prefix-text {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .prov-url {
+  flex: 0 4 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -123,6 +140,11 @@
 }
 
 .prov-state-detail {
+  /* A model id can be long ("gpt-4o-mini-2024-07-18 resting"): the column
+     does not grow for it. The whole text is the title. */
+  max-width: 12rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
   padding-left: var(--space-4);
 }
 
@@ -140,29 +162,87 @@
   color: var(--text-3);
 }
 
-.prov-traffic {
+/* A figure with a note under it: requests and how many failed, models and
+   where the provider's model list stands. */
+.prov-figure {
   display: inline-flex;
   flex-direction: column;
   align-items: flex-end;
   line-height: var(--leading-tight);
 }
 
-.prov-traffic-fail {
+.prov-figure-note {
   font-family: var(--font-sans);
   font-size: var(--text-xs);
   color: var(--text-3);
+  white-space: nowrap;
 }
 
-.prov-traffic-fail[data-tone="caution"] {
+.prov-figure-note[data-tone="caution"] {
   color: var(--caution-ink);
 }
 
-.prov-traffic-fail[data-tone="stop"] {
+.prov-figure-note[data-tone="stop"] {
   color: var(--stop-ink);
 }
 
 .prov-switch {
   display: inline-flex;
+}
+
+/* ---- The table in a narrower list ------------------------------------------ */
+
+/* Every column fits from a panel of about 1140px (a wide window). Below
+   that, at laptop and tablet widths, the columns that only repeat what the
+   detail drawer says give way, so the switch and the actions stay in view
+   without sideways scrolling: first Priority and Latency, then Credentials
+   (the State column and the lamp totals above the table already say how the
+   credentials stand), then Requests and Models. Measured on the panel, so a
+   collapsed sidebar gives the columns back. Phones have the cards instead.
+
+   The columns are picked by position; their order is set in providers.js. */
+.prov-panel {
+  container: prov-list / inline-size;
+}
+
+@media (min-width: 721px) {
+  @container prov-list (max-width: 1139px) {
+    .prov-table :is(th, td):is(:nth-child(5), :nth-child(7)) {
+      display: none;
+    }
+  }
+
+  @container prov-list (max-width: 919px) {
+    .prov-table :is(th, td):nth-child(3) {
+      display: none;
+    }
+
+    /* The name gives up room before the state does, and the words under
+       the State lamp may take a second line. */
+    .prov-id {
+      max-width: 15rem;
+    }
+
+    .prov-state-detail {
+      white-space: normal;
+    }
+  }
+
+  @container prov-list (max-width: 699px) {
+    .prov-table :is(th, td):nth-child(6) {
+      display: none;
+    }
+  }
+
+  @container prov-list (max-width: 599px) {
+    .prov-table :is(th, td):nth-child(4) {
+      display: none;
+    }
+
+    .prov-id {
+      min-width: 10rem;
+    }
+  }
 }
 
 @media (max-width: 720px) {
@@ -211,17 +291,6 @@
     padding-left: 0;
   }
 
-  /* The order control in the toolbar already sorts the cards: one control,
-     not two. (The selector has to outweigh the table's own, which shows its
-     "Sort by" menu for every collapsed table.) */
-  .prov-table.table-wrap[data-collapse] .table-sortbar {
-    display: none;
-  }
-
-  /* The row menu closes the card, on the side the thumb is. */
-  .prov-table .table td:last-child {
-    justify-content: flex-end;
-  }
 }
 
 /* ---- Empty state ---------------------------------------------------------- */
@@ -337,6 +406,25 @@
   flex-wrap: wrap;
   gap: var(--space-0h) var(--space-3);
   overflow-wrap: anywhere;
+}
+
+/* A model list that could not be fetched: the lamp, why, and the way out. */
+.prov-listing {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: var(--space-1h);
+  min-width: 0;
+}
+
+.prov-listing .status {
+  white-space: normal;
+}
+
+.prov-listing-why {
+  font-size: var(--text-sm);
+  line-height: var(--leading-snug);
+  color: var(--text-2);
 }
 
 /* Credentials: one block per credential, ruled like table rows. */
@@ -573,11 +661,6 @@
   gap: var(--space-6);
 }
 
-/* A segmented control under a label keeps its own width. */
-.prov-drawer .field > .seg {
-  align-self: flex-start;
-}
-
 /* ---- Editor: kind picker and chips ---------------------------------------- */
 
 .prov-kinds {
@@ -640,11 +723,6 @@
 .prov-kind[aria-checked="true"] {
   border-color: var(--accent);
   background: var(--wash-accent);
-}
-
-/* The global focus ring assumes a control's radius; a card keeps its own. */
-.prov-kind:focus-visible {
-  border-radius: var(--radius-md);
 }
 
 .prov-kind[aria-checked="true"] .prov-kind-mark {

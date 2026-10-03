@@ -7,20 +7,34 @@
 // set by the page.
 
 import { API_BASE } from '../../lib/api.js';
-import { DASH, formatCurrency, formatDate, formatDuration, formatNumber, formatTime } from '../../lib/format.js';
+import { DASH, formatCurrency, formatDuration, formatNumber } from '../../lib/format.js';
 
 /** The query parameters that filter the list; the same names the API takes. */
 export const FILTER_KEYS = ['status', 'model', 'provider', 'key', 'q'];
 
+/**
+ * The names the gateway files a request under when it has none of its own:
+ * `model=unknown` and `provider=unknown` select the requests without a
+ * model or a provider, `key=anonymous` the ones without a client key.
+ */
+export const NO_MODEL_FILTER = 'unknown';
+export const NO_PROVIDER_FILTER = 'unknown';
+const NO_KEY_FILTER = 'anonymous';
+
+/** True for a record that names no model: it was refused before one was read. */
+export function hasNoModel(record) {
+  return !record.requested_model && !record.client_model;
+}
+
 const same = (a, b) => typeof a === 'string' && a.toLowerCase() === b;
 
 function matchesStatus(record, status) {
-  const want = status.toLowerCase();
-  if (want === 'ok') return record.ok === true;
-  if (want === 'error') return record.ok === false;
-  if (/^\d{3}$/.test(want)) return record.status === Number(want);
-  if (/^\dxx$/.test(want)) return Math.floor(record.status / 100) === Number(want[0]);
-  // The gateway ignores a status it cannot parse; so does the page.
+  const want = status.trim().toLowerCase();
+  if (want === 'ok' || want === 'success' || want === 'succeeded') return record.ok === true;
+  if (want === 'error' || want === 'err' || want === 'failed' || want === 'failure') return record.ok === false;
+  if (/^[1-5]xx$/.test(want)) return Math.floor(record.status / 100) === Number(want[0]);
+  if (/^[1-5]\d\d$/.test(want)) return record.status === Number(want);
+  // The gateway ignores a status it cannot parse (999, 6xx); so does the page.
   return true;
 }
 
@@ -37,20 +51,20 @@ export default function matchesFilters(record, filters, partial = false) {
     if (partial || !matchesStatus(record, status)) return false;
   }
   if (provider) {
-    if (partial || !same(record.provider, provider.toLowerCase())) return false;
+    if (partial || !same(record.provider || NO_PROVIDER_FILTER, provider.toLowerCase())) return false;
   }
   if (model) {
+    // Any of the three names, or the name the request is filed under: the
+    // client-facing model, else the requested one, else "unknown".
     const want = model.toLowerCase();
-    if (![record.requested_model, record.client_model, record.upstream_model].some((name) => same(name, want))) return false;
+    const filed = record.client_model || record.requested_model || NO_MODEL_FILTER;
+    if (![record.requested_model, record.client_model, record.upstream_model, filed].some((name) => same(name, want))) return false;
   }
   if (key) {
     const want = key.toLowerCase();
     const client = record.client ?? {};
-    if (want === 'anonymous') {
-      if (client.key_name != null || client.key_id != null) return false;
-    } else if (!same(client.key_name, want) && !same(client.key_id, want)) {
-      return false;
-    }
+    const filed = client.key_name || client.key_id || NO_KEY_FILTER;
+    if (![filed, client.key_id, client.key_name].some((name) => same(name, want))) return false;
   }
   if (q) {
     const want = q.toLowerCase();
@@ -105,6 +119,9 @@ export function mergeRecords(rows, incoming) {
 // ---------------------------------------------------------------------------
 
 const STATUS_WORDS = {
+  // A WebSocket session the gateway relayed to the upstream, recorded when
+  // it ends.
+  101: 'WebSocket session',
   200: 'OK',
   400: 'Bad request',
   401: 'Unauthorized',
@@ -131,16 +148,21 @@ export function statusWords(status) {
   return '';
 }
 
+// Every error class the gateway records (crates/admin/API.md, "A request
+// record").
 const KIND_WORDS = {
   invalid_request: 'Invalid request',
+  authentication: 'Not authorised',
+  permission: 'Model not allowed for this key',
   not_found: 'Not found',
+  too_large: 'Too large',
   rate_limit: 'Rate limited',
   upstream: 'Upstream error',
   unavailable: 'No provider available',
   timeout: 'Timed out',
-  auth: 'Not authorised',
-  cancelled: 'Cancelled by the client',
+  internal: 'Gateway error',
   client_disconnect: 'The client went away',
+  aborted: 'Session cut short',
 };
 
 /** An error class ("rate_limit") as words. Unknown classes are spelled out. */
@@ -157,12 +179,6 @@ export const MODES = {
   mock: { label: 'Mock', tone: 'neutral', outline: true, hint: 'Answered by the built-in mock provider. Nothing left the gateway.' },
   raw: { label: 'Raw', tone: 'neutral', outline: true, hint: 'Proxied as raw JSON, without protocol handling.' },
 };
-
-/** "2 Oct 14:03:27.512" */
-export function formatTimestamp(at) {
-  if (at == null) return DASH;
-  return `${formatDate(at)} ${formatTime(at, { ms: true })}`;
-}
 
 const hasUsage = (usage) => !!usage && Object.values(usage).some((n) => n > 0);
 
@@ -306,6 +322,30 @@ export function buildCurl(record, bodies) {
   lines.push('-H "Content-Type: application/json"');
   lines.push(`-d ${shellQuote(bodies.client_request)}`);
   return lines.join(' \\\n  ');
+}
+
+// ---------------------------------------------------------------------------
+// Open in playground
+// ---------------------------------------------------------------------------
+
+// What the playground accepts in ?from=. Keep these in step with its replay
+// checks: PROTOCOL_IDS (playground/protocols.js) and REPLAYABLE (playground.js).
+const PLAYGROUND_PROTOCOLS = ['openai-chat', 'openai-responses', 'anthropic', 'gemini'];
+const PLAYGROUND_ENDPOINTS = /\/v1\/chat\/completions$|\/v1\/responses(?: \(WebSocket\))?$|\/v1\/messages$|:(?:stream)?[gG]enerateContent$|\/playground$/;
+
+/**
+ * True for a generation request in one of the playground's four protocols,
+ * the kind it can send again. Embeddings, token counts and the like are
+ * recorded under a protocol too, and the playground refuses them.
+ */
+export function playgroundAccepts(record) {
+  if (!record || !PLAYGROUND_PROTOCOLS.includes(record.client_protocol)) return false;
+  return typeof record.endpoint !== 'string' || PLAYGROUND_ENDPOINTS.test(record.endpoint);
+}
+
+/** True when "Open in playground" loads this request: it accepts it, and its client body was captured. */
+export function playgroundReplayable(record, bodies) {
+  return typeof bodies?.client_request === 'string' && bodies.client_request !== '' && playgroundAccepts(record);
 }
 
 /** True for a captured body that is a server-sent event stream, not JSON. */

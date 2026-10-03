@@ -151,6 +151,3 @@ export async function getExact(path, signal) {
   }
   return data;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default getExact;

@@ -23,9 +23,9 @@ import {
   toneForStatus,
 } from '../../components/index.js';
 import { api } from '../../lib/api.js';
-import { DASH, formatDuration, formatNumber, formatPercent, formatRelativeTime, plural } from '../../lib/format.js';
+import { DASH, formatDuration, formatNumber, formatPercent, formatRelativeTime, plural, sentence } from '../../lib/format.js';
 import { useAsync, useResource } from '../../lib/hooks.js';
-import { explainCooldown, kindInfo, providerHealth, reasonNoun } from './model.js';
+import { discoveryInfo, explainCooldown, kindInfo, providerHealth, reasonNoun } from './model.js';
 import { Section } from './parts.js';
 
 const credentialPath = (id, action) => `/credentials/${encodeURIComponent(id)}/${action}`;
@@ -69,8 +69,15 @@ function TestPanel({ provider, onTested }) {
     onTested?.();
   };
 
+  // The mock provider's scripted 401 is the one failure that rests nothing:
+  // a rejected key would rest the credential, and the mock models share one.
+  const description =
+    provider.kind === 'mock'
+      ? 'Sends one small request through the first usable credential, whatever its cooldown. A failure rests the model as a real one would, except mock-error-401: its scripted rejection is answered and leaves the credential in rotation.'
+      : 'Sends one small request through the first usable credential, whatever its cooldown. A failure rests the model as a real one would.';
+
   return html`
-    <${Section} title="Test connection" description="Sends one small request through the first usable credential, whatever its cooldown. A failure rests the model as a real one would.">
+    <${Section} title="Test connection" description=${description}>
       <div class="prov-test-row">
         <${Select}
           class="prov-test-model"
@@ -113,7 +120,9 @@ function CredentialItem({ credential, state, now, onPatch, onRefresh }) {
   const reset = useAsync(() => api.post(credentialPath(credential.id, 'reset'), {}));
   const toggle = useAsync((enable) => api.post(credentialPath(credential.id, enable ? 'enable' : 'disable'), {}));
   const name = credential.label || credential.masked_key || credential.id;
-  const off = state.key === 'disabled';
+  // The credential's own switch, whatever its provider's: that is what Enable and Disable move.
+  const off = credential.disabled === true || state.key === 'disabled';
+  const providerOff = state.key === 'idle';
   const canReset = state.key === 'cooling' || (credential.model_cooldowns ?? []).length > 0 || credential.consecutive_failures > 0 || credential.cooldown_until != null;
 
   const doReset = async () => {
@@ -131,7 +140,11 @@ function CredentialItem({ credential, state, now, onPatch, onRefresh }) {
       // The answer is the provider's new view: ids stay, source and index may move.
       if (typeof view === 'object') onPatch(view);
       toast.success(off ? 'Credential enabled' : 'Credential disabled', {
-        description: off ? `${name} takes requests again.` : `${name} takes no requests. The change is saved in the configuration.`,
+        description: off
+          ? providerOff
+            ? `${name} takes requests again once the provider is enabled.`
+            : `${name} takes requests again.`
+          : `${name} takes no requests. The change is saved in the configuration.`,
       });
       onRefresh();
     } else {
@@ -240,7 +253,42 @@ function CredentialsTab({ provider, health, now, onPatch, onRefresh, onEdit }) {
 // Models
 // ---------------------------------------------------------------------------
 
-function ModelsTab({ provider, health, now }) {
+/**
+ * Where the provider's model list stands (its `discovery`), in one line:
+ * "42 models, fetched 3m ago", "Fetching the model list…", or that it could
+ * not be fetched, why, and the button that asks the upstream again.
+ */
+function DiscoveryLine({ provider, now, onFetch, fetching }) {
+  const listing = discoveryInfo(provider, now);
+  if (listing.state === 'pending') return html`<${StatusLamp} tone="info" label=${listing.text} />`;
+  if (listing.state !== 'failed') return html`<span>${listing.text}</span>`;
+  return html`
+    <div class="prov-listing">
+      <${StatusLamp} tone="caution" label=${listing.text} detail=${listing.at != null ? formatRelativeTime(listing.at, now) : undefined} />
+      <span class="prov-listing-why prov-break">
+        ${listing.error ? sentence(listing.error) : 'The gateway gave no reason.'}${listing.models > 0 ? ` The last list that arrived (${plural(listing.models, 'model')}) is still served.` : ''}
+      </span>
+      <${Button} size="sm" icon="refresh" loading=${fetching} onClick=${() => onFetch(provider)}>Retry<//>
+    </div>
+  `;
+}
+
+/** Where the models a provider serves come from, as a sentence for the Models tab. */
+function modelSource(provider, listing) {
+  const explicit = provider.config?.models?.length ?? 0;
+  if (explicit > 0) return `An explicit list of ${plural(explicit, 'model')}.`;
+  if (provider.kind === 'mock') return 'The mock models built into the gateway.';
+  // What stands in while there is no list from the upstream: the last one
+  // that did arrive, else the built-in catalog, where the kind has one.
+  const standIn = listing.models > 0 ? `the last list that arrived (${plural(listing.models, 'model')}) is served` : (provider.model_count ?? 0) > 0 ? 'the built-in catalog for this kind stands in' : 'no models are served';
+  if (listing.state === 'ok') return `The provider's own model list: ${listing.text}.`;
+  if (listing.state === 'pending') return `The gateway is fetching the provider's model list. Until it arrives, ${standIn}.`;
+  if (listing.state === 'failed') return `The provider's model list could not be fetched, so ${standIn}.`;
+  if (provider.enabled === false) return 'The provider is disabled: its model list is not fetched.';
+  return 'The built-in catalog for this kind: discovery is off.';
+}
+
+function ModelsTab({ provider, health, now, onFetchModels, fetchingModels }) {
   // The route table knows which upstream model stands behind each name.
   const table = useResource('/models', { pollMs: 30_000 });
   const [filter, setFilter] = useState('');
@@ -330,8 +378,26 @@ function ModelsTab({ provider, health, now }) {
     },
   ];
 
-  const explicit = provider.config?.models?.length ?? 0;
-  const source = explicit > 0 ? `An explicit list of ${plural(explicit, 'model')}.` : provider.discover ? "The provider's own model list, with the built-in catalog as the fallback." : 'The built-in catalog for this kind.';
+  const listing = discoveryInfo(provider, now);
+  const source = modelSource(provider, listing);
+
+  // Why there is nothing to list, by what the gateway says about the model list.
+  let nothing;
+  if (provider.enabled === false) {
+    nothing = { title: 'No models', description: 'A disabled provider serves nothing.' };
+  } else if (listing.state === 'pending') {
+    nothing = { title: 'Fetching the model list', description: 'The gateway is asking the provider for its models. They appear here when the list has arrived.' };
+  } else if (listing.state === 'failed') {
+    nothing = {
+      title: 'No models',
+      description: 'Fetch the model list again, or add models to the explicit list in the editor.',
+      action: html`<${Button} size="sm" icon="refresh" loading=${fetchingModels} onClick=${() => onFetchModels(provider)}>Fetch the model list again<//>`,
+    };
+  } else if (listing.state === 'ok') {
+    nothing = { title: 'No models', description: 'The provider lists no models, or its exclude patterns hide them all.' };
+  } else {
+    nothing = { title: 'No models', description: 'The provider lists no models. Add them to its explicit list, or switch discovery on and fetch the list.' };
+  }
 
   return html`
     <div class="stack" style="--gap:var(--space-3)">
@@ -352,11 +418,7 @@ function ModelsTab({ provider, health, now }) {
           caption=${`Models served by ${provider.name}`}
           empty=${needle
             ? { icon: 'search', title: 'No model matches', description: `Nothing served by ${provider.name} contains "${filter.trim()}".` }
-            : {
-                icon: 'models',
-                title: 'No models',
-                description: provider.enabled === false ? 'A disabled provider serves nothing.' : 'The provider lists no models. Add them to its explicit list, or switch discovery on and fetch the list.',
-              }}
+            : { icon: 'models', ...nothing }}
         />
       </div>
     </div>
@@ -367,7 +429,7 @@ function ModelsTab({ provider, health, now }) {
 // Drawer
 // ---------------------------------------------------------------------------
 
-function DetailBody({ provider, now, tab, onTab, onEdit, onPatch, onRefresh, onToggle, toggling }) {
+function DetailBody({ provider, now, tab, onTab, onEdit, onPatch, onRefresh, onToggle, toggling, onFetchModels, fetchingModels }) {
   const health = providerHealth(provider, now);
   const info = kindInfo(provider.kind);
   const headerNames = Object.keys(provider.headers ?? {});
@@ -399,6 +461,7 @@ function DetailBody({ provider, now, tab, onTab, onEdit, onPatch, onRefresh, onT
           { label: 'Speaks', value: html`<span class="row row-wrap" style="--gap:var(--space-1)">${(provider.protocols ?? []).map((p) => html`<${Badge} mono key=${p}>${p}<//>`)}</span>` },
           { label: 'Proxy', value: provider.proxy ? html`<span class="mono prov-break">${provider.proxy}</span>` : null, hidden: !provider.proxy },
           { label: 'Headers', value: html`<span class="mono prov-break">${headerNames.join(', ')}</span>`, hidden: headerNames.length === 0 },
+          { label: 'Model list', value: html`<${DiscoveryLine} provider=${provider} now=${now} onFetch=${onFetchModels} fetching=${fetchingModels} />` },
           {
             label: 'Traffic',
             value:
@@ -423,7 +486,7 @@ function DetailBody({ provider, now, tab, onTab, onEdit, onPatch, onRefresh, onT
         />
         ${current === 'credentials'
           ? html`<${CredentialsTab} provider=${provider} health=${health} now=${now} onPatch=${onPatch} onRefresh=${onRefresh} onEdit=${onEdit} />`
-          : html`<${ModelsTab} key=${provider.name} provider=${provider} health=${health} now=${now} />`}
+          : html`<${ModelsTab} key=${provider.name} provider=${provider} health=${health} now=${now} onFetchModels=${onFetchModels} fetchingModels=${fetchingModels} />`}
       </div>
     </div>
   `;
@@ -434,7 +497,7 @@ function DetailBody({ provider, now, tab, onTab, onEdit, onPatch, onRefresh, onT
  * provider  its view from the list, when it is there
  * state     "loading" | "error" | "ready": of the list itself
  */
-export default function ProviderDetail({ name, provider, state, error, now, tab, onTab, onClose, onEdit, onDelete, onPatch, onRefresh, onRetry, onToggle, toggling }) {
+export default function ProviderDetail({ name, provider, state, error, now, tab, onTab, onClose, onEdit, onDelete, onPatch, onRefresh, onRetry, onToggle, toggling, onFetchModels, fetchingModels }) {
   // Keep the last provider on screen while the drawer slides out.
   const last = useRef(null);
   if (provider) last.current = provider;
@@ -443,11 +506,11 @@ export default function ProviderDetail({ name, provider, state, error, now, tab,
 
   let body;
   if (shown) {
-    body = html`<${DetailBody} provider=${shown} now=${now} tab=${tab} onTab=${onTab} onEdit=${() => onEdit(shown)} onPatch=${onPatch} onRefresh=${onRefresh} onToggle=${onToggle} toggling=${toggling} />`;
+    body = html`<${DetailBody} provider=${shown} now=${now} tab=${tab} onTab=${onTab} onEdit=${() => onEdit(shown)} onPatch=${onPatch} onRefresh=${onRefresh} onToggle=${onToggle} toggling=${toggling} onFetchModels=${onFetchModels} fetchingModels=${fetchingModels} />`;
   } else if (state === 'loading') {
     body = html`<div class="stack"><${Skeleton} width="40%" height="20px" /><${Skeleton} lines=${5} /><${Skeleton} lines=${4} /></div>`;
   } else if (state === 'error') {
-    body = html`<${ErrorState} title="Could not load providers" error=${error} onRetry=${onRetry} />`;
+    body = html`<${ErrorState} title="Could not load the providers" error=${error} onRetry=${onRetry} />`;
   } else {
     body = html`
       <${EmptyState}

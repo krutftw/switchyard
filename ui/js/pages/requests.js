@@ -12,42 +12,24 @@ import { html, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { Button, ErrorState, IconButton, LoadMore, Notice, Page, Panel, StatusLamp, Switch, Table } from '../components/index.js';
 import { useCommands } from '../lib/commands.js';
 import { loadStyles, prefersReducedMotion } from '../lib/dom.js';
-import { formatNumber, formatTime, plural } from '../lib/format.js';
+import { formatNumber, formatTime, plural, sentence } from '../lib/format.js';
 import { usePresence, useResource } from '../lib/hooks.js';
 import { useLive } from '../lib/live.js';
 import { navigate } from '../lib/router.js';
-import requestColumns, { HoverTips, memo } from './requests/cells.js';
+import { COLUMNS, HoverTips, memo } from './requests/cells.js';
 import RequestDrawer from './requests/detail.js';
 import FilterBar from './requests/filters.js';
 import useRequestLog from './requests/log.js';
-import matchesFilters, { FILTER_KEYS } from './requests/record.js';
+import matchesFilters, { FILTER_KEYS, NO_MODEL_FILTER, hasNoModel } from './requests/record.js';
 
 await loadStyles('pages/requests.css');
 
-const COLUMNS = requestColumns();
-
-/** The table re-renders when its rows change, and not when anything else on
- *  the page does. Not even for the selection: see useSelectedRow. */
-const LogTable = memo(function LogTable({ rows, loading, freshKeys, onOpen, empty }) {
-  return html`<${Table} class="req-table" dense columns=${COLUMNS} rows=${rows} rowKey="id" loading=${loading} skeletonRows=${12} freshKeys=${freshKeys} onRowClick=${onOpen} empty=${empty} caption="Requests, newest first" />`;
+/** The table re-renders when its rows or the open request change, and not
+ *  when anything else on the page does. Table's own rows are memoised, so
+ *  opening a request renders two of them again, not the whole list. */
+const LogTable = memo(function LogTable({ rows, loading, freshKeys, selectedKey, onOpen, empty }) {
+  return html`<${Table} class="req-table" dense columns=${COLUMNS} rows=${rows} rowKey="id" loading=${loading} skeletonRows=${12} freshKeys=${freshKeys} selectedKey=${selectedKey} onRowClick=${onOpen} empty=${empty} caption="Requests, newest first" />`;
 });
-
-/**
- * Mark the row of the open request. Table can do this itself (selectedKey),
- * but a changed prop renders every row again, and opening a request is the
- * thing done most on this page: with a thousand rows listed that is a
- * visible pause. Rows are keyed by id, so the mark stays with its request
- * when rows arrive above it.
- */
-function useSelectedRow(box, index, rows) {
-  useLayoutEffect(() => {
-    const body = box.current?.querySelector('tbody');
-    if (!body) return;
-    const row = index >= 0 ? body.children[index] : null;
-    for (const marked of body.querySelectorAll('tr[data-selected]')) if (marked !== row) marked.removeAttribute('data-selected');
-    row?.setAttribute('data-selected', '');
-  }, [box, index, rows]);
-}
 
 /** Width of an element, measured before the first paint and on every resize. */
 function useWidth(ref) {
@@ -72,13 +54,6 @@ function useWidth(ref) {
 const FIT_FULL = 960;
 const FIT_TIGHT = 880;
 const FIT_CARDS = 600;
-
-/**
- * How many requests the gateway keeps in memory (crates/admin/API.md: "the
- * most recent 2000"). The list cannot go further back than that, and the
- * API has no field that says so, so the page has to know the number.
- */
-const MEMORY_LIMIT = 2000;
 
 const MODE_LAMP = {
   streaming: { tone: 'info', pulse: true, label: 'Updating live', detail: 'new requests appear as they finish' },
@@ -157,13 +132,50 @@ export default function Requests({ route }) {
     return () => observer.disconnect();
   }, [log.reveal]);
 
+  // Some controls remove themselves when they have done their work: "N new
+  // requests", "Clear filters" in the empty state, "Load older requests" at
+  // the end of the list, "Try again" once the list has loaded. The keyboard
+  // then goes to the row that took the control's place (`index`), once the
+  // list has it, unless the focus has moved on to something else meanwhile.
+  const handOver = useRef(null); // { index, untilShown } | null
+  useEffect(() => {
+    const want = handOver.current;
+    if (!want) return;
+    if (log.loading || log.loadingMore || log.refreshing) {
+      want.started = true;
+      return;
+    }
+    if (want.untilShown ? log.pending > 0 : !want.started) return;
+    handOver.current = null;
+    const at = document.activeElement;
+    if (at && at !== document.body && at.isConnected && !at.closest('.req-new')) return;
+    const body = top.current?.parentElement;
+    // (Failing a row: what the table shows in its place, the empty state's link.)
+    (body?.querySelectorAll('.req-table tbody tr[data-clickable]')[want.index] ?? body?.querySelector('.req-table tbody a, .req-table tbody button'))?.focus({ preventScroll: true });
+  });
+
+  const retry = useCallback(() => {
+    handOver.current = { index: 0 };
+    log.refresh({ reveal: true });
+  }, [log.refresh]);
+
   const showNew = useCallback(() => {
+    handOver.current = { index: 0, untilShown: true };
     log.reveal();
     top.current?.scrollIntoView({ behavior: prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
   }, [log.reveal]);
 
   const inFlight = useMemo(() => (live ? log.inFlight.filter((record) => matchesFilters(record, filters, true)) : []), [live, log.inFlight, filters]);
   const rows = useMemo(() => (inFlight.length > 0 ? [...inFlight, ...log.rows] : log.rows), [inFlight, log.rows]);
+
+  // The first of the rows a page of older requests adds stands where the
+  // button was.
+  const listed = useRef(0);
+  listed.current = rows.length;
+  const loadOlder = useCallback(() => {
+    handOver.current = { index: listed.current };
+    log.loadMore();
+  }, [log.loadMore]);
 
   // ---- Filter options -----------------------------------------------------
 
@@ -176,6 +188,24 @@ export default function Requests({ route }) {
     keys.refresh();
   });
   const modelNames = useMemo(() => models.data?.map((m) => m.name), [models.data]);
+
+  // Requests that were refused before a model could be read have none. The
+  // model filter offers them ("No model") while the gateway holds any: asked
+  // once, again when one arrives that the answer did not know of, and again
+  // with each reload of the list while the answer is yes (they leave the
+  // gateway's memory like any other request).
+  const unnamed = useResource(['/requests', { model: NO_MODEL_FILTER, limit: 1 }]);
+  const unnamedKnown = (unnamed.data?.total ?? 0) > 0;
+  useLive('request.finished', (record) => {
+    if (record && hasNoModel(record)) unnamed.refresh();
+  }, { enabled: !unnamedKnown });
+  const reloadedAt = useRef(null);
+  useEffect(() => {
+    if (reloadedAt.current != null && unnamedKnown) unnamed.refresh();
+    reloadedAt.current = log.updatedAt;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [log.updatedAt]);
+  const noModel = useMemo(() => unnamedKnown || log.rows.some(hasNoModel), [unnamedKnown, log.rows]);
   const providerNames = useMemo(() => providers.data?.map((p) => p.name), [providers.data]);
   const keyList = useMemo(() => keys.data?.map((k) => ({ id: k.id, name: k.name })), [keys.data]);
 
@@ -207,8 +237,6 @@ export default function Requests({ route }) {
   const seed = index === -1 ? null : rows[index];
   const newer = index > 0 ? rows[index - 1] : null;
   const older = index !== -1 && index < rows.length - 1 ? rows[index + 1] : null;
-  const tableBox = useRef(null);
-  useSelectedRow(tableBox, index, rows);
 
   // ---- Command palette ----------------------------------------------------
 
@@ -230,7 +258,7 @@ export default function Requests({ route }) {
             icon: 'filter',
             title: 'No requests match these filters',
             description: 'Requests that match appear here as they finish. Clear the filters to see every request the gateway has in memory.',
-            action: html`<${Button} icon="x" onClick=${clearFilters}>Clear filters<//>`,
+            action: html`<${Button} icon="x" onClick=${() => { handOver.current = { index: 0 }; clearFilters(); }}>Clear filters<//>`,
           }
         : {
             icon: 'requests',
@@ -244,22 +272,24 @@ export default function Requests({ route }) {
   const failed = log.error && rows.length === 0;
   const lamp = MODE_LAMP[log.mode];
   // The count of everything that matches, known once a page has loaded. The
-  // gateway only keeps so many: at that number the list is the newest ones,
-  // not all of them, and the title says so.
-  const capped = !filtered && log.total != null && log.total >= MEMORY_LIMIT;
+  // gateway only keeps so many (`capacity`, which comes with every page): at
+  // that number the list is the newest ones, not all of them, and the title
+  // says so.
+  const capacity = log.capacity;
+  const capped = !filtered && capacity != null && log.total != null && log.total >= capacity;
   let title = 'Requests';
-  if (capped) title = `Newest ${formatNumber(MEMORY_LIMIT)} requests`;
+  if (capped) title = `Newest ${formatNumber(capacity)} requests`;
   else if (log.total != null) title = `${formatNumber(log.total)} ${filtered ? 'matching ' : ''}${log.total === 1 ? 'request' : 'requests'}`;
 
   return html`
     <${Page} class="req-page" title="Requests" description="The most recent requests, newest first. Select one to see its attempts, usage and captured bodies.">
-      <${FilterBar} filters=${filters} onChange=${setFilters} onClear=${clearFilters} models=${modelNames} providers=${providerNames} keys=${keyList} />
+      <${FilterBar} filters=${filters} onChange=${setFilters} onClear=${clearFilters} models=${modelNames} noModel=${noModel} providers=${providerNames} keys=${keyList} />
 
       ${log.error &&
       !failed &&
       html`
-        <${Notice} tone="caution" title="Could not refresh the list" action=${html`<${Button} size="sm" icon="refresh" loading=${log.refreshing} onClick=${() => log.refresh({ reveal: true })}>Try again<//>`}>
-          ${log.error.message} The rows below are as of ${formatTime(log.updatedAt)}.
+        <${Notice} tone="caution" title="Could not refresh the list" action=${html`<${Button} size="sm" icon="refresh" loading=${log.refreshing} onClick=${retry}>Try again<//>`}>
+          ${sentence(log.error.message)} The rows below are as of ${formatTime(log.updatedAt)}.
         <//>
       `}
 
@@ -283,19 +313,19 @@ export default function Requests({ route }) {
         <div class="req-top" ref=${top}></div>
         <${NewRequests} count=${log.pending} overflow=${log.pendingOverflow} onShow=${showNew} />
         ${failed
-          ? html`<${ErrorState} title="Could not load requests" error=${log.error} onRetry=${() => log.refresh({ reveal: true })} retrying=${log.refreshing} />`
+          ? html`<${ErrorState} title="Could not load requests" error=${log.error} onRetry=${retry} retrying=${log.refreshing} />`
           : html`
-              <${HoverTips} class="req-tips" boxRef=${tableBox}>
-                <${LogTable} rows=${rows} loading=${log.loading} freshKeys=${log.fresh} onOpen=${open} empty=${empty} />
+              <${HoverTips} class="req-tips">
+                <${LogTable} rows=${rows} loading=${log.loading} freshKeys=${log.fresh} selectedKey=${id || null} onOpen=${open} empty=${empty} />
               <//>
             `}
         ${log.rows.length > 0 &&
         html`
           <div class="req-foot">
             ${log.moreError && html`<p class="req-foot-error" role="alert">Could not load older requests: ${log.moreError.message}</p>`}
-            <${LoadMore} hasMore=${log.hasMore} loading=${log.loadingMore} onLoad=${log.loadMore} shown=${log.rows.length} noun=${filtered ? 'matching requests' : 'requests'} />
-            ${!log.hasMore && capped && html`<p class="req-foot-note">The gateway keeps its ${formatNumber(MEMORY_LIMIT)} most recent requests in memory, so the list ends here. Older requests still count on the <a href="#/usage">Usage</a> page.</p>`}
-            ${!log.hasMore && filtered && html`<p class="req-foot-note">Filters search the ${formatNumber(MEMORY_LIMIT)} most recent requests, which is what the gateway keeps in memory.</p>`}
+            <${LoadMore} hasMore=${log.hasMore} loading=${log.loadingMore} onLoad=${loadOlder} shown=${log.rows.length} noun=${`${filtered ? 'matching ' : ''}${log.rows.length === 1 && !log.hasMore ? 'request' : 'requests'}`} />
+            ${!log.hasMore && capped && html`<p class="req-foot-note">The gateway keeps its ${formatNumber(capacity)} most recent requests in memory, so the list ends here. Older requests still count on the <a href="#/usage">Usage</a> page.</p>`}
+            ${!log.hasMore && filtered && capacity != null && html`<p class="req-foot-note">Filters search the ${formatNumber(capacity)} most recent requests, which is what the gateway keeps in memory.</p>`}
           </div>
         `}
       <//>

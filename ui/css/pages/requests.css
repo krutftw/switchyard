@@ -23,11 +23,6 @@
   flex: 1 1 0;
 }
 
-/* The field has its own clear button, in the same place in every browser. */
-.req-search input::-webkit-search-cancel-button {
-  display: none;
-}
-
 .req-filters-selects {
   display: flex;
   flex-wrap: wrap;
@@ -314,12 +309,7 @@
   display: block;
 }
 
-/* Nothing scrolls sideways, so the column headers can stay in view under
-   the top bar while the page scrolls. */
-.req-table.table-wrap {
-  overflow: visible;
-}
-
+/* The header sticks as one row (see "Rows" below), not cell by cell. */
 .req-table .table[data-sticky] th {
   position: static;
 }
@@ -390,10 +380,12 @@
 }
 
 /* The header row sticks as one piece: a cell cannot stick further than its
-   own row once rows are grids. */
+   own row once rows are grids. It stops where the shared table's headers
+   do (--sticky-top, the top bar by default), which is also what the rows'
+   scroll margin is worked out from. */
 .req-panel[data-layout="rows"] .table thead {
   position: sticky;
-  top: var(--topbar-h);
+  top: var(--table-sticky-top, var(--topbar-h));
   z-index: var(--z-sticky);
 }
 

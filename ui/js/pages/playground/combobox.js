@@ -11,7 +11,7 @@
 
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Button, Field, Icon, Portal, Skeleton, StatusLamp } from '../../components/index.js';
-import { cx, placeFloating } from '../../lib/dom.js';
+import { cx, placeFloating, scrollMoves } from '../../lib/dom.js';
 import { useOutsidePointer, useUid } from '../../lib/hooks.js';
 
 /** Suggestions drawn at once; a longer list asks for a narrower search. */
@@ -89,10 +89,11 @@ export default function Combobox({
       setPos(null);
       return undefined;
     }
-    // The list is anchored to a field that scrolls away: close rather than chase it.
+    // The list is anchored to a field that scrolls away: close rather than
+    // chase it. Only scrolling that moves the field counts: an answer that
+    // streams into the transcript next to it scrolls by itself.
     const onScroll = (event) => {
-      if (list.current && list.current.contains(event.target)) return;
-      close();
+      if (scrollMoves(event.target, anchor.current)) close();
     };
     window.addEventListener('scroll', onScroll, true);
     window.addEventListener('resize', close);

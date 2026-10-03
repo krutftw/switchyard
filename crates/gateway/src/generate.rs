@@ -34,7 +34,8 @@ use switchyard_core::{ApiError, Codec, Protocol, SseEvent, Usage};
 use switchyard_scheduler::{Lease, Outcome, Resolved};
 use switchyard_telemetry::{Attempt, ClientInfo, Mode, RequestStart, Transport, new_request_id};
 use switchyard_translate::{
-    CodecRef, ReasoningInputs, Transcoder, apply_to_request, plan_with_label, rewrite_model_text,
+    CodecRef, PayloadCtx, ReasoningInputs, Transcoder, apply_payload_rules, apply_to_request,
+    plan_with_label, rewrite_model_text,
 };
 use switchyard_upstream::{
     Operation, Target, Timeouts, UpstreamBody, build_request, mock_error, mock_response,
@@ -811,8 +812,12 @@ impl Inner {
     ) -> Attempted {
         let protocol = lease.upstream_protocol;
         let stream = job.meta.stream;
-        let mut request = match job.decoded() {
-            Ok(request) => request.clone(),
+        let decoded = match mock_payload_rules(job, resolved, lease) {
+            Some(patched) => patched,
+            None => job.decoded().cloned(),
+        };
+        let mut request = match decoded {
+            Ok(request) => request,
             Err(error) => return Attempted::Fatal(error),
         };
         request.model = lease.upstream_model.clone();
@@ -904,6 +909,45 @@ impl Inner {
             Err(error) => Attempted::Fatal(error),
         }
     }
+}
+
+/// The payload rules for an attempt on the mock provider.
+///
+/// The mock stands in for an upstream that speaks the client's protocol, so
+/// the rules are applied as they are for a passthrough request: to the
+/// client's body with the upstream model written in, `default` rules
+/// consulting the client's original body. The patched body is decoded again
+/// and is what the mock answers (and what is captured as the upstream
+/// request). `None` when no rule changes anything — the request decoded
+/// once is used then; `Some(Err)` when a rule left a body the protocol
+/// cannot be read from, which is what a real upstream would refuse too.
+fn mock_payload_rules(
+    job: &Job,
+    resolved: &Resolved,
+    lease: &Lease,
+) -> Option<Result<switchyard_core::ir::Request, ApiError>> {
+    let payload = &job.config.payload;
+    if payload.is_empty() {
+        return None;
+    }
+    let codec = job.client;
+    let rules = PayloadCtx {
+        upstream_model: &lease.upstream_model,
+        requested_model: &resolved.base,
+        protocol: codec.protocol(),
+        provider: &lease.credential.provider,
+        same_protocol: true,
+    };
+    let mut body = (*job.body).clone();
+    codec.set_request_model(&mut body, &lease.upstream_model);
+    if apply_payload_rules(payload, &rules, Some(&job.body), &mut body) == 0 {
+        return None;
+    }
+    let path = RequestPath {
+        model: job.path_model.as_deref(),
+        stream: job.path_stream,
+    };
+    Some(codec.decode_request(&body, &path).map_err(ApiError::from))
 }
 
 /// `future` under an optional time limit; `None` when the limit expired.

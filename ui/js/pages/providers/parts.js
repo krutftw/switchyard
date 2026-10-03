@@ -246,5 +246,3 @@ export function Disclosure({ open, onToggle, controls, children, count }) {
     </button>
   `;
 }
-
-export default CredentialLamps;

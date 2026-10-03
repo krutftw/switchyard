@@ -12,7 +12,7 @@
 import { html, useLayoutEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Badge, Button, CodeBlock, Icon, Notice, Skeleton, StatusLamp, Textarea } from '../../components/index.js';
 import { cx } from '../../lib/dom.js';
-import { formatDuration, formatNumber, formatTokens, plural } from '../../lib/format.js';
+import { formatDuration, formatDurationWords, formatNumber, formatTokens, plural } from '../../lib/format.js';
 import { href } from '../../lib/router.js';
 import { SAMPLE_TOOL, SAMPLE_TOOL_RESULT, adviceFor, prettyArgs, protocolInfo, statusName } from './protocols.js';
 
@@ -49,7 +49,8 @@ function ToolCall({ block, writing, form }) {
   return html`
     <div class="play-tool">
       <${CodeBlock}
-        title=${`Tool call: ${block.name || 'unnamed'}`}
+        title=${block.name ? html`Tool call: <span class="mono">${block.name}</span>` : 'Tool call: unnamed'}
+        label=${`Arguments of the tool call ${block.name || 'unnamed'}`}
         value=${args || (writing ? '' : '{}')}
         language=${writing ? 'text' : 'json'}
         maxHeight="220px"
@@ -94,13 +95,12 @@ export function Blocks({ blocks, streaming = false, forms = null }) {
 // Errors
 // ---------------------------------------------------------------------------
 
-/** Retry-After as words: whole seconds while it is short. */
-const waitText = (seconds) => (seconds < 120 ? plural(Math.ceil(seconds), 'second') : formatDuration(seconds * 1000));
-
 function errorTitle(error) {
   if (error.kind === 'network') return 'No answer from the gateway';
   if (error.kind === 'stream') return error.status ? `The stream failed with status ${error.status}` : 'The stream failed after it started';
   const name = statusName(error.status);
+  // A turn the socket answered with one error frame: nothing was streamed.
+  if (error.kind === 'frame') return `Error frame, status ${error.status}${name ? ` ${name}` : ''}`;
   return `HTTP ${error.status}${name ? ` ${name}` : ''}`;
 }
 
@@ -108,7 +108,9 @@ function errorTitle(error) {
  * An error as part of the conversation: the status, the server's own
  * message, and what to do next. Exported for the WebSocket panel.
  *
- * error  { kind: 'http' | 'stream' | 'network', status, message, type, code, issues, retryAfter }
+ * error  { kind: 'http' | 'stream' | 'frame' | 'network', status, message, type, code, issues,
+ *          retryAfter (seconds: the Retry-After header, or error.headers of a WebSocket error frame),
+ *          via: 'socket' for a turn of the WebSocket view }
  */
 export function ErrorNote({ error, requestId, onRetry, retryLabel = 'Send again', busy = false }) {
   const issues = error.issues ?? [];
@@ -124,7 +126,7 @@ export function ErrorNote({ error, requestId, onRetry, retryLabel = 'Send again'
       html`<ul class="issue-list">
         ${issues.map((issue, i) => html`<li key=${i}>${issue.path && html`<span class="issue-path">${issue.path}</span>`}<span>${issue.message}</span></li>`)}
       </ul>`}
-      <span>${error.retryAfter != null ? `The gateway asks to wait ${waitText(error.retryAfter)}. ` : ''}${adviceFor(error)}</span>
+      <span>${error.retryAfter != null ? `The gateway asks to wait ${formatDurationWords(Math.ceil(error.retryAfter) * 1000)}. ` : ''}${adviceFor(error)}</span>
       ${(onRetry || requestId) &&
       html`<span class="row row-wrap play-error-actions">
         ${onRetry && html`<${Button} size="sm" icon="refresh" disabled=${busy} onClick=${() => onRetry()}>${retryLabel}<//>`}

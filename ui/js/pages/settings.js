@@ -16,17 +16,17 @@
 //   pricing.js    prices
 //   raw.js        the raw file: validate, diff, save, reload
 
-import { html, useEffect, useRef, useState } from '../../vendor/preact-htm.js';
+import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Button, ErrorState, Notice, Page, Panel, Tabs, toast } from '../components/index.js';
 import { api } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
-import { loadStyles, prefersReducedMotion } from '../lib/dom.js';
-import { formatTime } from '../lib/format.js';
+import { loadStyles } from '../lib/dom.js';
+import { formatTime, sentence } from '../lib/format.js';
 import { useAsync, useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { navigate, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
-import { FormSkeleton, confirmLeave, secretSettled, sentence } from './settings/common.js';
+import { FormSkeleton, fileProblems, focusAfterNotice, secretSettled } from './settings/common.js';
 import { GeneralTab } from './settings/general.js';
 import { LoggingTab } from './settings/logging.js';
 import { PayloadTab } from './settings/payload.js';
@@ -57,6 +57,11 @@ export default function Settings() {
   const liveOpen = useStore(liveState, (s) => s.status === 'open');
   const config = useResource('/config', { pollMs: liveOpen ? 0 : 20_000 });
   const status = useResource('/status');
+  // The file on disk, while the gateway refuses it: { message, at } (null
+  // while the file is fine). The frames come in the order things happened
+  // and one with ok: true follows when a refused file is valid again, so
+  // the latest frame says how the file stands. A save that is refused
+  // because of the file (409) says the same, without a time.
   const [rejected, setRejected] = useState(null);
 
   useLive('config.reloaded', (data) => {
@@ -68,12 +73,14 @@ export default function Settings() {
     });
   });
 
-  // Frames sent while the connection was down are gone: refetch when it returns.
-  const wasOpen = useRef(liveOpen);
-  useEffect(() => {
-    if (liveOpen && !wasOpen.current) config.refresh();
-    wasOpen.current = liveOpen;
-  }, [liveOpen]);
+  // Frames sent while the connection was down, or dropped for it, are gone.
+  useLiveGap(() => {
+    config.refresh();
+    status.refresh();
+  });
+
+  // A refusal that is already shown says more (when it happened) and stays.
+  const diskInvalid = (error) => setRejected((current) => current ?? { ok: false, message: `the file is not valid: ${fileProblems(error)}`, at: null });
 
   useCommands(
     () =>
@@ -88,33 +95,14 @@ export default function Settings() {
     [],
   );
 
-  const change = async (next) => {
-    if (next !== tab && (await confirmLeave())) setTab(next);
-  };
-
-  // Seven tabs do not fit a phone: the strip scrolls sideways. Keep the
-  // selected tab in view, so a link to a later tab shows which one is open.
-  const main = useRef(null);
-  const firstScroll = useRef(true);
-  useEffect(() => {
-    const strip = main.current?.querySelector(':scope > .tabs');
-    const selected = strip?.querySelector('[role="tab"][aria-selected="true"]');
-    const first = firstScroll.current;
-    firstScroll.current = false;
-    if (!strip || !selected || strip.scrollWidth <= strip.clientWidth) return;
-    const box = strip.getBoundingClientRect();
-    const at = selected.getBoundingClientRect();
-    const left = strip.scrollLeft + at.left - box.left - (box.width - at.width) / 2;
-    strip.scrollTo({ left: Math.max(0, left), behavior: first || prefersReducedMotion() ? 'auto' : 'smooth' });
-  }, [tab]);
-
-  // The gateway announces a refused file, but not that the file was put back
-  // the way it was: reloading is how the notice is cleared then.
+  // The gateway takes up a repaired file by itself and says so with a frame;
+  // reloading by hand is for when that frame did not get here.
   const reload = useAsync(() => api.post('/reload'));
   const reloadFromDisk = async () => {
     const result = await reload.run();
     if (result) {
       setRejected(null);
+      focusAfterNotice();
       config.mutate(result);
       toast.success('Reloaded from disk', { description: 'The file is valid and in effect.' });
     }
@@ -128,11 +116,11 @@ export default function Settings() {
 
   let body;
   if (FormTab) {
-    if (config.data) body = html`<${FormTab} key=${tab} config=${config} status=${status.data} />`;
+    if (config.data) body = html`<${FormTab} key=${tab} config=${config} status=${status.data} onDiskInvalid=${diskInvalid} />`;
     else if (config.error) body = html`<${Panel} flush><${ErrorState} title="Could not load the settings" error=${config.error} onRetry=${config.refresh} /><//>`;
     else body = html`<div class="settings-form"><${FormSkeleton} rows=${6} /><${FormSkeleton} rows=${3} /></div>`;
-  } else if (tab === 'payload') body = html`<${PayloadTab} key="payload" />`;
-  else if (tab === 'pricing') body = html`<${PricingTab} key="pricing" />`;
+  } else if (tab === 'payload') body = html`<${PayloadTab} key="payload" onDiskInvalid=${diskInvalid} />`;
+  else if (tab === 'pricing') body = html`<${PricingTab} key="pricing" onDiskInvalid=${diskInvalid} />`;
   else {
     // `refused` is the refusal itself, so the tab can tell a new one from the
     // one it has already looked into; it reports back which one was resolved.
@@ -141,7 +129,7 @@ export default function Settings() {
 
   return html`
     <${Page} class="settings" title="Settings" description="Gateway-wide configuration, saved to switchyard.toml and applied at once. Providers, API keys and aliases have their own pages.">
-      <div class="settings-main" ref=${main}>
+      <div class="settings-main">
       ${rejected &&
       html`<${Notice}
         tone="stop"
@@ -149,11 +137,11 @@ export default function Settings() {
         action=${tab === 'raw'
           ? null
           : html`<div class="btn-group">
-              <${Button} size="sm" onClick=${() => change('raw')}>Open the raw file<//>
+              <${Button} size="sm" onClick=${() => { setTab('raw'); focusAfterNotice(); }}>Open the raw file<//>
               <${Button} size="sm" icon="refresh" loading=${reload.loading} onClick=${reloadFromDisk}>Reload from disk<//>
             </div>`}
       >
-        ${sentence(rejected.message || 'The file is not a valid configuration')} The gateway keeps running on the last valid configuration. Fix the file, then reload it. Refused at ${formatTime(rejected.at)}.
+        ${sentence(rejected.message || 'The file is not a valid configuration')} The gateway keeps running on the last valid configuration, and saves on the other tabs are refused until the file is valid again. Fix or restore it on the Raw file tab or in an editor.${rejected.at ? ` Refused at ${formatTime(rejected.at)}.` : ''}
       <//>`}
       ${restart.length > 0 &&
       html`<${Notice} tone="caution" title="Restart needed">
@@ -162,11 +150,11 @@ export default function Settings() {
       ${config.error &&
       config.data &&
       FormTab &&
-      html`<${Notice} tone="caution" title="Could not refresh the settings" action=${html`<${Button} size="sm" icon="refresh" onClick=${config.refresh}>Try again<//>`}>
+      html`<${Notice} tone="caution" title="Could not refresh the settings" action=${html`<${Button} size="sm" icon="refresh" onClick=${() => config.refresh().then(() => focusAfterNotice())}>Try again<//>`}>
         ${sentence(config.error.message)} The values below are the last ones loaded.
       <//>`}
 
-      <${Tabs} label="Settings sections" tabs=${TABS} value=${tab} onChange=${change} />
+      <${Tabs} label="Settings sections" tabs=${TABS} value=${tab} onChange=${setTab} />
 
       <div class="settings-body" role="tabpanel" aria-label=${TABS.find((entry) => entry.id === tab).label} data-tab=${tab}>${body}</div>
       </div>

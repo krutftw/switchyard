@@ -36,14 +36,15 @@ export function syncClock(serverNow) {
 /** The gateway's time right now, without a hook. */
 export const serverNow = () => Date.now() + serverClock.get().offset;
 
-/** The gateway's time, ticking every `stepMs` (see useNow). */
+/**
+ * The gateway's time, ticking every `stepMs`: the clock's reading at the tick
+ * (see useNow), so it is the same number until the next one and safe in
+ * dependency lists.
+ */
 export function useServerNow(stepMs = 1000) {
-  // useNow rounds down to the step, which would make every countdown read up
-  // to a second long. The tick only schedules the render; the time is read
-  // when the render happens.
-  useNow(stepMs);
+  const now = useNow(stepMs);
   const offset = useStore(serverClock, (s) => s.offset);
-  return Date.now() + offset;
+  return now + offset;
 }
 
 /** Finished requests newer than the loaded series: [{ at, ok }]. */
@@ -88,7 +89,3 @@ export function markFrame() {
 
 /** When the last such frame arrived (this browser's clock), or null. */
 export const lastFrameAt = () => frameAt;
-
-// check.mjs asks every module under pages/ for a default export that is a
-// function; this module has no component.
-export default useServerNow;

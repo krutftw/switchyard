@@ -1,14 +1,9 @@
 /* About page. */
 
-/* Land below the sticky top bar when jumped to. */
+/* Land below the sticky top bar when jumped to. A section link also moves
+   keyboard focus to the panel; the shared ring follows the panel's corners. */
 .about-section {
   scroll-margin-top: calc(var(--topbar-h) + var(--space-4));
-}
-
-/* A section link moves keyboard focus to the panel it jumped to. The ring
-   follows the panel's own corners. */
-.about-section:focus-visible {
-  border-radius: var(--radius-md);
 }
 
 /* Text from a link or from the gateway that may have no place to break. */
@@ -422,10 +417,6 @@
 .about-keys-or {
   font-size: var(--text-xs);
   color: var(--text-3);
-}
-
-.about-flip {
-  transform: scaleX(-1);
 }
 
 /* ---- Licence -------------------------------------------------------------- */

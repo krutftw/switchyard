@@ -14,6 +14,8 @@
 //   group     sidebar group; omit to keep the page out of the navigation
 //   primary   also shown in the phone bottom bar (at most four)
 //   keywords  extra words the command palette matches
+//   dev       a page for page authors: left out of the navigation and the
+//             command palette; it is opened by its address only
 //   load      () => import('./pages/<name>.js')
 
 export const NAV_GROUPS = ['Operate', 'Gateway', 'Observe', 'System'];
@@ -104,11 +106,12 @@ export const ROUTES = [
     load: () => import('./pages/about.js'),
   },
   {
-    // The component reference. Not in the navigation; reachable from the
-    // command palette and at #/_kit.
+    // The component reference, for page authors. Not in the navigation or
+    // the command palette: open it at #/_kit.
     path: '/_kit',
     title: 'Component kit',
     icon: 'kit',
+    dev: true,
     keywords: 'kitchen sink components design system reference',
     load: () => import('./pages/kitchen-sink.js'),
   },

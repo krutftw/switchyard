@@ -6,7 +6,7 @@
 // scrolling list in logs/list.js; this module is the page around them:
 // filters in the URL, pause, clear, download, and every state in between.
 
-import { html, useEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../vendor/preact-htm.js';
 import { Button, IconButton, Spinner } from '../components/button.js';
 import { Input, Select } from '../components/form.js';
 import { Icon } from '../components/icons.js';
@@ -17,9 +17,9 @@ import { toast } from '../components/toast.js';
 import { api } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
 import { copyText, loadStyles } from '../lib/dom.js';
-import { formatNumber, formatTime, plural } from '../lib/format.js';
+import { formatNumber, formatTime, plural, sentence } from '../lib/format.js';
 import { useDebounced, useHotkey, useInterval, useLocalStorage, usePresence, useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { href, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import { LogList } from './logs/list.js';
@@ -37,7 +37,7 @@ import {
   matches,
   narrows,
   parseLevel,
-  sentence,
+  sameQuery,
   serverQuery,
   tailOf,
 } from './logs/model.js';
@@ -58,11 +58,7 @@ const OLDER_ROUNDS = 6;
 const TARGET_CHOICES = 40;
 /** Characters of a target shown in the picker; the end of a target says the most. */
 const TARGET_LABEL = 48;
-/** How long GET /status may take when asked which process is answering. */
-const PROCESS_TIMEOUT_MS = 8000;
-/** Live frames wait at most this long for that answer after a reconnect. */
-const HOLD_MS = 10_000;
-/** Frames kept while they wait; beyond it the oldest go and are fetched instead. */
+/** Frames kept until the next batch; beyond it the oldest go and are fetched instead. */
 const QUEUE_MAX = 8000;
 
 const LEVEL_OPTIONS = [
@@ -85,6 +81,7 @@ const LEVEL_OPTIONS = [
  *   version    changes whenever the buffer does
  *   status     "loading" (nothing to show yet) | "ready" | "error"
  *   error      why the last load for the current filter failed
+ *   retrying   a first load that failed is being tried again
  *   refreshing a load for a new filter is in flight, older data is on screen
  *   syncError  why the last catch-up failed (the lines on screen are kept)
  *   older      { loading, error } of "load older"
@@ -113,74 +110,62 @@ function useLogFeed(filter) {
       syncing: false,
       syncAgain: false,
       olderBusy: false,
-      // The gateway process the buffer was filled from (its `started_at`).
-      // A restarted gateway numbers its lines from 1 again, so every answer
-      // is checked against it, and after a reconnect the live frames wait
-      // until one answer has said which process is sending them.
+      // The gateway process the buffer is filled from (its `started_at`). A
+      // restarted gateway numbers its lines from 1 again, and both sources
+      // say which process they are: every page of GET /logs, and the
+      // "hello" frame a live connection begins with, before any of its lines.
       startedAt: null,
-      connection: 0, // times the live connection came back
-      checked: 0, // the connection up to which the process is known
-      heldSince: 0,
     };
     const bump = () => setVersion((v) => (v + 1) % 1_000_000_000);
 
-    /** `started_at` of the process that answers, or null when it cannot be asked. */
-    const whichProcess = async (signal) => {
-      try {
-        const status = await api.get('/status', { signal, timeout: PROCESS_TIMEOUT_MS });
-        const at = Number(status?.started_at);
-        return Number.isFinite(at) && at > 0 ? at : null;
-      } catch {
-        return null;
-      }
+    /** `started_at` as a page or a "hello" frame gives it, or null when it does not. */
+    const processOf = (data) => {
+      const at = Number(data?.started_at);
+      return Number.isFinite(at) && at > 0 ? at : null;
     };
 
-    /** A page of GET /logs, and which process it came from. */
-    const fetchPage = async (query) => {
-      const signal = io.controller.signal;
-      const mark = io.connection;
-      const [page, startedAt] = await Promise.all([api.get('/logs', { query, signal }), whichProcess(signal)]);
-      return { page, startedAt, mark };
-    };
+    /** A page of GET /logs. */
+    const fetchPage = (query) => api.get('/logs', { query, signal: io.controller.signal });
 
-    /**
-     * Take note of the process an answer came from. Returns true when the
-     * gateway was restarted since the buffer was filled: the buffer has then
-     * been told (logs/model.js), the answer must be dropped (its lines were
-     * asked for with the old numbering in mind) and the log loaded afresh.
-     */
-    const settle = ({ startedAt, mark }) => {
-      let restarted = false;
-      if (startedAt !== null) {
-        restarted = io.startedAt !== null && startedAt !== io.startedAt;
-        io.startedAt = startedAt;
-      }
-      if (restarted) {
-        store.restart(startedAt);
-        bump();
-      }
-      if (mark > io.checked) io.checked = mark;
-      return restarted;
+    /** Put the frames received so far into the buffer. Returns true when it then needs a catch-up. */
+    const apply = () => {
+      if (io.queue.length === 0) return false;
+      const batch = io.queue;
+      io.queue = [];
+      const result = store.live(batch);
+      if (result.added > 0) bump();
+      return result.needSync;
     };
 
     const flush = () => {
       io.timer = null;
       if (!io.alive) return;
-      // After a reconnect, frames wait until it is known which process sends them.
-      if (io.checked < io.connection && Date.now() - io.heldSince < HOLD_MS) return;
-      io.checked = io.connection;
-      if (io.queue.length === 0) return;
-      const batch = io.queue;
-      io.queue = [];
-      const result = store.live(batch);
-      if (result.added > 0) bump();
       // Before the first page has landed, that page settles it (see reset).
-      if (result.needSync) sync();
+      // A catch-up already on its way may close the hole: the buffer says
+      // so when its page is in, and only then is another one sent.
+      if (apply()) sync({ fresh: false });
     };
 
-    /** Apply what is waiting, now that it may be. */
-    const drain = () => {
-      if (io.alive && io.queue.length > 0 && io.timer === null) io.timer = setTimeout(flush, 0);
+    /**
+     * Take note of the process a page or a live connection belongs to
+     * (`data` is the page or the "hello" frame). Returns true when the
+     * gateway was restarted since the buffer was filled: the buffer has then
+     * been told (logs/model.js) and the log must be loaded afresh. A page
+     * that says so is dropped: its lines were asked for with the old
+     * numbering in mind.
+     */
+    const settle = (data) => {
+      const startedAt = processOf(data);
+      if (startedAt === null) return false;
+      const restarted = io.startedAt !== null && startedAt !== io.startedAt;
+      io.startedAt = startedAt;
+      if (restarted) {
+        // Frames not yet in the buffer are lines of the process that is gone.
+        apply();
+        store.restart(startedAt);
+        bump();
+      }
+      return restarted;
     };
 
     const startOver = () => reset(serverQuery(filterRef.current));
@@ -188,10 +173,18 @@ function useLogFeed(filter) {
     /** With lines of an earlier run on screen, this run is fetched whole (see dropEarlierRuns in the model). */
     const pageSize = (normal) => (store.hasEarlierRuns() ? GATEWAY_LINES : normal);
 
-    async function sync() {
+    /**
+     * Catch up: fetch the newest page and join it with what is held.
+     * `fresh: false` when a page that is already on its way will do.
+     */
+    async function sync({ fresh = true } = {}) {
       if (!io.ready || !io.alive) return;
+      // A catch-up may drop lines that sit behind a hole, and a paused view
+      // must not change: the lines are fetched on resume. (A gateway that
+      // restarts meanwhile says so in the "hello" of the next connection.)
+      if (store.paused !== null) return;
       if (io.syncing) {
-        io.syncAgain = true;
+        if (fresh) io.syncAgain = true;
         return;
       }
       io.syncing = true;
@@ -201,81 +194,75 @@ function useLogFeed(filter) {
         // One request normally; another when frames were lost meanwhile.
         for (let round = 0; round < 4; round += 1) {
           io.syncAgain = false;
-          if (store.paused !== null) {
-            // A catch-up may drop lines that sit behind a hole, and the
-            // paused view must not change: only check that the gateway is
-            // still the same process. The lines are fetched on resume.
-            const mark = io.connection;
-            const startedAt = await whichProcess(io.controller.signal);
-            if (generation !== io.generation || !io.alive) return;
-            if (settle({ startedAt, mark })) {
-              startOver();
-              return;
-            }
-            if (!io.syncAgain) break;
-          } else {
-            const sentAt = store.lastSeq;
-            const answer = await fetchPage({ limit: pageSize(SYNC_SIZE), level: store.query.level, q: store.query.q });
-            if (generation !== io.generation || !io.alive) return;
-            if (settle(answer)) {
-              startOver();
-              return;
-            }
-            // Paused while the request was on its way: leave the view alone.
-            if (store.paused !== null) continue;
-            // So much was missed that the page does not reach back to the
-            // lines held, which would have to go. With a filter on, give up
-            // the lines it hides instead and ask again for the ones it
-            // shows: far fewer were missed of those.
-            const focus = store.focus;
-            if (focus && (focus.level !== store.query.level || focus.q !== store.query.q) && !store.joins(answer.page)) {
-              store.narrow(focus);
-              bump();
-              continue;
-            }
-            const result = store.sync(answer.page, sentAt);
-            setSyncError(null);
-            bump();
-            if (!result.needSync && !io.syncAgain) break;
+          const sentAt = store.lastSeq;
+          const page = await fetchPage({ limit: pageSize(SYNC_SIZE), ...store.query });
+          if (generation !== io.generation || !io.alive) return;
+          if (settle(page)) {
+            startOver();
+            return;
           }
+          // Paused while the request was on its way: leave the view alone.
+          if (store.paused !== null) break;
+          // So much was missed that the page does not reach back to the
+          // lines held, which would have to go. With a filter on, give up
+          // the lines it hides instead and ask again for the ones it
+          // shows: far fewer were missed of those.
+          const focus = store.focus;
+          if (focus && !sameQuery(focus, store.query) && !store.joins(page)) {
+            store.narrow(focus);
+            bump();
+            continue;
+          }
+          const result = store.sync(page, sentAt);
+          setSyncError(null);
+          bump();
+          if (!result.needSync && !io.syncAgain) break;
         }
       } catch (error) {
         failed = true;
-        if (generation === io.generation && io.alive && !error.aborted) {
-          setSyncError(error);
-          // The process could not be asked: do not keep the tail waiting.
-          io.checked = io.connection;
-        }
+        if (generation === io.generation && io.alive && !error.aborted) setSyncError(error);
       } finally {
         const again = io.syncAgain;
         io.syncAgain = false;
         io.syncing = false;
-        drain();
         // A request that came in during the last round still gets its answer.
         if (again && !failed && io.alive && generation === io.generation) sync();
       }
     }
 
-    async function reset(query) {
+    /**
+     * Load the newest page for `query` in place of the history held.
+     * `uncleared`: the lines a "Clear view" hid come back with it. They do
+     * when the page has arrived, not before: until then the cleared view
+     * stays as it is, its button busy.
+     */
+    async function reset(query, { uncleared = false } = {}) {
       io.generation += 1;
       const generation = io.generation;
       io.controller.abort();
       io.controller = new AbortController();
       io.pending = query;
-      setLoad({ status: io.ready ? 'ready' : 'loading', error: null, refreshing: io.ready });
+      setLoad((state) => {
+        if (io.ready) return { status: 'ready', error: null, refreshing: true };
+        // Trying again after a first load that failed: the error stays on
+        // screen, its button busy, until there is something better to show.
+        if (state.status === 'error') return { ...state, retrying: true };
+        return { status: 'loading', error: null, refreshing: false };
+      });
       setOlder({ loading: false, error: null });
       const sentAt = store.lastSeq;
       // A paused view gets the newest lines up to the pause, not up to now.
       const upTo = store.paused !== null && store.paused > store.base ? store.paused + 1 : null;
       try {
-        const answer = await fetchPage({ limit: pageSize(PAGE_SIZE), level: query.level, q: query.q, before: upTo === null ? null : upTo - store.base });
+        const page = await fetchPage({ limit: pageSize(PAGE_SIZE), ...query, before: upTo === null ? null : upTo - store.base });
         if (generation !== io.generation || !io.alive) return;
         io.pending = null;
-        if (settle(answer)) {
+        if (uncleared) store.unclear();
+        if (settle(page)) {
           startOver();
           return;
         }
-        const result = store.reset(answer.page, query, sentAt, upTo);
+        const result = store.reset(page, query, sentAt, upTo);
         io.ready = true;
         setLoad({ status: 'ready', error: null, refreshing: false });
         setSyncError(null);
@@ -290,10 +277,7 @@ function useLogFeed(filter) {
       } catch (error) {
         if (generation !== io.generation || !io.alive || error.aborted) return;
         io.pending = null;
-        io.checked = io.connection;
         setLoad({ status: io.ready ? 'ready' : 'error', error, refreshing: false });
-      } finally {
-        drain();
       }
     }
 
@@ -303,13 +287,10 @@ function useLogFeed(filter) {
       io.controller.abort();
       io.controller = new AbortController();
       io.pending = null;
-      // The cancelled request may have been the one the frames waited for.
-      io.checked = io.connection;
       setLoad({ status: 'ready', error: null, refreshing: false });
       setOlder({ loading: false, error: null });
-      drain();
-      // The cancelled load may also have been the one that catches up
-      // (after a restart of the gateway, say): do that for what is held.
+      // The cancelled load may have been the one that catches up (after a
+      // restart of the gateway, say): do that for what is held.
       sync();
     };
 
@@ -329,13 +310,13 @@ function useLogFeed(filter) {
           if (store.used() >= store.maxLines) store.narrow(query);
           const room = store.maxLines - store.used();
           if (room <= 0) break;
-          const answer = await fetchPage({ limit: Math.min(PAGE_SIZE, room), level: query.level, q: query.q, before: store.cursor() });
+          const page = await fetchPage({ limit: Math.min(PAGE_SIZE, room), ...query, before: store.cursor() });
           if (generation !== io.generation || !io.alive) return;
-          if (settle(answer)) {
+          if (settle(page)) {
             startOver();
             return;
           }
-          const { lines } = store.older(answer.page, query);
+          const { lines } = store.older(page, query);
           bump();
           if (lines.some((line) => matches(line, filterRef.current))) break;
         }
@@ -344,7 +325,6 @@ function useLogFeed(filter) {
         if (generation === io.generation && io.alive && !error.aborted) setOlder({ loading: false, error });
       } finally {
         io.olderBusy = false;
-        drain();
       }
     };
 
@@ -386,19 +366,28 @@ function useLogFeed(filter) {
         if (io.queue.length > QUEUE_MAX) io.queue.splice(0, io.queue.length - QUEUE_MAX / 2);
         if (io.timer === null) io.timer = setTimeout(flush, FLUSH_MS);
       },
-      /** The gateway dropped frames for this connection: fetch what is missing. */
+      /**
+       * Frames are missing: the live connection is back after being down, or
+       * the gateway dropped some for it. The next frame starts a new run,
+       * and what lies in between is fetched.
+       */
       resync() {
+        // The frames not yet in the buffer came before the hole.
+        apply();
         store.breakRun();
         sync();
       },
-      /** The live connection is up (again): the frames in between are gone, and the gateway may be another process. */
-      reconnected() {
+      /**
+       * The live connection is down. It brings no frames: the run it brought
+       * has ended, and what is fetched from here on is not joined to it.
+       */
+      down() {
+        apply();
         store.breakRun();
-        if (io.ready) {
-          io.connection += 1;
-          io.heldSince = Date.now();
-        }
-        sync();
+      },
+      /** A "hello" live frame: a connection has begun, to a gateway that may have been restarted. */
+      hello(data) {
+        if (settle(data)) startOver();
       },
       reload: startOver,
       pause() {
@@ -416,8 +405,7 @@ function useLogFeed(filter) {
         bump();
       },
       restore() {
-        store.unclear();
-        return startOver();
+        return reset(serverQuery(filterRef.current), { uncleared: true });
       },
       stop() {
         io.alive = false;
@@ -436,15 +424,17 @@ function useLogFeed(filter) {
   }, [feed, filter]);
 
   useLive('log', feed.push);
-  useLive('lagged', feed.resync);
+  useLive('hello', feed.hello);
+  useLiveGap(feed.resync);
 
   const liveStatus = useStore(liveState, (state) => state.status);
   const liveOpen = liveStatus === 'open';
+  // A connection that is down brings no frames: the run it brought has
+  // ended. This effect stands before the one that starts polling, because
+  // what polling fetches must not be joined to that run.
   useEffect(() => {
-    if (liveOpen) feed.reconnected();
-    // While the connection is down the next frame, if any, starts a new run.
-    else store.breakRun();
-  }, [feed, store, liveOpen]);
+    if (!liveOpen) feed.down();
+  }, [feed, liveOpen]);
 
   // Without the live connection the log is polled, unless the view is
   // paused. "connecting" is the moment before the first connection: not down.
@@ -473,6 +463,7 @@ function useLogFeed(filter) {
     status: load.status,
     error: load.error,
     refreshing: load.refreshing,
+    retrying: load.retrying === true,
     syncError,
     older,
     liveOpen,
@@ -675,6 +666,29 @@ export default function Logs() {
   const [activeSeq, setActiveSeq] = useState(null);
   const searchInput = useRef(null);
   const list = useRef(null);
+  const viewEl = useRef(null);
+
+  // The focus is never left on <body>. Controls of this page go away under
+  // it: "Load older lines" at the start of the log, "Show earlier lines"
+  // once they show, the buttons of an empty view when the list returns,
+  // "Clear view" (disabled) when nothing is left to clear. The control that
+  // has the focus before a render and cannot have it afterwards gives it to
+  // what the view then holds: the list, where the arrow keys work, or the
+  // first thing an empty view offers. (A button that loads keeps the focus
+  // while it does; rows are looked after in logs/list.js.)
+  const focusedBefore = useRef(null);
+  const activeNow = document.activeElement;
+  focusedBefore.current = activeNow && activeNow !== document.body && activeNow.closest('.logs') ? activeNow : null;
+  useLayoutEffect(() => {
+    const held = focusedBefore.current;
+    focusedBefore.current = null;
+    if (!held || (held.isConnected && !held.disabled)) return;
+    // Something else has taken the focus meanwhile: it stays there.
+    const active = document.activeElement;
+    if (active && active !== document.body && active !== held) return;
+    const next = viewEl.current?.querySelector('.logs-scroll, .empty button, .empty a') ?? searchInput.current;
+    next?.focus({ preventScroll: true });
+  });
 
   // What is on screen: the buffer through the display filter, up to the
   // line the view is paused at. `held` is what waits behind the pause.
@@ -771,14 +785,6 @@ export default function Logs() {
     resume();
     list.current?.focus();
   };
-  // The button that loads older lines is busy while it does and out of view
-  // afterwards (or gone, with the empty state it stood in): the focus it had
-  // goes to the list, where the arrow keys work.
-  const loadOlder = async () => {
-    await feed.loadOlder();
-    const active = document.activeElement;
-    if (!active || active === document.body || active.closest('.logs-top')) list.current?.focus();
-  };
   const clearView = () => {
     feed.clear();
     setExpanded(new Set());
@@ -816,7 +822,7 @@ export default function Logs() {
   // lines it shows, every time; "full" is when even that leaves no room for
   // older ones.
   const wanted = serverQuery(filter);
-  const canNarrow = (wanted.level !== '' || wanted.q !== '') && covers(store.query, filter) && narrows(store.query, wanted);
+  const canNarrow = (wanted.level !== '' || wanted.q !== '' || wanted.target !== '') && covers(store.query, filter) && narrows(store.query, wanted);
   store.focus = canNarrow ? wanted : null;
   const total = store.used();
   const full = total >= store.maxLines && (!canNarrow || store.wouldKeep(wanted) >= store.maxLines);
@@ -824,6 +830,9 @@ export default function Logs() {
   // New lines since the user scrolled away from the end.
   const unseen = !follow && leftAt !== null ? shown.length - lowerBound(shown, leftAt + 1) : 0;
   const hasLines = shown.length > 0;
+  // A view without lines has no place to keep: the list that comes back
+  // (a filter taken off again) follows the end, as a new one does.
+  if (!hasLines && !follow) setFollow(true);
 
   // -------------------------------------------------------------------------
   // The view
@@ -840,7 +849,7 @@ export default function Logs() {
   if (feed.status === 'loading') {
     view = html`<${SkeletonLines} />`;
   } else if (feed.status === 'error') {
-    view = html`<${ErrorState} title="Could not load the log" error=${feed.error} onRetry=${retry} />`;
+    view = html`<${ErrorState} title="Could not load the log" error=${feed.error} onRetry=${retry} retrying=${feed.retrying} />`;
   } else if (!hasLines && store.cleared > 0 && (total === 0 || !filtered)) {
     view = html`
       <${EmptyState}
@@ -869,7 +878,7 @@ export default function Logs() {
         title=${feed.refreshing ? 'Searching the log' : 'No lines match'}
         description=${description}
         action=${html`
-          ${store.floor !== null && !full && html`<${Button} loading=${feed.older.loading} onClick=${loadOlder}>Search older lines<//>`}
+          ${store.floor !== null && !full && html`<${Button} loading=${feed.older.loading} onClick=${feed.loadOlder}>Search older lines<//>`}
           ${paused && held > 0 && html`<${Button} icon="play" onClick=${resume}>Resume<//>`}
           <${Button} variant=${(store.floor !== null && !full) || (paused && held > 0) ? 'ghost' : 'secondary'} onClick=${clearFilters}>Clear filters<//>
         `}
@@ -890,7 +899,7 @@ export default function Logs() {
         icon="logs"
         title="No log lines yet"
         description=${`Lines appear here as the gateway writes them.${gatewayLevel && levelRank(gatewayLevel) > levelRank('info') ? ` It records only ${gatewayLevel === 'error' ? 'errors' : 'warnings and errors'} at the moment.` : ''}`}
-        action=${store.floor !== null ? html`<${Button} loading=${feed.older.loading} onClick=${loadOlder}>Load older lines<//>` : null}
+        action=${store.floor !== null ? html`<${Button} loading=${feed.older.loading} onClick=${feed.loadOlder}>Load older lines<//>` : null}
       />
     `;
   } else {
@@ -907,7 +916,7 @@ export default function Logs() {
         layoutKey=${wrap ? 'wrap' : 'single'}
         actions=${actions}
         controls=${list}
-        top=${html`<${ListTop} feed=${feed} filtered=${filtered} full=${full} onRestore=${feed.restore} onOlder=${loadOlder} />`}
+        top=${html`<${ListTop} feed=${feed} filtered=${filtered} full=${full} onRestore=${feed.restore} onOlder=${feed.loadOlder} />`}
       />
     `;
   }
@@ -955,23 +964,13 @@ export default function Logs() {
             value=${text}
             onChange=${setText}
             onEnter=${() => applySearch(text)}
+            onClear=${() => applySearch('')}
+            clearLabel="Clear search"
             inputRef=${searchInput}
             placeholder="Search message, target and fields"
             aria-label="Search log lines"
             aria-keyshortcuts="/"
             autocomplete="off"
-            actions=${text
-              ? html`<${IconButton}
-                  icon="x"
-                  label="Clear search"
-                  size="sm"
-                  onClick=${() => {
-                    setText('');
-                    applySearch('');
-                    searchInput.current?.focus();
-                  }}
-                />`
-              : null}
           />
           <${TargetPicker} targets=${targets} value=${target} onChange=${setTarget} />
           <div class="logs-tools">
@@ -992,7 +991,7 @@ export default function Logs() {
             ${sentence(feed.syncError.message)} The lines loaded so far stay on screen.
           <//>
         `}
-        <div class="logs-view" data-wrap=${wrap ? '' : undefined} data-stale=${feed.refreshing ? '' : undefined}>
+        <div ref=${viewEl} class="logs-view" data-wrap=${wrap ? '' : undefined} data-stale=${feed.refreshing ? '' : undefined}>
           ${view}
           <${EndPill} open=${hasLines && feed.status === 'ready' && (paused || !follow)} paused=${paused} count=${paused ? held : unseen} onClick=${paused ? resumeFromPill : jumpToEnd} />
         </div>

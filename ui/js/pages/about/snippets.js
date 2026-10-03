@@ -53,9 +53,12 @@ const sameHost = (a, b) => a === b || (LOOPBACK.has(a) && LOOPBACK.has(b));
  * proxy or a tunnel): that is what a client on the gateway's own machine
  * would use. A wildcard bind (0.0.0.0) names no address a client could use.
  *
+ * `tls` is GET /status `tls`: whether that listener serves HTTPS, and so the
+ * scheme that goes in front of the listen address.
+ *
  * @returns {{ id: 'browser' | 'listen', label: string, base: string }[]}
  */
-export function addressChoices(listen, pageUrl) {
+export function addressChoices(listen, pageUrl, { tls = false } = {}) {
   const browser = browserBase(pageUrl);
   const choices = [{ id: 'browser', label: 'This browser’s address', base: browser }];
   const bound = parseListen(listen);
@@ -71,9 +74,7 @@ export function addressChoices(listen, pageUrl) {
     const direct = page.pathname.replace(/\/+$/, '') === '' && pagePort === bound.port && sameHost(page.hostname.toLowerCase(), bound.host.toLowerCase());
     if (direct) return choices;
   }
-  // The scheme of the listener is not part of /status. Through a proxy the
-  // gateway itself almost always speaks plain HTTP.
-  choices.push({ id: 'listen', label: 'Listen address', base: `http://${bound.host}:${bound.port}` });
+  choices.push({ id: 'listen', label: 'Listen address', base: `${tls ? 'https' : 'http'}://${bound.host}:${bound.port}` });
   return choices;
 }
 
@@ -87,14 +88,14 @@ export function wsBase(base) {
 // ---------------------------------------------------------------------------
 
 /**
- * The entries of GET /models a client can call: a name and at least one
- * route. An alias whose targets match nothing is listed with `routes: []`
- * and answers 404, so it is not one of them.
+ * The entries of GET /models a client can call: every name the gateway does
+ * not mark `ignored`. An ignored entry is an alias without a routable target;
+ * it answers 404, so it is not one of them.
  *
- * @param {{ name: string, hidden?: boolean, routes?: { credentials_available: number }[] }[] | undefined} models  GET /models
+ * @param {{ name: string, hidden?: boolean, ignored?: boolean, routes?: { credentials_available: number }[] }[] | undefined} models  GET /models
  */
 export function callableModels(models) {
-  return (Array.isArray(models) ? models : []).filter((m) => m && typeof m.name === 'string' && m.name !== '' && Array.isArray(m.routes) && m.routes.length > 0);
+  return (Array.isArray(models) ? models : []).filter((m) => m && typeof m.name === 'string' && m.name !== '' && m.ignored !== true);
 }
 
 /** Whether a credential could serve the model right now. */
@@ -420,10 +421,6 @@ export function clientSnippets(client, { base, model, shell = 'posix' }) {
   }
 }
 
-// ui/tests/check.mjs asks every file under js/pages/ for a default export,
-// sub-modules included.
-export default clientSnippets;
-
 // ---------------------------------------------------------------------------
 // Diagnostics
 // ---------------------------------------------------------------------------
@@ -460,6 +457,7 @@ export function diagnosticsText(status, { uptimeMs = null, error = null } = {}) 
     `Models: ${n(counts.models)}`,
     `Client keys: ${n(counts.client_keys)}`,
     `Key required: ${yesNo(status.auth_required)}`,
+    `HTTPS listener: ${yesNo(status.tls)}`,
     `Remote admin: ${status.admin ? (status.admin.allow_remote ? 'allowed' : 'off') : 'unknown'}`,
     `Requests: ${n(totals.requests)} since start, ${n(totals.errors)} failed`,
     `In flight: ${n(live.in_flight)} requests, ${n(live.active_streams)} streams, ${n(live.ws_connections)} WebSockets`,

@@ -3,7 +3,7 @@
 
 import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { Button, Notice, Panel, SecretInput } from '../../components/index.js';
-import { NumberRow, Rows, SettingRow, SettingsForm, SwitchRow, TextRow, expectSecret, fieldId, useEdits, useSettingsSave } from './common.js';
+import { NumberRow, Rows, SettingRow, SettingsForm, SwitchRow, TextRow, expectSecret, fieldId, forgetSecret, isSecretReference, useEdits, useSettingsSave } from './common.js';
 
 /** 32 URL-safe characters from the browser's random source. */
 function generateSecret() {
@@ -13,7 +13,7 @@ function generateSecret() {
   return btoa(text).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
 }
 
-export function GeneralTab({ config, status }) {
+export function GeneralTab({ config, status, onDiskInvalid }) {
   const live = config.data.config;
   // The edited subset. An unset [server.tls] reads as two empty fields, and
   // the secret field starts empty: the gateway only ever sends its mask.
@@ -32,23 +32,19 @@ export function GeneralTab({ config, status }) {
   const cert = String(form.value('server.tls.cert') ?? '').trim();
   const key = String(form.value('server.tls.key') ?? '').trim();
   const newSecret = form.value('admin.secret') ?? '';
+  // "env:NAME" or "${NAME}": the gateway reads the secret from its own environment.
+  const secretIsReference = isSecretReference(newSecret);
 
   const saver = useSettingsSave({
     form,
     config,
     name: 'General',
+    onDiskInvalid,
     check: () => {
       const problems = [];
-      // The gateway takes an empty host or data directory as given and then
-      // cannot start with it.
-      if (form.changed('server.host') && !String(form.value('server.host') ?? '').trim()) {
-        problems.push({ path: 'server.host', message: 'Enter the address to bind, for example 127.0.0.1.' });
-      }
-      if (form.changed('server.data_dir') && !String(form.value('server.data_dir') ?? '').trim()) {
-        problems.push({ path: 'server.data_dir', message: 'Enter a folder, for example data.' });
-      }
       if (cert && !key) problems.push({ path: 'server.tls.key', message: 'Enter the key file too, or clear the certificate to serve plain HTTP.' });
       if (key && !cert) problems.push({ path: 'server.tls.cert', message: 'Enter the certificate file too, or clear the key to serve plain HTTP.' });
+      // The gateway would take such a secret, and no browser could send it.
       if (/[\u0000-\u0008\u000a-\u001f\u007f]/.test(newSecret)) {
         problems.push({ path: 'admin.secret', message: 'The secret cannot contain line breaks or other control characters. Enter it as a single line.' });
       }
@@ -67,11 +63,18 @@ export function GeneralTab({ config, status }) {
       if (patch.admin?.allow_remote === true) lines.push('The dashboard and the admin API will accept sign-ins from other machines.');
       if (patch.admin?.allow_remote === false && viaRemote) lines.push('You are connected from another machine. This session is refused as soon as the change is saved.');
       if (patch.admin?.ui === false) lines.push('The dashboard stops being served. This page works until you reload it; after that, set admin.ui = true in switchyard.toml to get it back.');
-      if (patch.admin?.secret) lines.push('The admin secret changes at once. Other browsers and scripts must sign in again with the new secret.');
+      if (patch.admin?.secret && secretIsReference) {
+        lines.push("The admin secret becomes the value of that variable in the gateway's environment. This page cannot read it: this browser, like every other browser and script, has to sign in again with that value.");
+      } else if (patch.admin?.secret) {
+        lines.push('The admin secret changes at once. Other browsers and scripts must sign in again with the new secret.');
+      }
       return lines;
     },
     prepare: (patch) => {
+      // A reference cannot be followed from here: the session ends, and the
+      // sign-in page asks for the variable's value.
       if (!patch.admin?.secret) return null;
+      if (secretIsReference) return { done: forgetSecret };
       const change = expectSecret(patch.admin.secret);
       return {
         failed: change.cancel,
@@ -123,7 +126,7 @@ export function GeneralTab({ config, status }) {
             mono
             placeholder="cert.pem"
             error=${issues.at('server.tls.cert') ?? issues.at('server.tls')}
-            description="Serve HTTPS directly from this PEM certificate. Leave certificate and key empty to serve plain HTTP, for example behind a reverse proxy."
+            description=${`Serve HTTPS directly from this PEM certificate. Leave certificate and key empty to serve plain HTTP, for example behind a reverse proxy.${typeof status?.tls === 'boolean' ? ` The listener serves ${status.tls ? 'HTTPS' : 'plain HTTP'} now.` : ''}`}
           />
           <${TextRow} form=${form} issues=${issues} path="server.tls.key" label="TLS private key" restart mono placeholder="key.pem" description="The PEM private key that belongs to the certificate." />
           <${NumberRow} form=${form} issues=${issues} path="server.body_limit_mb" label="Request body limit" min=${1} unit="MB" description="The largest request body the client API accepts. Larger requests are answered with 413." />
@@ -171,7 +174,8 @@ export function GeneralTab({ config, status }) {
                 copy
                 placeholder="New secret"
                 error=${issues.at('admin.secret')}
-                hint=${newSecret ? (newSecret.length < 16 ? 'Short secrets are easy to guess. Use 16 characters or more.' : 'Copy it somewhere safe before saving. It is shown masked afterwards.') : 'Leave empty to keep the current secret.'}
+                warning=${newSecret && !secretIsReference && newSecret.length < 16 ? 'Short secrets are easy to guess. Use 16 characters or more.' : undefined}
+                hint=${!newSecret ? 'Leave empty to keep the current secret.' : secretIsReference ? 'A reference: the gateway reads the secret from that variable in its own environment.' : 'Copy it somewhere safe before saving. It is shown masked afterwards.'}
               />
               <div><${Button} size="sm" icon="refresh" onClick=${() => form.set('admin.secret')(generateSecret())}>Generate a secret<//></div>
             </div>
@@ -192,12 +196,11 @@ export function GeneralTab({ config, status }) {
         <//>`}
         ${form.changed('admin.secret') &&
         html`<${Notice} class="settings-inset" tone="info" title="Changing the secret">
-          The new secret takes effect the moment it is saved. This browser stays signed in; every other session and script has to use the new secret.
+          ${secretIsReference
+            ? "The variable's value becomes the secret the moment this is saved. Every session, this one included, has to sign in again with it."
+            : 'The new secret takes effect the moment it is saved. This browser stays signed in; every other session and script has to use the new secret.'}
         <//>`}
       <//>
     <//>
   `;
 }
-
-// ui/tests/check.mjs asks every module under pages/ for a default export.
-export default GeneralTab;

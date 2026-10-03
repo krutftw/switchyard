@@ -4,8 +4,9 @@
 //
 // Data: GET /status and GET /models (the models the examples may use), both
 // kept fresh by the config.reloaded live topic, by polling while the live
-// connection is down, and refetched after a reconnect; and the licence texts
-// the gateway serves next to the dashboard. Nothing on this page writes.
+// connection is down, and refetched when live frames may have been missed;
+// and the licence texts the gateway serves next to the dashboard. Nothing on
+// this page writes.
 //
 // URL state: ?section= (jump target), ?client= (tab in "Connect a client"),
 // ?model= (model in the examples), ?addr= (which base URL the examples use).
@@ -42,12 +43,12 @@ import {
 import { ApiError } from '../lib/api.js';
 import { useCommands } from '../lib/commands.js';
 import { copyText, loadStyles, prefersReducedMotion } from '../lib/dom.js';
-import { formatDateTime, formatDuration, formatNumber, formatTime, plural } from '../lib/format.js';
+import { formatDateTime, formatDuration, formatNumber, formatTime, plural, sentence } from '../lib/format.js';
 import { hotkeyLabel, useIsPhone, useLocalStorage, useNow, useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { href, routeStore, setQuery, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
-import endpointUrl, {
+import {
   ARROWS,
   CLIPROXY_URL,
   EFFORT_BUDGETS,
@@ -59,6 +60,7 @@ import endpointUrl, {
   REASONING_RULES,
   REPOSITORY_URL,
   SHORTCUTS,
+  endpointUrl,
 } from './about/reference.js';
 import {
   CLIENTS,
@@ -91,68 +93,61 @@ const SECTIONS = [
   { id: 'licence', label: 'Licence' },
 ];
 
-/** A message from the gateway as a sentence: capital first, full stop last. */
-function sentence(message) {
-  const text = String(message ?? '').trim();
-  if (!text) return 'The gateway did not give a reason.';
-  return text[0].toUpperCase() + text.slice(1) + (/[.!?]$/.test(text) ? '' : '.');
-}
+const sectionElement = (id) => document.getElementById(`about-${id}`);
 
 /**
  * Bring a section to the top. A jump the user asked for glides (unless they
  * turned motion off); arriving by a link does not: `instant` places the page.
  */
 function scrollToSection(id, instant = false) {
-  document.getElementById(`about-${id}`)?.scrollIntoView({ behavior: instant || prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
+  sectionElement(id)?.scrollIntoView({ behavior: instant || prefersReducedMotion() ? 'auto' : 'smooth', block: 'start' });
 }
-
-let stopHolding = null;
 
 /**
  * Move keyboard focus to a section (its panel takes focus, it is not a tab
- * stop), so the next Tab goes into the section and a screen reader names it.
- * Scrolling is left to scrollToSection.
- *
- * `hold`: a command run from the palette gets here before the palette has
- * handed focus back to where it was (it does so in an effect, a frame
- * later). For half a second, focus that lands outside the section without
- * the reader touching anything is taken back, once.
+ * stop), so the next Tab goes into the section and a screen reader names it
+ * (a panel is a region named by its title). Scrolling is left to
+ * scrollToSection.
  */
-function focusSection(id, { hold = false } = {}) {
-  const section = document.getElementById(`about-${id}`);
-  if (!section) return;
-  stopHolding?.();
-  section.focus({ preventScroll: true });
-  if (!hold) return;
-
-  const inputs = ['keydown', 'pointerdown'];
-  const stop = () => {
-    clearTimeout(timer);
-    document.removeEventListener('focusin', onFocusIn, true);
-    for (const name of inputs) window.removeEventListener(name, stop, true);
-    if (stopHolding === stop) stopHolding = null;
-  };
-  const onFocusIn = (event) => {
-    if (section.contains(event.target)) return;
-    stop();
-    section.focus({ preventScroll: true });
-  };
-  const timer = setTimeout(stop, 500);
-  document.addEventListener('focusin', onFocusIn, true);
-  for (const name of inputs) window.addEventListener(name, stop, true);
-  stopHolding = stop;
+function focusSection(id) {
+  sectionElement(id)?.focus({ preventScroll: true });
 }
 
 /**
  * Set ?section= (and whatever else) without a history entry, then go there:
- * the page scrolls and keyboard focus follows.
+ * the page scrolls and keyboard focus follows. Also right for a command run
+ * from the palette: by the time it runs, the palette has closed and handed
+ * the focus back, so the focus placed here stays.
  */
-function jumpTo(id, extra, focusOptions) {
+function jumpTo(id, extra) {
   setQuery({ ...extra, section: id });
   // The sections do not move when a query parameter changes, so there is
   // nothing to wait for.
   scrollToSection(id);
-  focusSection(id, focusOptions);
+  focusSection(id);
+}
+
+/**
+ * A "Try again" that works takes its error state, and so itself, off the
+ * page, which would leave the keyboard on <body>. This returns the handler
+ * for such a button: once it has been pressed and `failed` turns false,
+ * focus goes to what `target()` returns, unless the reader has put it
+ * somewhere else meanwhile.
+ */
+function useRetryFocus(failed, retry, target) {
+  const pressed = useRef(false);
+  const targetRef = useRef(target);
+  targetRef.current = target;
+  useEffect(() => {
+    if (failed || !pressed.current) return;
+    pressed.current = false;
+    const active = document.activeElement;
+    if (!active || active === document.body) targetRef.current()?.focus({ preventScroll: true });
+  }, [failed]);
+  return () => {
+    pressed.current = true;
+    return retry();
+  };
 }
 
 function SectionNav({ query }) {
@@ -192,7 +187,8 @@ function Uptime({ uptimeMs, at, startedAt }) {
 
 function GatewayPanel({ status, liveOpen }) {
   const data = status.data;
-  const failed = status.error && !data;
+  const failed = !!status.error && !data;
+  const retry = useRetryFocus(failed, status.refresh, () => sectionElement('gateway'));
   const blank = (width) => html`<${Skeleton} width=${width} />`;
   const warnings = data?.warnings ?? [];
 
@@ -233,7 +229,8 @@ function GatewayPanel({ status, liveOpen }) {
 
   return html`
     <${Panel}
-      id="about-gateway" tabindex="-1" aria-label="Gateway"
+      id="about-gateway"
+      tabindex="-1"
       class="about-section"
       title="Gateway"
       description="The process this dashboard is talking to."
@@ -245,7 +242,7 @@ function GatewayPanel({ status, liveOpen }) {
           `}
     >
       ${failed
-        ? html`<${ErrorState} compact title="Could not load the gateway status" error=${status.error} onRetry=${status.refresh} retrying=${status.loading} />`
+        ? html`<${ErrorState} compact title="Could not load the gateway status" error=${status.error} onRetry=${retry} retrying=${status.loading} />`
         : html`<div aria-busy=${data ? undefined : 'true'}><${KeyValue} items=${items} /></div>`}
     <//>
   `;
@@ -276,7 +273,8 @@ function DiagnosticsPanel({ status, textRef }) {
 
   return html`
     <${Panel}
-      id="about-diagnostics" tabindex="-1" aria-label="Diagnostics"
+      id="about-diagnostics"
+      tabindex="-1"
       class="about-section"
       title="Diagnostics"
       description="Paste this when you ask for help. It has no keys, paths or addresses."
@@ -327,11 +325,15 @@ function ConnectPanel({ status, models }) {
   const shell = SHELLS.some((s) => s.value === shellPref) ? shellPref : guessShell();
 
   const listen = status.data?.listen;
-  const choices = useMemo(() => addressChoices(listen, document.baseURI), [listen]);
+  // GET /status says whether the listener serves HTTPS: the scheme in front
+  // of the listen address is a fact, not a guess.
+  const tls = status.data?.tls === true;
+  const choices = useMemo(() => addressChoices(listen, document.baseURI, { tls }), [listen, tls]);
   const address = choices.find((choice) => choice.id === addrParam) ?? choices[0];
   const bound = parseListen(listen);
 
-  // The picker offers what a client can call: listed names with a route. A
+  // The picker offers what a client can call: listed names the gateway can
+  // route (an alias without a routable target is `ignored` and left out). A
   // name whose credentials all rest is kept, and says so.
   const picks = useMemo(
     () =>
@@ -362,27 +364,17 @@ function ConnectPanel({ status, models }) {
 
   const snippets = useMemo(() => clientSnippets(client, { base: address.base, model, shell }), [client, address.base, model, shell]);
   const authRequired = status.data?.auth_required;
-
-  // On a narrow screen the tab strip scrolls sideways. Bring the selected tab
-  // into it (a link or the palette may have picked one that is off the edge)
-  // by moving the strip itself: scrollIntoView would move the page as well.
-  const tabsHost = useRef(null);
-  useEffect(() => {
-    const strip = tabsHost.current?.querySelector('[role="tablist"]');
-    const tab = strip?.querySelector('[aria-selected="true"]');
-    if (!strip || !tab) return;
-    const left = tab.offsetLeft - strip.offsetLeft;
-    if (left < strip.scrollLeft) strip.scrollLeft = left;
-    else if (left + tab.offsetWidth > strip.scrollLeft + strip.clientWidth) strip.scrollLeft = left + tab.offsetWidth - strip.clientWidth;
-  }, [client]);
+  // "Try again" under the controls goes away once the list has loaded: the
+  // picker took its place (or, with no model to pick, the panel).
+  const retryModels = useRetryFocus(!!models.error && !models.data, models.refresh, () => document.getElementById('about-model') ?? sectionElement('connect'));
 
   return html`
-    <${Panel} id="about-connect" tabindex="-1" aria-label="Connect a client" class="about-section" title="Connect a client" description="Point a client at the gateway and give it a client key. The snippets use this gateway’s address.">
+    <${Panel} id="about-connect" tabindex="-1" class="about-section" title="Connect a client" description="Point a client at the gateway and give it a client key. The snippets use this gateway’s address.">
       <div class="stack">
         <div class="about-controls">
           ${choices.length > 1 &&
           html`
-            <${Field} label="Address" hint=${address.id === 'listen' ? 'What a client on the gateway’s own machine uses. Plain HTTP is assumed.' : 'How this browser reaches the gateway.'}>
+            <${Field} label="Address" hint=${address.id === 'listen' ? `What a client on the gateway’s own machine uses. The gateway serves ${tls ? 'HTTPS' : 'plain HTTP'} there.` : 'How this browser reaches the gateway.'}>
               <${Segmented} label="Address in the snippets" size="sm" value=${address.id} onChange=${setAddr} options=${choices.map((choice) => ({ value: choice.id, label: choice.label }))} />
             <//>
           `}
@@ -398,7 +390,7 @@ function ConnectPanel({ status, models }) {
 
         ${bound?.wildcard &&
         html`<p class="about-aside">The gateway listens on every interface (<span class="mono">${listen}</span>). From another machine, replace the host in the snippets with this machine’s name or address.</p>`}
-        ${models.error && !models.data && html`<p class="about-aside">The model list did not load, so the examples use the placeholder <span class="mono">${MODEL_PLACEHOLDER}</span>. <button type="button" class="about-link" onClick=${models.refresh}>Try again</button></p>`}
+        ${models.error && !models.data && html`<p class="about-aside">The model list did not load, so the examples use the placeholder <span class="mono">${MODEL_PLACEHOLDER}</span>. <button type="button" class="about-link" onClick=${retryModels}>Try again</button></p>`}
         ${noModels &&
         html`
           <${Notice} tone="caution" title="No models to call yet" action=${html`<${Button} size="sm" href=${href('/providers')}>Open providers<//>`}>
@@ -412,7 +404,7 @@ function ConnectPanel({ status, models }) {
           <//>
         `}
 
-        <div ref=${tabsHost}><${Tabs} label="Client" value=${client} onChange=${setClient} tabs=${CLIENTS} /></div>
+        <${Tabs} label="Client" value=${client} onChange=${setClient} tabs=${CLIENTS} />
 
         <div class="stack" role="tabpanel" aria-label=${CLIENTS.find((c) => c.id === client).label} style="--gap:var(--space-3)">
           <p class="about-lead">${snippets.lead}</p>
@@ -478,7 +470,8 @@ function EndpointsPanel({ base }) {
 
   return html`
     <${Panel}
-      id="about-endpoints" tabindex="-1" aria-label="Client API endpoints"
+      id="about-endpoints"
+      tabindex="-1"
       class="about-section about-endpoints"
       title="Client API endpoints"
       description="Everything a client can call. The copy button gives the full URL on this gateway."
@@ -542,7 +535,8 @@ function SuffixRow({ row }) {
 function ReasoningPanel() {
   return html`
     <${Panel}
-      id="about-reasoning" tabindex="-1" aria-label="Reasoning suffix"
+      id="about-reasoning"
+      tabindex="-1"
       class="about-section about-reasoning"
       title="Reasoning suffix"
       description="Add a suffix to any model name to set how hard the model thinks. The gateway writes it in the form the serving provider understands."
@@ -582,7 +576,7 @@ function ReasoningPanel() {
 function KeyCap({ name }) {
   const arrow = ARROWS[name];
   if (arrow) {
-    return html`<${Kbd}><${Icon} name=${arrow.icon} size=${10} class=${arrow.flip ? 'about-flip' : undefined} /><span class="sr-only">${arrow.label}</span><//>`;
+    return html`<${Kbd}><${Icon} name=${arrow.icon} size=${10} /><span class="sr-only">${arrow.label}</span><//>`;
   }
   return html`<${Kbd}>${hotkeyLabel(name)}<//>`;
 }
@@ -603,7 +597,7 @@ function ShortcutKeys({ keys }) {
 function ShortcutsPanel() {
   const isPhone = useIsPhone();
   return html`
-    <${Panel} id="about-shortcuts" tabindex="-1" aria-label="Keyboard shortcuts" class="about-section" title="Keyboard shortcuts" description="Everything in the dashboard works from the keyboard.">
+    <${Panel} id="about-shortcuts" tabindex="-1" class="about-section" title="Keyboard shortcuts" description="Everything in the dashboard works from the keyboard.">
       <div class="about-shortcuts">
         ${SHORTCUTS.map((group) => {
           const items = group.items.filter((item) => !(item.desktop && isPhone));
@@ -688,9 +682,19 @@ function Disclosure({ title, hint, onOpen, children }) {
 }
 
 function LicenceText({ resource, path }) {
-  if (resource.data != null) return html`<${CodeBlock} language="text" title=${path} value=${resource.data} maxHeight="320px" />`;
-  if (resource.error) return html`<${ErrorState} compact title="Could not load the licence text" error=${resource.error} onRetry=${resource.refresh} retrying=${resource.loading} />`;
-  return html`<div class="about-code-skel" aria-busy="true" aria-label="Loading the licence text"><${Skeleton} lines=${6} /></div>`;
+  const host = useRef(null);
+  // When a retry works the text replaces the error state: the keyboard goes
+  // to the heading of the disclosure it is in.
+  const retry = useRetryFocus(!!resource.error && resource.data == null, resource.refresh, () => host.current?.closest('details')?.querySelector('summary'));
+  return html`
+    <div ref=${host}>
+      ${resource.data != null
+        ? html`<${CodeBlock} language="text" title=${path} value=${resource.data} maxHeight="320px" />`
+        : resource.error
+          ? html`<${ErrorState} compact title="Could not load the licence text" error=${resource.error} onRetry=${retry} retrying=${resource.loading} />`
+          : html`<div class="about-code-skel" aria-busy="true" aria-label="Loading the licence text"><${Skeleton} lines=${6} /></div>`}
+    </div>
+  `;
 }
 
 /** A licence file fetched the first time its disclosure is opened. */
@@ -711,7 +715,7 @@ function LicencePanel() {
   const bundled = useMemo(() => parseLicenceSections(vendor.data), [vendor.data]);
 
   return html`
-    <${Panel} id="about-licence" tabindex="-1" aria-label="Licence and acknowledgements" class="about-section" title="Licence and acknowledgements">
+    <${Panel} id="about-licence" tabindex="-1" class="about-section" title="Licence and acknowledgements">
       <div class="stack">
         <div class="stack about-prose" style="--gap:var(--space-2)">
           <p>Switchyard is free software under the <strong>MIT licence</strong>. The source, the issue tracker and the releases are at <a href=${REPOSITORY_URL} target="_blank" rel="noopener noreferrer">github.com/krutftw/switchyard</a>.</p>
@@ -758,8 +762,7 @@ function LicencePanel() {
 // ---------------------------------------------------------------------------
 
 export default function About({ route }) {
-  const live = useStore(liveState, (s) => ({ status: s.status, since: s.since }));
-  const liveOpen = live.status === 'open';
+  const liveOpen = useStore(liveState, (s) => s.status === 'open');
 
   // With the live connection up, config.reloaded says when to look again and
   // a slow poll catches the rest (a credential that starts or stops resting
@@ -768,25 +771,15 @@ export default function About({ route }) {
   const status = useResource('/status', { pollMs });
   const models = useResource('/models', { pollMs });
 
-  useLive('config.reloaded', () => {
+  const reload = () => {
     status.refresh();
     models.refresh();
-  });
-
-  // Frames sent while the connection was down are gone: look again once it
-  // is back.
-  const openedAt = liveOpen ? live.since : null;
-  const firstOpen = useRef(true);
-  useEffect(() => {
-    if (openedAt == null) return;
-    if (firstOpen.current) {
-      firstOpen.current = false;
-      return;
-    }
-    status.refresh();
-    models.refresh();
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [openedAt]);
+  };
+  // Applied or refused, the frame says the configuration (or the file) moved.
+  useLive('config.reloaded', reload);
+  // Frames sent while the connection was down, or dropped for a connection
+  // that fell behind, are gone: look again.
+  useLiveGap(reload);
 
   // A link to a section (#/about?section=connect) lands on it: once when the
   // page appears, and once more each time the first answer of a request
@@ -842,7 +835,7 @@ export default function About({ route }) {
         group: 'About',
         icon: 'plug',
         keywords: 'base url environment variable setup sdk snippet curl example',
-        run: () => jumpTo('connect', { client: client.id === CLIENTS[0].id ? null : client.id }, { hold: true }),
+        run: () => jumpTo('connect', { client: client.id === CLIENTS[0].id ? null : client.id }),
       })),
     ],
     [],
@@ -851,16 +844,19 @@ export default function About({ route }) {
   const data = status.data;
   const restart = data?.restart_required ?? [];
   const base = useMemo(() => addressChoices(null, document.baseURI)[0].base, []);
+  // The notice about a failed refresh goes away, with its button, when the
+  // next one works: the keyboard goes to the panel the answer is shown in.
+  const stale = !!status.error && !!data;
+  const retryStatus = useRetryFocus(stale, status.refresh, () => sectionElement('gateway'));
 
   return html`
     <${Page} title="About" description="What is running, how to point a client at it, and what the gateway accepts." class="about">
       <${SectionNav} query=${route.query} />
 
-      ${status.error &&
-      data &&
+      ${stale &&
       html`
-        <${Notice} tone="caution" title="Could not refresh the gateway status" action=${html`<${Button} size="sm" icon="refresh" loading=${status.refreshing} onClick=${status.refresh}>Try again<//>`}>
-          ${sentence(status.error.message)} Showing what was loaded at ${formatTime(status.updatedAt)}.
+        <${Notice} tone="caution" title="Could not refresh the gateway status" action=${html`<${Button} size="sm" icon="refresh" loading=${status.refreshing} onClick=${retryStatus}>Try again<//>`}>
+          ${sentence(status.error.message) || 'The gateway did not give a reason.'} Showing what was loaded at ${formatTime(status.updatedAt)}.
         <//>
       `}
       ${restart.length > 0 &&

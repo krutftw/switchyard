@@ -9,13 +9,14 @@
 //     off, arrivals wait in a queue and are only counted ("12 new requests");
 //   - request.started frames are kept as the set of requests in flight;
 //   - without a live connection the newest page is polled instead;
-//   - after a reconnect, or when the gateway says frames were dropped, the
-//     newest page is fetched again, because frames in between are gone.
+//   - after a reconnect, or when the gateway says frames were dropped
+//     (useLiveGap), the newest page is fetched again, because frames in
+//     between are gone.
 
 import { useCallback, useEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { api } from '../../lib/api.js';
 import { useInterval } from '../../lib/hooks.js';
-import { liveState, useLive } from '../../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../../lib/live.js';
 import { useStore } from '../../lib/store.js';
 import matchesFilters, { cursorOf, mergeRecords } from './record.js';
 
@@ -40,6 +41,9 @@ const NO_KEYS = new Set();
 const BLANK = {
   rows: [],
   total: null,
+  // How many finished requests the gateway keeps in memory; the list, and
+  // `total`, cannot go beyond it. Known once a page has loaded.
+  capacity: null,
   cursor: null,
   hasMore: false,
   loading: true,
@@ -149,7 +153,7 @@ export default function useRequestLog(filters, { live, atTop }) {
   const applyHead = (page, reveal) => {
     for (const item of page.items) inFlight.current.delete(item.id);
     commit((s) => {
-      const base = { total: page.total, error: null, loading: false, refreshing: false, updatedAt: Date.now(), inFlight: inFlightList() };
+      const base = { total: page.total, capacity: page.capacity ?? s.capacity, error: null, loading: false, refreshing: false, updatedAt: Date.now(), inFlight: inFlightList() };
       const listed = new Set(s.rows.map((r) => r.id));
       const unseen = page.items.filter((r) => !listed.has(r.id));
       // Requests that finished while this page was on its way are newer than
@@ -231,12 +235,13 @@ export default function useRequestLog(filters, { live, atTop }) {
     pending.current = [];
     incoming.current = [];
     freshAt.current.clear();
-    commit({ ...BLANK, inFlight: inFlightList() });
+    // (The capacity is the gateway's, not the filters': it stays.)
+    commit({ ...BLANK, capacity: current.current.capacity, inFlight: inFlightList() });
     api.get('/requests', { query: query({ limit: FIRST_PAGE }), signal: controller.signal }).then(
       (page) => {
         if (mine !== generation.current) return;
         for (const item of page.items) inFlight.current.delete(item.id);
-        commit({ rows: page.items, total: page.total, cursor: page.next_before, hasMore: page.has_more, loading: false, error: null, updatedAt: Date.now(), inFlight: inFlightList() });
+        commit({ rows: page.items, total: page.total, capacity: page.capacity ?? null, cursor: page.next_before, hasMore: page.has_more, loading: false, error: null, updatedAt: Date.now(), inFlight: inFlightList() });
       },
       (error) => {
         if (mine !== generation.current || error.aborted) return;
@@ -334,9 +339,10 @@ export default function useRequestLog(filters, { live, atTop }) {
     schedule();
   });
 
-  // The gateway dropped frames for this connection: the list has holes, and
-  // a request whose end was dropped would look in flight for ever.
-  useLive('lagged', () => {
+  // Frames may be missing: the gateway dropped some for this connection, or
+  // the connection was down for a while. The list has holes then, and a
+  // request whose end was missed would look in flight for ever.
+  useLiveGap(() => {
     inFlight.current.clear();
     refresh();
   });
@@ -387,18 +393,6 @@ export default function useRequestLog(filters, { live, atTop }) {
     },
     live && !connected ? POLL_MS : null,
   );
-
-  // A new connection knows nothing of what happened while there was none.
-  const sawConnection = useRef(false);
-  useEffect(() => {
-    if (!connected) return;
-    if (!sawConnection.current) {
-      sawConnection.current = true;
-      return;
-    }
-    inFlight.current.clear();
-    refresh();
-  }, [connected, refresh]);
 
   useEffect(
     () => () => {

@@ -18,7 +18,7 @@ import { useCommands } from '../lib/commands.js';
 import { loadStyles } from '../lib/dom.js';
 import { formatTime } from '../lib/format.js';
 import { useResource } from '../lib/hooks.js';
-import { liveState, useLive } from '../lib/live.js';
+import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { navigate, routeStore, setQuery, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import AliasesTab, { useAliasDraft } from './models/aliases.js';
@@ -43,8 +43,8 @@ export default function Models() {
   // Live events say when credentials or the configuration change. Cooldowns
   // also end on their own, without an event, so the table is polled as well:
   // slowly while the live connection is up, faster while it is down.
-  const live = useStore(liveState, (s) => ({ status: s.status, since: s.since }));
-  const pollMs = live.status === 'open' ? 30_000 : 10_000;
+  const liveStatus = useStore(liveState, (s) => s.status);
+  const pollMs = liveStatus === 'open' ? 30_000 : 10_000;
 
   const models = useResource('/models', { pollMs });
   const providers = useResource('/providers', { pollMs });
@@ -68,17 +68,20 @@ export default function Models() {
   useLive('credential', refreshRouting);
   useLive('config.reloaded', refreshAll);
 
-  // Frames sent while the connection was down are gone: catch up when it returns.
-  const mounted = useRef(false);
+  // Frames sent while the connection was down, or dropped for a connection
+  // that fell behind, are gone: catch up.
+  useLiveGap(refreshAll);
+
+  // A model list that is still being fetched ends without an event: while a
+  // provider's discovery is pending the providers and the table are read
+  // again every few seconds, so its models appear when the answer does.
+  const discovering = (providers.data ?? []).some((p) => p.enabled !== false && p.discovery?.state === 'pending');
   useEffect(() => {
-    // Not on mount: the first load is already on its way.
-    if (!mounted.current) {
-      mounted.current = true;
-      return;
-    }
-    if (live.status === 'open') refreshAll();
+    if (!discovering) return undefined;
+    const timer = setTimeout(refreshRouting, 3000);
+    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [live.status, live.since]);
+  }, [discovering, providers.data]);
 
   // Refetch just after the next cooldown ends, so "back in 3s" turns green
   // on time instead of at the next poll.
@@ -111,16 +114,17 @@ export default function Models() {
     for (const row of rows ?? []) {
       if (!row.isAlias) names.add(row.name.toLowerCase());
       // An alias that pins a depth on the model of its own name stands in front of that model.
-      else if (pinsOwnModel(row, rowsByName)) names.add(row.name.toLowerCase());
+      else if (pinsOwnModel(row)) names.add(row.name.toLowerCase());
     }
-    // A model that a saved alias already hides is in neither list any more;
-    // the gateway only says so in a warning sentence of GET /status.
+    // A discovered model that a saved alias replaces is in neither list any
+    // more, and no field of GET /models or GET /providers names it: the
+    // gateway only says so in a warning sentence of GET /status.
     for (const warning of status.data?.warnings ?? []) {
       const hit = /^alias `([^`]+)` hides the model of the same name/.exec(String(warning));
       if (hit) names.add(hit[1].toLowerCase());
     }
     return names;
-  }, [providers.data, rows, rowsByName, status.data]);
+  }, [providers.data, rows, status.data]);
 
   // Which upstream model ids are routed to, and by which providers (for the catalog).
   const served = useMemo(() => {

@@ -147,6 +147,7 @@ export default function CatalogTab({ catalog, loading, error, onRetry, served })
         onSort=${(next) => setQuery({ csort: !next || (next.key === DEFAULT_SORT.key && next.dir === DEFAULT_SORT.dir) ? null : `${next.key}:${next.dir}` })}
         loading=${loading}
         error=${error}
+        errorTitle="Could not load the catalog"
         onRetry=${onRetry}
         empty=${filtering
           ? {

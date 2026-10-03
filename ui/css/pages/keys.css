@@ -115,11 +115,6 @@
   color: var(--text-3);
 }
 
-/* A rate limit of 0 lets nothing through. */
-.keys-caution {
-  color: var(--caution-ink);
-}
-
 /* Two figures in one cell: the second, smaller, under the first. Used when
    the window has no room for a column each (failed under requests, tokens
    under cost, the rate limit under the model patterns). */

@@ -3,8 +3,9 @@
 //
 // The gateway stores aliases as one list and replaces it as a whole, so the
 // editor works on a draft of the list: edit any number of aliases, then save
-// once. Validation issues of a refused save (422, paths such as
-// "aliases[2].targets") are put back on the row and field they belong to.
+// once. The gateway validates the list; the issues of a refused save (422,
+// with paths into the list that was sent: "[2].name", "[2].targets",
+// "[2].targets[1]") are put back on the row and field they belong to.
 // Deleting a saved alias is the one change that is applied at once, after a
 // confirmation that names it.
 //
@@ -14,7 +15,8 @@
 // delete removes its one alias from the list as it is at that moment.
 //
 // The draft lives in a module-level store, so it survives a visit to another
-// tab or page (the router has no "leave?" guard to hold the user here).
+// tab or page: nothing is lost by moving around the dashboard, and nobody is
+// asked. Only closing or reloading the window would lose it, and that asks.
 
 import { html, useCallback, useEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
 import {
@@ -37,8 +39,9 @@ import {
   useIssues,
 } from '../../components/index.js';
 import { api } from '../../lib/api.js';
-import { plural } from '../../lib/format.js';
+import { plural, sentence } from '../../lib/format.js';
 import { useAsync } from '../../lib/hooks.js';
+import { registerLeaveGuard } from '../../lib/router.js';
 import { createStore, useStore } from '../../lib/store.js';
 import Combobox from './combobox.js';
 import { aliasWarnings, draftFromServer, draftToBody, lookup, newAlias, newTarget, parseSuffix, sameAliases, suffixChoices } from './logic.js';
@@ -57,21 +60,20 @@ const patchRow = (key, patch) => updateRows((rows) => rows.map((row) => (row.key
 
 const isDirty = ({ rows, base }) => !!rows && !!base && !sameAliases(draftToBody(rows), base);
 
-// Closing or reloading the window with unsaved edits asks first. The guard
-// lives with the draft, not with the tab that shows it: the draft outlives
-// the Aliases tab and the Models page, and so does the risk of losing it.
-// (Moving around inside the dashboard keeps the draft: see the header note.)
-const warnBeforeUnload = (event) => {
-  event.preventDefault();
-  event.returnValue = '';
-};
-let guarding = false;
+// Closing or reloading the window with unsaved edits asks first: a leave
+// guard of the router that lets every route change pass (the draft survives
+// those) and only makes the browser ask on unload. It lives with the draft,
+// not with the tab that shows it: the draft outlives the Aliases tab and the
+// Models page, and so does the risk of losing it.
+let unguard = null;
 draftStore.subscribe((state) => {
   const dirty = isDirty(state);
-  if (dirty === guarding || typeof window === 'undefined') return;
-  guarding = dirty;
-  if (dirty) window.addEventListener('beforeunload', warnBeforeUnload);
-  else window.removeEventListener('beforeunload', warnBeforeUnload);
+  if (dirty === (unguard !== null) || typeof window === 'undefined') return;
+  if (dirty) unguard = registerLeaveGuard(() => true, { unload: true });
+  else {
+    unguard();
+    unguard = null;
+  }
 });
 
 /**
@@ -128,13 +130,14 @@ function deleteConsequences(alias, { saved, rowsByName, realNames, ready }) {
   const lower = name.toLowerCase();
   const targets = (alias.targets ?? []).map((t) => String(t).trim()).filter(Boolean);
   const own = rowsByName.get(name);
-  const routes = own?.isAlias ? own.routes.length : null;
+  // The gateway's own word for an alias none of whose targets routes (GET /models).
+  const ignored = !!own?.isAlias && own.ignored;
   const matched = (target) => {
     const entry = lookup(rowsByName, parseSuffix(target).base) ?? lookup(rowsByName, target);
     return entry && entry.name.toLowerCase() !== lower && entry.routes.length > 0 ? entry.name : null;
   };
   const out = [];
-  if (routes === 0) {
+  if (ignored) {
     out.push(`Nothing changes for clients: none of its targets matches a model, so the gateway already ignores ${name}.`);
   } else if (realNames.has(lower)) {
     out.push(
@@ -154,7 +157,7 @@ function deleteConsequences(alias, { saved, rowsByName, realNames, ready }) {
         .flatMap((other) => (other.targets ?? []).map(matched))
         .filter(Boolean),
     );
-    const relisted = alias.hide_targets && routes !== 0 && reachable.every((target) => !hiddenElsewhere.has(target));
+    const relisted = alias.hide_targets && !ignored && reachable.every((target) => !hiddenElsewhere.has(target));
     const one = reachable.length === 1;
     out.push(`${listOf(reachable)} ${one ? 'stays' : 'stay'} reachable under ${one ? 'its' : 'their'} own name${one ? '' : 's'}${relisted ? ` and ${one ? 'shows' : 'show'} up in client model lists again` : ''}.`);
   }
@@ -165,41 +168,12 @@ function deleteConsequences(alias, { saved, rowsByName, realNames, ready }) {
 // Pieces
 // ---------------------------------------------------------------------------
 
-/** Six dots: the drag handle. The shared icon set has none (reported as a gap). */
-function GripIcon() {
-  return html`
-    <svg class="icon" width="16" height="16" viewBox="0 0 24 24" fill="currentColor" stroke="none" aria-hidden="true" focusable="false">
-      <circle cx="9" cy="6" r="1.5" /><circle cx="15" cy="6" r="1.5" />
-      <circle cx="9" cy="12" r="1.5" /><circle cx="15" cy="12" r="1.5" />
-      <circle cx="9" cy="18" r="1.5" /><circle cx="15" cy="18" r="1.5" />
-    </svg>
-  `;
-}
-
-/** A caution line under a field: something the gateway accepts but the operator should know. */
-function Warning({ children }) {
-  return html`<p class="models-warn"><${Icon} name="alert" size=${14} /><span>${children}</span></p>`;
-}
-
-/** The gateway words issues as fragments ("must not be empty"); under a field they read as sentences. */
-const sentence = (text) => {
-  const t = String(text ?? '').trim();
-  if (!t) return t;
-  return `${t[0].toUpperCase()}${t.slice(1)}${/[.!?]$/.test(t) ? '' : '.'}`;
-};
-
 const SUFFIX_HINT = { none: 'reasoning off', auto: 'provider picks the depth' };
 
 function TargetRow({ row, target, index, count, options, more, error, warning, drop, dragging, handlers }) {
   const name = target.value.trim() || `target ${index + 1}`;
   return html`
-    <li
-      class="models-target"
-      data-drop=${drop?.id === target.id ? drop.pos : undefined}
-      data-dragging=${dragging === target.id ? '' : undefined}
-      onDragOver=${(event) => handlers.dragOver(event, row.key, target.id)}
-      onDrop=${(event) => handlers.drop(event, row.key, target.id)}
-    >
+    <li class="models-target" data-target=${target.id} data-drop=${drop?.id === target.id ? drop.pos : undefined} data-dragging=${dragging === target.id ? '' : undefined}>
       <span
         class="models-target-grip"
         draggable="true"
@@ -208,7 +182,7 @@ function TargetRow({ row, target, index, count, options, more, error, warning, d
         onDragStart=${(event) => handlers.dragStart(event, row.key, target)}
         onDragEnd=${handlers.dragEnd}
       >
-        <${GripIcon} />
+        <${Icon} name="grip" />
       </span>
       <span class="models-target-order num" aria-hidden="true">${index + 1}</span>
       <div class="models-target-field">
@@ -218,11 +192,11 @@ function TargetRow({ row, target, index, count, options, more, error, warning, d
           options=${options}
           more=${more}
           error=${error}
+          warning=${warning}
           label=${`Target ${index + 1} of ${row.name.trim() || 'the new alias'}`}
           placeholder=${index === 0 ? 'Model name, such as gpt-5 or gpt-5(high)' : 'Next model to try'}
           data-focus=${`target-${target.id}`}
         />
-        ${!error && warning && html`<${Warning}>${warning}<//>`}
       </div>
       <span class="models-target-actions">
         <${IconButton} icon="arrow-up" size="sm" label=${`Move ${name} up`} disabled=${index === 0} data-focus=${`up-${target.id}`} onClick=${() => handlers.move(row.key, target.id, -1)} />
@@ -260,20 +234,18 @@ function AliasBlock({ row, savedAlias, modelRow, modelsState, warnings, issues, 
       </div>
       <div class="models-alias-body">
         <div class="models-alias-main">
-          <div class="stack" style="--gap:var(--space-1h)">
-            <${Input}
-              label="Name"
-              mono
-              value=${row.name}
-              onChange=${(value) => handlers.setName(row.key, value)}
-              error=${issues?.name}
-              placeholder="smart"
-              hint=${issues?.name || warnings.name ? undefined : 'What clients put in the model field.'}
-              autocomplete="off"
-              data-focus=${`name-${row.key}`}
-            />
-            ${!issues?.name && warnings.name && html`<${Warning}>${warnings.name}<//>`}
-          </div>
+          <${Input}
+            label="Name"
+            mono
+            value=${row.name}
+            onChange=${(value) => handlers.setName(row.key, value)}
+            error=${issues?.name}
+            warning=${warnings.name}
+            placeholder="smart"
+            hint="What clients put in the model field."
+            autocomplete="off"
+            data-focus=${`name-${row.key}`}
+          />
           <${Switch}
             label="Hide targets"
             hint="Leave the targets' own names out of the model lists clients fetch. Requests that name them still work."
@@ -283,7 +255,13 @@ function AliasBlock({ row, savedAlias, modelRow, modelsState, warnings, issues, 
         </div>
         <div class="models-alias-targets">
           <div class="field-label"><span>Targets</span><span class="field-optional">tried in this order</span></div>
-          <ol class="models-target-list">
+          <ol
+            class="models-target-list"
+            onDragEnter=${(event) => handlers.dragOver(event, row.key)}
+            onDragOver=${(event) => handlers.dragOver(event, row.key)}
+            onDragLeave=${handlers.dragLeave}
+            onDrop=${(event) => handlers.drop(event, row.key)}
+          >
             ${row.targets.map(
               (target, index) => html`
                 <${TargetRow}
@@ -357,26 +335,27 @@ export default function AliasesTab({ saved, loading, error, onRetry, draft, mode
   });
   const issues = useIssues(save.error);
 
-  // Issues are addressed by position in what was sent; rows may have moved
-  // or gone since, so they are handed out by row key and target id.
+  // The gateway addresses an issue by its place in the list that was sent
+  // ("[2].name", "[2].targets", "[2].targets[1]"; useIssues reads them as
+  // "2.name", "2.targets.1"). Rows may have moved or gone since, so the
+  // messages are handed out by row key and target id. Only a refusal of the
+  // list itself is mapped: the issues of a 409 are about the configuration
+  // file on disk, not about this list, and stay in the form's error notice.
   const rowIssues = new Map();
-  if (save.error) {
+  if (save.error && save.error.status !== 409) {
     sent.current.forEach((entry, i) => {
-      const prefix = `aliases.${i}`;
-      const nameIssue = issues.at(`${prefix}.name`);
+      const nameIssue = issues.at(`${i}.name`);
       const out = { name: nameIssue ? sentence(nameIssue) : undefined, targets: new Map(), targetList: undefined, other: [] };
       const list = [];
-      for (const issue of issues.under(prefix)) {
-        if (issue.path === `${prefix}.name`) continue;
+      for (const issue of issues.under(String(i))) {
+        if (issue.path === `${i}.name`) continue;
         const message = sentence(issue.message);
-        if (issue.path === `${prefix}.targets`) {
-          // "an alias cannot target itself" names the list, not the target: put it on the targets it is about.
-          const row = /target itself/i.test(issue.message) ? (rows ?? []).find((r) => r.key === entry.key) : null;
-          const own = row ? row.targets.filter((t) => entry.targetIds.includes(t.id) && t.value.trim().toLowerCase() === row.name.trim().toLowerCase()) : [];
-          if (own.length > 0) for (const t of own) out.targets.set(t.id, message);
-          else list.push(message);
-        } else if (issue.path.startsWith(`${prefix}.targets.`)) {
-          const id = entry.targetIds[Number(issue.path.slice(prefix.length + '.targets.'.length).split('.')[0])];
+        if (issue.path === `${i}.targets`) {
+          // The list as a whole: it is empty.
+          list.push(message);
+        } else if (issue.path.startsWith(`${i}.targets.`)) {
+          // One target, by its place among the targets that were sent (blank rows are not).
+          const id = entry.targetIds[Number(issue.path.slice(`${i}.targets.`.length).split('.')[0])];
           if (id) out.targets.set(id, [out.targets.get(id), message].filter(Boolean).join(' '));
           else list.push(message);
         } else out.other.push(message);
@@ -387,25 +366,23 @@ export default function AliasesTab({ saved, loading, error, onRetry, draft, mode
   }
 
   // Focus follows what the user just did (a new row, a moved row, a row that
-  // is gone). Once more a frame later: a confirm dialog that is closing
-  // hands focus back to the button that opened it, which may be the one
-  // that was just removed or disabled.
+  // is gone). Placing it once is enough: a confirm dialog that is closing
+  // leaves a focus the page has placed where it is. But it has to be placed
+  // by the render that shows the change. An effect still owed from the
+  // render before it is run just ahead of the next one, with the old rows
+  // on screen: it would take the request and focus something that is about
+  // to go (the "Add alias" of a list whose last alias was just deleted).
   useEffect(() => {
     const selectors = focusNext.current;
-    if (!selectors) return;
+    if (!selectors || rows !== draftStore.get().rows) return;
     focusNext.current = null;
-    const apply = () => {
-      for (const selector of selectors) {
-        const el = document.querySelector(selector);
-        if (el && !el.disabled) {
-          if (document.activeElement !== el) el.focus();
-          break;
-        }
+    for (const selector of selectors) {
+      const el = document.querySelector(selector);
+      if (el && !el.disabled) {
+        if (document.activeElement !== el) el.focus();
+        break;
       }
-    };
-    apply();
-    // Not cancelled by the next render: the selectors only match this editor's own controls.
-    requestAnimationFrame(apply);
+    }
   });
 
   const baseOptions = useMemo(
@@ -488,29 +465,53 @@ export default function AliasesTab({ saved, loading, error, onRetry, draft, mode
       if (item && event.dataTransfer.setDragImage) event.dataTransfer.setDragImage(item, 16, item.offsetHeight / 2);
       setDragging(target.id);
     },
-    dragOver: (event, key, id) => {
+    // The three below are on the list, not on its rows: the whole list takes
+    // the drop, the gaps between rows included (the line that shows where
+    // the target will land is drawn in a gap, and that is where a hand lets
+    // go). Entering counts as much as moving over: a browser may ask only
+    // once before the drop.
+    dragOver: (event, key) => {
       // Targets are reordered within their alias, not moved between aliases.
       if (!drag.current || drag.current.key !== key) return;
       event.preventDefault();
       event.dataTransfer.dropEffect = 'move';
-      const rect = event.currentTarget.getBoundingClientRect();
-      const pos = event.clientY < rect.top + rect.height / 2 ? 'before' : 'after';
-      setDrop((prev) => (prev && prev.id === id && prev.pos === pos ? prev : { id, pos }));
+      // The row under the pointer; in a gap, the nearer of its two neighbours.
+      let place = null;
+      let nearest = Infinity;
+      for (const item of event.currentTarget.children) {
+        const rect = item.getBoundingClientRect();
+        const middle = rect.top + rect.height / 2;
+        const distance = Math.abs(event.clientY - middle);
+        if (distance < nearest) {
+          nearest = distance;
+          place = { id: item.getAttribute('data-target'), pos: event.clientY < middle ? 'before' : 'after' };
+        }
+      }
+      drag.current.place = place;
+      setDrop((prev) => (prev && place && prev.id === place.id && prev.pos === place.pos ? prev : place));
     },
-    drop: (event, key, id) => {
+    dragLeave: (event) => {
+      // Out of the list altogether (not from one row to the next): letting
+      // go there moves nothing, so no line says otherwise.
+      const rect = event.currentTarget.getBoundingClientRect();
+      if (event.clientX >= rect.left && event.clientX <= rect.right && event.clientY >= rect.top && event.clientY <= rect.bottom) return;
+      if (drag.current) drag.current.place = null;
+      setDrop(null);
+    },
+    drop: (event, key) => {
       const from = drag.current;
       if (!from || from.key !== key) return;
       event.preventDefault();
-      const pos = drop?.id === id ? drop.pos : 'before';
+      const place = from.place;
       drag.current = null;
       setDrop(null);
       setDragging(null);
-      if (from.id === id) return;
+      if (!place || place.id === from.id) return;
       const row = (draftStore.get().rows ?? []).find((r) => r.key === key);
       if (!row) return;
       const without = row.targets.filter((t) => t.id !== from.id);
-      const at = without.findIndex((t) => t.id === id);
-      moveTo(key, from.id, pos === 'before' ? at : at + 1);
+      const at = without.findIndex((t) => t.id === place.id);
+      if (at !== -1) moveTo(key, from.id, place.pos === 'before' ? at : at + 1);
     },
     dragEnd: () => {
       drag.current = null;
@@ -589,6 +590,11 @@ export default function AliasesTab({ saved, loading, error, onRetry, draft, mode
       return;
     }
     const list = Array.isArray(result.list) ? result.list : draftToBody(draftStore.get().rows ?? []);
+    // The Save button is disabled once nothing is unsaved, and a disabled
+    // button cannot hold the focus: when it was pressed (not when Enter in a
+    // field saved), focus goes to the line that now says "all saved".
+    // (After the last alias went there is no such line: then "Add alias".)
+    if (document.activeElement?.closest?.('.models-savebar-actions')) focusNext.current = ['[data-focus="savebar"]', '[data-focus="add-alias"]'];
     adopt(list);
     onSaved(list);
     toast.success(list.length === 0 ? 'Aliases cleared' : 'Aliases saved');
@@ -652,7 +658,7 @@ export default function AliasesTab({ saved, loading, error, onRetry, draft, mode
         actions=${rows.length > 0 ? html`<${Button} icon="plus" disabled=${busy} data-focus="add-alias" onClick=${addAlias}>Add alias<//>` : null}
         footer=${rows.length > 0 || dirty
           ? html`
-              <span class="models-savebar-text" role="status">
+              <span class="models-savebar-text" role="status" tabindex="-1" data-focus="savebar">
                 ${dirty
                   ? [changed > 0 ? `${plural(changed, 'alias', 'aliases')} changed` : '', removed > 0 ? `${removed} removed` : ''].filter(Boolean).join(', ') || 'Unsaved changes'
                   : `${plural(rows.length, 'alias', 'aliases')}, all saved`}

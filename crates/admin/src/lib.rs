@@ -77,6 +77,12 @@ pub struct AdminOptions {
     /// it was bound), for `GET /admin/api/status`: the address alone does
     /// not say which scheme a client has to use.
     pub tls: bool,
+    /// Settings the command line fixes whatever the file says, as dotted
+    /// paths: `server.host` for `--host`, `server.port` for `--port`. A
+    /// restart with the same command line does not apply the file's value
+    /// of such a setting, so `restart_required` never lists it; `GET
+    /// /status` and `GET /config` name it in `command_line_overrides`.
+    pub command_line: Vec<String>,
 }
 
 impl AdminOptions {
@@ -94,6 +100,7 @@ impl AdminOptions {
             allow_remote_override,
             listen: None,
             tls: false,
+            command_line: Vec::new(),
         }
     }
 }

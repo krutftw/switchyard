@@ -33,6 +33,9 @@ export function vitalsFromStats(data) {
     errorWindow: 'minute',
     p50: data.p50_ms,
     p95: data.p95_ms,
+    // How many requests the percentiles were taken over (null: a gateway
+    // that does not say).
+    samples: data.latency_samples ?? null,
     inFlight: data.in_flight,
     streams: data.active_streams,
     sockets: data.ws_connections,
@@ -59,7 +62,6 @@ export function vitalsFromPoll(status, summary) {
     errorWindow: 'hour',
     p50: summary?.latency?.p50 ?? null,
     p95: summary?.latency?.p95 ?? null,
-    // How many requests the percentiles were taken over (the frame has no such count).
     samples: summary?.latency?.samples ?? null,
     inFlight: live.in_flight ?? null,
     streams: live.active_streams ?? null,
@@ -68,12 +70,34 @@ export function vitalsFromPoll(status, summary) {
   };
 }
 
+/**
+ * True when the latency percentiles describe nothing: no request finished in
+ * the hour they cover. The gateway then reports 0 for both, which is "no
+ * data", not "0ms". It says so with a sample count of 0; a gateway that
+ * sends no count is taken at its zeros.
+ */
+export function latencyUnknown(vitals) {
+  if (!vitals) return true;
+  if (vitals.samples != null) return vitals.samples === 0;
+  return !vitals.p50 && !vitals.p95;
+}
+
 /** Lamp for an error rate: amber from 5%, red from 25%. */
 export function errorRateTone(rate) {
   if (typeof rate !== 'number' || !Number.isFinite(rate)) return null;
   if (rate >= 0.25) return 'stop';
   if (rate >= 0.05) return 'caution';
   return null;
+}
+
+/**
+ * What that lamp says, in words: its name and its tooltip. `span` is what
+ * the rate covers, "minute" or "hour".
+ */
+export function errorRateWords(rate, span = 'minute') {
+  const tone = errorRateTone(rate);
+  if (!tone) return null;
+  return `${tone === 'stop' ? 'High: 25%' : 'Elevated: 5%'} or more of the requests in the last ${span} failed`;
 }
 
 // ---------------------------------------------------------------------------
@@ -151,11 +175,16 @@ export function reasonText(reason) {
  * kind: "ready" | "cooling" | "disabled" | "unusable" | "unknown".
  * A cooldown that has run out counts as ready even before the gateway says
  * so: it announces the start of a cooldown, not its end.
+ *
+ * "disabled" is the gateway's word and wins over everything else. `by` says
+ * what switched the credential off: "provider" (its provider is disabled, so
+ * all of the provider's credentials read disabled), "credential" or
+ * "runtime" (its own switch).
  */
 export function credentialState(cred, now) {
   const resting = (cred.model_cooldowns ?? []).filter((m) => typeof m.until === 'number' && m.until > now);
   const base = { id: cred.id, name: cred.label || cred.id, until: null, reason: null, resting };
-  if (cred.disabled || cred.status === 'disabled') return { ...base, kind: 'disabled', tone: 'off', label: 'Disabled' };
+  if (cred.disabled || cred.status === 'disabled') return { ...base, kind: 'disabled', tone: 'off', label: 'Disabled', by: cred.disabled_by ?? null };
   if (cred.usable === false || cred.status === 'unusable') {
     return { ...base, kind: 'unusable', tone: 'stop', label: 'Unusable', reason: cred.unusable_reason || null };
   }
@@ -176,7 +205,9 @@ export function credentialState(cred, now) {
 /** One credential's state in words: "cooling down, back in 0:44 (rate limited)". */
 export function credentialDetail(state, now) {
   let text = state.label.toLowerCase();
-  if (state.kind === 'cooling') {
+  if (state.kind === 'disabled' && state.by === 'provider') {
+    text = 'provider disabled';
+  } else if (state.kind === 'cooling') {
     if (state.until != null) text += `, back in ${formatCountdown((state.until - now) / 1000)}`;
     if (state.reason) text += ` (${state.reason})`;
   } else if (state.kind === 'unusable' && state.reason) {
@@ -268,7 +299,7 @@ export function summarizeProvider(provider, now) {
     rank: rankOf(tone, counts),
     counts,
     credentials,
-    trouble: enabled ? troubledCredentials(credentials) : [],
+    trouble: troubledCredentials(credentials),
     next,
     resting: restingModels.size,
     nextChange,
@@ -332,9 +363,11 @@ export function nextCooldownEnd(summaries) {
 /**
  * Is the gateway healthy? From the provider rows. The counts in /status stand
  * in only when the provider list could not be loaded (`providersFailed`), and
- * then without figures: /status counts the credentials of disabled providers,
- * the rows do not, and one strip must not show two different numbers. While
- * the provider list is still loading the answer is null (a skeleton).
+ * then without figures: like the rows they leave out the credentials of
+ * disabled providers, but they count a credential that is switched off by
+ * itself, which the rows do not, and one strip must not show two different
+ * numbers. While the provider list is still loading the answer is null (a
+ * skeleton).
  */
 export function gatewayVerdict(summaries, status, providersFailed = false) {
   if (!summaries) {
@@ -346,11 +379,10 @@ export function gatewayVerdict(summaries, status, providersFailed = false) {
     return { tone: 'clear', label: 'Serving', detail: 'Credentials are ready' };
   }
   if (summaries.length === 0) return { tone: 'off', label: 'No providers', detail: 'Nothing to route requests to yet' };
+  // The credentials of a disabled provider all read "disabled": they are out
+  // of the figures together with those that are switched off one by one.
   const sum = { total: 0, ready: 0, cooling: 0, unusable: 0, disabled: 0, unknown: 0 };
-  for (const s of summaries) {
-    if (!s.enabled) continue;
-    for (const key of Object.keys(sum)) sum[key] += s.counts[key];
-  }
+  for (const s of summaries) for (const key of Object.keys(sum)) sum[key] += s.counts[key];
   const active = sum.total - sum.disabled;
   if (sum.ready === 0) {
     if (sum.cooling > 0) return { tone: 'stop', label: 'Not serving', detail: sum.cooling === 1 ? 'The only usable credential is cooling down' : `All ${formatNumber(sum.cooling)} usable credentials are cooling down` };
@@ -650,29 +682,36 @@ const bare = (host) => String(host ?? '').toLowerCase();
 /**
  * The base URL clients use, as { base, direct }.
  *
- * `listen` is what the gateway bound to. When the dashboard was opened on
- * that very socket (`direct`), the listen address is the answer and the
- * page's scheme is the gateway's; a wildcard address is not one a client can
+ * `listen` is what the gateway bound to and `tls` whether that listener
+ * serves HTTPS (both from /status). When the dashboard was opened on that
+ * very socket (`direct`), the listen address is the answer, with the scheme
+ * the gateway says it speaks; a wildcard address is not one a client can
  * call, so the host the dashboard was opened on stands in for it.
  *
  * When the page's address is a different one (a TLS-terminating proxy, a
- * port mapping, a tunnel), neither the listen address nor its scheme is
- * known to be reachable from where the operator sits. The page's own origin
- * is: it has just served this dashboard from the gateway.
+ * port mapping, a tunnel), the listen address is not known to be reachable
+ * from where the operator sits. The page's own origin is: it has just served
+ * this dashboard from the gateway. A page whose scheme is not the listener's
+ * came through such a proxy, whatever its host and port.
+ *
+ * `tls` is not a boolean for a gateway that does not report it: the page's
+ * scheme is then taken for the gateway's.
  */
-export function clientBase(listen, pageLocation) {
+export function clientBase(listen, pageLocation, tls) {
   const page = pageLocation?.host ? pageLocation : null;
   const origin = page ? `${page.protocol}//${page.host}` : null;
   const parts = /^(.*):(\d+)$/.exec(listen ?? '');
   // No address with a port to go by (the gateway did not report one).
   if (!parts) return { base: origin ?? 'http://127.0.0.1:8317', direct: false };
-  if (!page) return { base: `http://${listen}`, direct: true };
+  if (!page) return { base: `${tls === true ? 'https' : 'http'}://${listen}`, direct: true };
   const [, host, port] = parts;
-  const pagePort = page.port || (page.protocol === 'https:' ? '443' : '80');
+  const pageTls = page.protocol === 'https:';
+  const pagePort = page.port || (pageTls ? '443' : '80');
   const wildcard = WILDCARD_HOSTS.has(bare(host));
   const sameHost = wildcard || bare(host) === bare(page.hostname) || (LOOPBACK_HOSTS.has(bare(host)) && LOOPBACK_HOSTS.has(bare(page.hostname)));
-  if (port !== pagePort || !sameHost) return { base: origin, direct: false };
-  return { base: wildcard ? origin : `${page.protocol}//${listen}`, direct: true };
+  const listenTls = typeof tls === 'boolean' ? tls : pageTls;
+  if (port !== pagePort || !sameHost || listenTls !== pageTls) return { base: origin, direct: false };
+  return { base: wildcard ? origin : `${listenTls ? 'https' : 'http'}://${listen}`, direct: true };
 }
 
 /** A request a new operator can paste into a terminal. The key is a variable, never the key. */
@@ -684,7 +723,3 @@ export function curlExample({ base, model, authRequired }) {
   lines.push(`  -d '${body.replace(/'/g, "'\\''")}'`);
   return lines.join('\n');
 }
-
-// check.mjs asks every module under pages/ for a default export that is a
-// function; this module has no component, so it offers its main entry point.
-export default summarizeProvider;
