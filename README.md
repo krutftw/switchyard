@@ -8,16 +8,16 @@ independent API gateway for other tools and applications.
 
 | Start here | Purpose | Availability |
 |---|---|---|
-| [Switchya user guide](docs/SWITCHYA.md) | Provider setup, projects, sessions, approvals, account boundaries, and app/CLI handoff | Windows x64 portable preview being prepared: `switchya-v0.1.0-preview.1`; publication pending |
+| [Switchya user guide](docs/SWITCHYA.md) | Provider setup, projects, sessions, approvals, account boundaries, and app/CLI handoff | [Windows x64 portable preview](https://github.com/krutftw/switchyard/releases/tag/switchya-v0.1.0-preview.1) |
 | [Native desktop build](desktop/README.md) | Build the separate desktop shell | Separate Cargo workspace; operating-system runtime verification is distinct from gateway verification |
 | [Switchyard Gateway](#switchyard-gateway) | Protocol translation, routing, credential pools, and its operations dashboard | [v0.1.0 Windows x64 and Linux x64 downloads](https://github.com/krutftw/switchyard/releases/tag/v0.1.0) |
 
-The planned Switchya preview targets Windows 10/11 x64 and contains the native
+The Switchya preview targets Windows 10/11 x64 and contains the native
 shell and CLI in an unsigned portable archive, with no installer or bundled
 runtime DLLs. Install the [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
 and Microsoft Edge WebView2 Runtime; WebView2 is required for the desktop
-shell. The release build and final package verification are still in progress;
-this is not a live download announcement.
+shell. Extract the ZIP and open `switchya-desktop.exe`, or run `switchya.exe serve`
+for the browser workspace. The first run guides you through provider setup.
 No macOS app binary is available, and separate Linux checks do not constitute
 a Linux desktop release. See [the preview verification status](docs/SWITCHYA.md#preview-verification-status)
 for the tested scope and remaining limits.

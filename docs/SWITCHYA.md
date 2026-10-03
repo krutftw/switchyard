@@ -5,15 +5,15 @@ desktop shell use the same built-in agent and saved project sessions. The
 independently installable [Switchyard Gateway](../README.md#switchyard-gateway)
 provides model access and routing.
 
-The **Windows x64 portable preview** is being prepared under the tag
-`switchya-v0.1.0-preview.1`. Its intended archive contains the native desktop
+The [**Windows x64 portable preview**](https://github.com/krutftw/switchyard/releases/tag/switchya-v0.1.0-preview.1)
+is tagged `switchya-v0.1.0-preview.1`. Its archive contains the native desktop
 shell and `switchya` CLI, targeting Windows 10/11 x64. It is unsigned and has
 no installer or bundled runtime DLLs. Install the
 [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
 and Microsoft Edge WebView2 Runtime; WebView2 is required for the desktop
-shell. The release build, final archive verification and publication are
-pending; no live preview
-download is claimed here.
+shell. Extract the ZIP and open `switchya-desktop.exe`, or run
+`switchya.exe serve` for the browser workspace. Configuration and saved sessions
+remain in your application-data directory; they are not stored inside the ZIP.
 
 Gateway downloads remain a separate product. The gateway's Windows and Linux
 release does not establish Switchya desktop availability on those platforms.
@@ -23,18 +23,18 @@ runtime tests. Source-build instructions remain below.
 
 ## Preview verification status
 
-The current verification snapshot is from 3 October 2026. Final release-build
-and extracted-package results must be recorded before publishing the preview.
+The verification snapshot is from 3 October 2026. The [platform report](PLATFORM-VERIFICATION.md)
+separates builds, source checks and runtime observations.
 
 | Area | Evidence and limits |
 |---|---|
 | Windows automated checks | 88 tests passed across the four new packages: agent engine 15, agent tools 13, adapters 22 and app host 38. The 38 host tests passed again after the final lint refactor. All four packages passed all-targets Clippy with warnings denied. This count is not a whole-gateway-workspace test total. |
 | UI checks | The final complete `app-ui/tests/*.test.mjs` run passed all 56 tests. |
 | Browser workflow | A controlled local provider exercised file reads, proposed patches, edit and command approval/denial, recorded command results, saved-session reload and CLI handoff. These are fixture checks, not live-model quality results. |
-| Native Windows shell | A debug build received a window and local-host smoke check. Interaction inside the native GUI has not been verified; the browser workflow above is a separate check. |
-| Portable release package | Release build, archive contents, hashes and extracted-package readback remain pending. |
+| Native Windows shell | Release version/help and startup checks passed, including a responding window and healthy local host. Interaction inside the native GUI has not been verified; the browser workflow above is a separate check. |
+| Portable release package | The release includes a SHA-256 file and a manifest of every packaged file. Verify the downloaded archive against those files. |
 | Accounts and model quality | Actual account sign-ins and live AI coding quality remain unverified. Account tests use controlled fixtures. Claude subscription quota remains unavailable because its documented status command does not expose it. |
-| Other platforms | Linux checks are separate from this Windows portable preview. No Linux or macOS desktop release is claimed; macOS results remain source checks only. |
+| Other platforms | 91 native Linux tests passed. Both macOS architectures passed app and desktop source checks. Linux and macOS desktop downloads are not included in this preview; see the platform report for the separate build/runtime limits. |
 
 See [Accounts](ACCOUNTS.md) for the current sign-in, usage and native-terminal
 boundaries. A source check, fixture run or successful build does not establish

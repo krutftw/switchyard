@@ -4,7 +4,7 @@ Local verification for the Switchya 0.1.0 preview, 3 October 2026. This report d
 
 | Platform | Verified result | Remaining boundary |
 | --- | --- | --- |
-| Windows x64 | App/agent/tools/adapters tests and warnings-denied Clippy passed. CLI and desktop release builds passed. The native desktop opened a responding window and completed its local host readiness check. | Packaged preview verification is in progress. Native GUI interaction and graceful window close have not been verified. |
+| Windows x64 | App/agent/tools/adapters tests and warnings-denied Clippy passed. CLI and desktop release builds and extracted portable candidate checks passed. The native desktop opened a responding window and completed its local host readiness check. | Native GUI interaction and graceful window close have not been verified. |
 | Linux x64 | 91 native tests passed with no failures on Alpine Linux 3.24.2 under WSL2. | Native desktop build and command-line smoke checks are in progress. |
 | macOS Apple Silicon | App/agent/tools/adapters and desktop all-target source checks passed. | No linked application, native tests, GUI runtime, signing, or notarization verified. |
 | macOS Intel | App/agent/tools/adapters and desktop all-target source checks passed. | No linked application, native tests, GUI runtime, signing, or notarization verified. |
@@ -12,6 +12,11 @@ Local verification for the Switchya 0.1.0 preview, 3 October 2026. This report d
 ## Windows release checks
 
 The CLI and native desktop release builds passed. The desktop executable returned successfully for `--version` and `--help`, opened a responding Switchya window, and exposed its local host status with version 0.1.0 and no active sessions. All 21 UI assets served by the CLI release matched the current source hashes.
+
+The portable candidate contained 19 allowlisted files with verified manifest hashes. After extraction into a separate directory, the CLI version check, desktop help check, responding native window, local host status, and embedded account-adapter UI asset check passed. The candidate executable hashes are:
+
+- Desktop: `b2fb8a770640c3cad921e0a9b6c7acf572b0c3b47b0d3b148141b2963a20ae6e`
+- CLI: `ae1287bcf1b682e67c2c28a7287e8448f38150df51cff16ab09606734ed5a119`
 
 These checks verify startup and readiness. Native webview interaction and graceful closing of the window have not been verified.
 

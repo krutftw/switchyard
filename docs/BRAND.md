@@ -7,13 +7,13 @@ The app command is `switchya`. Internal crate names and existing gateway configu
 ## Product language
 
 - **Switchya:** the app, its workspace, and its CLI.
-- **Switchya native engine:** the app's own coding-agent runtime, in development.
-- **Codex integration:** the separate integration with a user's Codex setup, in development. It is not a claim of affiliation with OpenAI.
+- **Switchya native engine:** the app's own coding-agent runtime, available in the early preview.
+- **Codex integration:** the separate structured adapter for a user's Codex setup. It is not a claim of affiliation with OpenAI.
 - **Switchyard Gateway:** the independently usable API gateway. The app's native engine can use it for model access. Do not imply every integrated agent necessarily routes through it.
 
 Lead with the work: a project, a task, a change, a review. Write in short, specific sentences. Explain uncertainty where it affects a decision. Avoid “best,” “unlimited,” “fully autonomous,” cost-saving percentages, and claims about competitors without comparative evidence.
 
-The app and CLI are **under development**. Native-engine and Codex work must stay labeled as implementation in progress until the associated checks pass. Platform targets are Windows, macOS, and Linux; targets are not equivalent to downloadable, verified releases. The public Gateway v0.1.0 Windows and Linux x64 downloads are a different product and must be labeled accordingly. macOS source checks are not equivalent to a tested Mac build.
+The app and CLI are an **early Windows portable preview**. State the verified scope and the remaining live-model and account checks; do not equate fixture tests with real provider validation. Platform targets are Windows, macOS, and Linux; targets are not equivalent to downloadable, verified releases. The public Gateway v0.1.0 Windows and Linux x64 downloads are a different product and must be labeled accordingly. macOS source checks are not equivalent to a tested Mac build.
 
 ## Visual identity
 
@@ -39,7 +39,7 @@ Keep the graphite, sheet, paper, steel, signal blue, and hold amber tokens above
 ```text
 mark + Switchya                       Workspace  Model access  Downloads
 
-Under development
+Windows preview
 A coding workspace.                   A desktop app and CLI for your code,
 Your choice of models.                using the providers you choose.
 
@@ -55,12 +55,12 @@ Or your Codex setup.             Codex integration → your Codex setup
 
 Switchyard Gateway              Actual download, setup, protocol details
 
-Downloads and status             App / CLI in development; Gateway release
+Downloads and status             Windows app / CLI preview; Gateway release
 ```
 
 Content stays left aligned and prose measures stay below roughly 75 characters. The hero preview is explicitly labeled as an interface concept until replaced by a screenshot of a verified build. It contains no invented customers, success counts, test results, or activity feed. Its only live controls switch explanatory views.
 
-Design review, 3 October 2026: the first version repeated vague phrases about ideas, work, and future plans. The refinement replaces those with specific jobs, removes the repeated closing banner and decorative review skeleton, and gives the Gateway download an explicit label. The light illustration remains a concept, not an actual app screenshot. No invented conversation, successful task, customer count, or testimonial is used. Account profiles and switching must not be presented as shipped while their implementation and verification are still in progress.
+Design review, 3 October 2026: the first version repeated vague phrases about ideas, work, and future plans. The refinement replaces those with specific jobs, removes the repeated closing banner and decorative review skeleton, and gives the Gateway download an explicit label. The light illustration remains a concept, not an actual app screenshot. No invented conversation, successful task, customer count, or testimonial is used. Named account profiles and defaults have been exercised; real sign-ins and simultaneous authenticated account operation remain unverified.
 
 The refined website was visually approved and published on 3 October 2026 as version `83a8dfc2-9a22-4688-9258-86d4b4abf056`. See `site/DESIGN-REVIEW.md` for review images and checks, and `site/VERIFICATION.md` for the public read-back evidence.
 

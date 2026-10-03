@@ -114,7 +114,7 @@ try {
     foreach ($relative in @(
         'LICENSE', 'NOTICE',
         'docs/SWITCHYA.md', 'docs/ACCOUNTS.md', 'docs/AGENT-ADAPTERS.md',
-        'docs/APP-API.md', 'docs/APP-ROADMAP.md', 'desktop/README.md',
+        'docs/APP-API.md', 'docs/APP-ROADMAP.md', 'docs/PLATFORM-VERIFICATION.md', 'desktop/README.md',
         'app-ui/vendor/LICENSES.txt', 'app-ui/fonts/Archivo-OFL.txt', 'app-ui/fonts/JetBrainsMono-OFL.txt',
         'ui/vendor/LICENSES.txt', 'ui/fonts/Archivo-OFL.txt', 'ui/fonts/JetBrainsMono-OFL.txt'
     )) {
