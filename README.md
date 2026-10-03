@@ -1,4 +1,60 @@
-# Switchyard
+# Switchya & Switchyard Gateway
+
+**Switchya** is a local coding workspace with a browser interface, a terminal
+CLI, and a native desktop shell. Open a project, choose a model,
+send a task, and review proposed edits and commands alongside their results.
+The app and CLI share saved sessions. **Switchyard Gateway** remains an
+independent API gateway for other tools and applications.
+
+| Start here | Purpose | Availability |
+|---|---|---|
+| [Switchya user guide](docs/SWITCHYA.md) | Provider setup, projects, sessions, approvals, account boundaries, and app/CLI handoff | Windows x64 portable preview being prepared: `switchya-v0.1.0-preview.1`; publication pending |
+| [Native desktop build](desktop/README.md) | Build the separate desktop shell | Separate Cargo workspace; operating-system runtime verification is distinct from gateway verification |
+| [Switchyard Gateway](#switchyard-gateway) | Protocol translation, routing, credential pools, and its operations dashboard | [v0.1.0 Windows x64 and Linux x64 downloads](https://github.com/krutftw/switchyard/releases/tag/v0.1.0) |
+
+The planned Switchya preview targets Windows 10/11 x64 and contains the native
+shell and CLI in an unsigned portable archive, with no installer or bundled
+runtime DLLs. Install the [Microsoft Visual C++ v14 x64 Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170)
+and Microsoft Edge WebView2 Runtime; WebView2 is required for the desktop
+shell. The release build and final package verification are still in progress;
+this is not a live download announcement.
+No macOS app binary is available, and separate Linux checks do not constitute
+a Linux desktop release. See [the preview verification status](docs/SWITCHYA.md#preview-verification-status)
+for the tested scope and remaining limits.
+
+The gateway release includes a Windows x64 ZIP and Linux x64 musl archive with
+SHA-256 files. macOS ARM and Intel source checks have passed, but no macOS
+binary or runtime verification is available. Container images have not been
+built or published. These gateway results do not establish Switchya desktop
+availability on those platforms.
+
+## Start Switchya from source
+
+From this checkout, in a Windows PowerShell terminal:
+
+```powershell
+cargo build --release --locked -p switchyard-app
+.\target\release\switchya.exe serve
+```
+
+Open the private launch URL printed in the terminal. Choose **Connect a
+provider** to add an OpenAI, Anthropic or Gemini API key, an environment-variable
+reference, or an existing local Ollama server. A starter mock model is not a
+working coding model. Open a local project, select a real model, and send a
+task. File edits and commands require an exact, single-use human decision;
+commands run with your operating-system permissions.
+
+To build the Windows desktop shell, use its separate manifest:
+
+```powershell
+cargo build --manifest-path desktop/Cargo.toml --release --locked
+```
+
+The desktop requires Rust 1.90+ and the [platform prerequisites](desktop/README.md).
+See the [Switchya guide](docs/SWITCHYA.md) for persistent sessions, CLI handoff,
+recovery, and the separate permission and account boundaries of existing agents.
+
+## Switchyard Gateway
 
 A fast LLM API gateway in a single Rust binary. Point any OpenAI, Anthropic or
 Gemini client at it and route requests to any provider you have keys for —
@@ -185,7 +241,7 @@ Environment: `SWITCHYARD_CONFIG`, `SWITCHYARD_ADMIN_SECRET`,
 
 ## Docker
 
-The initial release provides a Windows x64 archive. Linux/macOS binaries and
+The release provides Windows x64 and Linux x64 archives. macOS binaries and
 published container images are pending; build a container locally from this
 checkout with `docker build -t switchyard:local .` before using this example:
 

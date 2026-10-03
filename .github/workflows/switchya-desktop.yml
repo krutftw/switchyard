@@ -1,0 +1,58 @@
+name: Switchya desktop build checks
+
+# Native GUI builds are opt-in while the app is a preview. This workflow does
+# not publish artifacts, sign in, run model tasks, or prove GUI interaction.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: switchya-desktop-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_BUILD_JOBS: "2"
+
+jobs:
+  desktop:
+    name: Desktop build (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, windows-latest, macos-latest, macos-15-intel]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install Linux native dependencies
+        if: runner.os == 'Linux'
+        # https://v2.tauri.app/start/prerequisites/#linux
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev build-essential curl wget file libxdo-dev libssl-dev libayatana-appindicator3-dev librsvg2-dev
+      - name: Install Rust
+        run: rustup toolchain install stable --profile minimal --component rustfmt && rustup default stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            . -> target
+            desktop -> target
+      - name: Native shell formatting
+        run: cargo fmt --manifest-path desktop/Cargo.toml -- --check
+      - name: Workspace UI checks
+        run: node --test app-ui/tests/*.test.mjs
+      - name: Build desktop shell
+        run: cargo build --manifest-path desktop/Cargo.toml --locked
+      - name: Check command-line startup only
+        run: |
+          executable=desktop/target/debug/switchya-desktop
+          if [[ "$RUNNER_OS" == Windows ]]; then executable="${executable}.exe"; fi
+          "$executable" --version
+          "$executable" --help

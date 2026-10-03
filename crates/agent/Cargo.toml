@@ -1,0 +1,29 @@
+[package]
+name = "switchyard-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Durable local agent engine shared by Switchyard workspace clients"
+
+[dependencies]
+switchyard-core.workspace = true
+switchyard-gateway.workspace = true
+switchyard-agent-tools = { path = "../agent-tools" }
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+uuid.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+
+[dev-dependencies]
+tempfile.workspace = true
+axum.workspace = true
+bytes.workspace = true
+http.workspace = true
+futures.workspace = true
+switchyard-codecs.workspace = true

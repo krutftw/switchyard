@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#f6f8fb">
+  <meta name="description" content="Switchya is a desktop coding workspace and CLI for local projects. Download the Windows preview, connect your model providers, and review proposed changes. Switchyard Gateway is available separately.">
+  <meta property="og:type" content="website">
+  <meta property="og:title" content="Switchya — A coding workspace. Your choice of models.">
+  <meta property="og:description" content="A desktop app and CLI for your projects and model providers. Windows x64 portable preview 0.1.0-preview.1. Switchyard Gateway is available separately.">
+  <meta property="og:url" content="https://switchya.com/">
+  <meta name="twitter:card" content="summary">
+  <title>Switchya — A coding workspace. Your choice of models.</title>
+  <link rel="canonical" href="https://switchya.com/">
+  <link rel="icon" type="image/svg+xml" href="/assets/switchya-mark.svg">
+  <link rel="preload" href="/assets/fonts/archivo-latin-var.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="stylesheet" href="/site.css">
+  <script src="/site.js" defer></script>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+  <header class="site-header wrap">
+    <a class="wordmark" href="/" aria-label="Switchya home"><img src="/assets/switchya-mark.svg" width="35" height="35" alt=""><span>Switchya</span></a>
+    <nav aria-label="Main navigation">
+      <a href="#workspace">Workspace</a>
+      <a href="#architecture">Model access</a>
+      <a href="#availability">Downloads</a>
+    </nav>
+    <a class="header-link" href="https://github.com/krutftw/switchyard">Gateway on GitHub <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 4h10v10M16 4 4 16"/></svg></a>
+  </header>
+
+  <main id="main">
+    <section class="hero wrap" aria-labelledby="hero-title">
+      <div class="hero-copy">
+        <div>
+          <p class="status"><span class="status-dot" aria-hidden="true"></span>Windows preview · 0.1.0-preview.1</p>
+          <h1 id="hero-title">A coding workspace.<br>Your choice of models.</h1>
+        </div>
+        <div class="hero-intro">
+          <p>A desktop app and CLI for working on your code with the model providers you choose.</p>
+          <p class="muted">Open a project. Work through a task. Review the proposed changes alongside the conversation.</p>
+          <div class="hero-actions"><a class="button button-primary" href="https://github.com/krutftw/switchyard/releases/download/switchya-v0.1.0-preview.1/switchya-0.1.0-preview.1-windows-x86_64-portable.zip">Download Windows preview</a><a class="text-link" href="#gateway">Gateway downloads</a></div>
+        </div>
+      </div>
+
+      <div class="preview" id="product-preview">
+        <div class="preview-bar">
+          <div class="preview-tabs" role="tablist" aria-label="Explore the product direction">
+            <button id="tab-workspace" type="button" role="tab" aria-selected="true" aria-controls="panel-workspace" tabindex="0"><svg aria-hidden="true" viewBox="0 0 20 20"><rect x="2.5" y="3.5" width="15" height="13" rx="2"/><path d="M7 4v12"/></svg>Workspace</button>
+            <button id="tab-cli" type="button" role="tab" aria-selected="false" aria-controls="panel-cli" tabindex="-1"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="m3 5 5 5-5 5m8 0h6"/></svg>CLI</button>
+            <button id="tab-gateway" type="button" role="tab" aria-selected="false" aria-controls="panel-gateway" tabindex="-1"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M3 5h5l4 5h5M3 15h5l4-5"/><circle cx="3" cy="5" r="1"/><circle cx="3" cy="15" r="1"/></svg>Gateway</button>
+          </div>
+          <span class="preview-label">Illustrative layout</span>
+        </div>
+
+        <div id="panel-workspace" class="preview-panel" role="tabpanel" aria-labelledby="tab-workspace" tabindex="0">
+          <div class="workspace-concept" role="img" aria-label="Interface concept: projects on the left, a task conversation in the center, and proposed changes and checks on the right. This is not a running app.">
+            <div class="concept-rail">
+              <div class="concept-brand"><img src="/assets/switchya-mark.svg" width="26" height="26" alt="">Switchya</div>
+              <div class="concept-project"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M2.5 5.5h6l2 2h7v9h-15z"/></svg>your-project<span>⌄</span></div>
+              <div class="concept-new">＋ <span>New conversation</span></div>
+              <span class="concept-section-label">Your workspace</span>
+              <div class="concept-session is-current"><span class="route-dot"></span>New conversation</div>
+              <div class="concept-rail-bottom"><span class="tiny-route" aria-hidden="true"></span>On your machine</div>
+            </div>
+            <div class="concept-main">
+              <div class="concept-toolbar"><span>your-project</span><span class="concept-branch"><svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 5v10m0-6c0 4 8 1 8-5"/><circle cx="6" cy="3" r="2"/><circle cx="6" cy="17" r="2"/><circle cx="14" cy="3" r="2"/></svg>main</span></div>
+              <div class="concept-empty"><span class="empty-mark" aria-hidden="true"><svg viewBox="0 0 64 64"><path d="M46 15H27L16 26V31L48 33V38L37 49H18"/><path d="M32 32 44 20"/></svg></span><h2>Start with your code.</h2><p>Ask a question, investigate a failure,<br>or describe a change.</p></div>
+              <div class="concept-composer"><span>What do you want to build?</span><div><span class="composer-model">Choose a model <span>⌄</span></span><span class="composer-send" aria-hidden="true">↑</span></div></div>
+            </div>
+            <div class="concept-review"><div class="concept-review-heading">Review <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M4 4h12v12H4zm8 0v12"/></svg></div><div class="review-empty"><svg aria-hidden="true" viewBox="0 0 28 28"><path d="M7 4h9l5 5v15H7zM16 4v6h5M11 15h6m-6 4h6"/></svg><span>No changes yet</span><p>Proposed file edits and checks appear here.</p></div><div class="review-footnote">Review before you continue.</div></div>
+          </div>
+        </div>
+
+        <div id="panel-cli" class="preview-panel" role="tabpanel" aria-labelledby="tab-cli" tabindex="0">
+          <div class="cli-concept">
+            <div class="cli-description"><span class="status status-on-dark">Windows CLI preview</span><h2>Work from<br>your terminal.</h2><p>Start an interactive conversation, or pass a single task to a command.</p><p class="cli-small">Included in the Windows portable download.<br>PowerShell examples, with the CLI on your PATH.</p></div>
+            <div class="terminal-preview"><div class="terminal-title"><span class="terminal-lights" aria-hidden="true"><i></i><i></i><i></i></span><span>Switchya CLI</span></div><pre><code><span class="code-comment"># An interactive session</span>
+<span class="code-prompt">PS&gt;</span> switchya chat `
+    --project C:\projects\my-project `
+    --model MODEL
+
+<span class="code-comment"># A focused task</span>
+<span class="code-prompt">PS&gt;</span> switchya run `
+    --project C:\projects\my-project `
+    --model MODEL `
+    --prompt "Explain the test failure"</code></pre><p>Use an existing folder and a model ID from <code>switchya models</code>. For terminal-only use, close the desktop first.</p></div>
+          </div>
+        </div>
+
+        <div id="panel-gateway" class="preview-panel" role="tabpanel" aria-labelledby="tab-gateway" tabindex="0">
+          <div class="gateway-concept"><div><span class="status status-neutral">Standalone gateway available</span><h2>One endpoint.<br>A choice of models.</h2><p>Switchyard translates API protocols and routes requests to providers you configure.</p><a class="text-link" href="#gateway">See the Gateway release</a></div><div class="route-map" role="img" aria-label="Your compatible tools connect to Switchyard Gateway, which routes requests to your configured API providers."><div class="route-input">Your compatible tools<span>SDKs · CLIs · applications</span></div><div class="route-connector" aria-hidden="true"></div><div class="route-core"><img src="/assets/switchya-mark.svg" width="40" height="40" alt=""><span>Switchyard<strong>Gateway</strong></span></div><div class="route-connector" aria-hidden="true"></div><div class="route-output"><span>OpenAI</span><span>Anthropic</span><span>Gemini</span><span>Compatible endpoints</span></div></div></div>
+        </div>
+        <p class="preview-caption">Illustrative interface layouts. The Windows preview is available in the download above.</p>
+      </div>
+      <div class="hero-footnote"><span>Desktop app + command line</span><a href="#gateway">Switchyard Gateway is available separately</a></div>
+    </section>
+
+    <section class="workspace-section wrap section-space" id="workspace" aria-labelledby="workspace-title">
+      <div class="workspace-heading"><h2 id="workspace-title">Work from an<br>existing project.</h2><p>Understand a file, investigate a failure, or make a change. The workspace is built around the code you’re already working on.</p></div>
+      <dl class="workspace-details">
+        <div><dt>Work on an existing project</dt><dd>Start from a local folder. Keep the task conversation attached to the code you’re working on.</dd></div>
+        <div><dt>Connect your model providers</dt><dd>Configure model access for the native engine through Switchyard Gateway, or use your own Codex setup.</dd></div>
+        <div><dt>Inspect what changed</dt><dd>Keep proposed edits, tool actions, and checks visible as the task progresses.</dd></div>
+      </dl>
+    </section>
+
+    <section class="architecture-section section-space" id="architecture" aria-labelledby="architecture-title">
+      <div class="wrap architecture-layout">
+        <div class="architecture-copy"><h2 id="architecture-title">Use your providers.<br>Or your Codex setup.</h2><p>The native engine uses Switchyard Gateway for model access. The Codex integration connects to your own installation.</p><p class="architecture-note">Named profiles keep Codex and Claude defaults separate. Claude opens in its official terminal, outside the workspace conversation.</p></div>
+        <div class="architecture-diagram" aria-label="Preview product architecture">
+          <div class="architecture-entry"><img src="/assets/switchya-mark.svg" width="34" height="34" alt=""><strong>Switchya</strong><span>App + CLI</span></div>
+          <div class="architecture-shared">Your project workspace</div>
+          <div class="architecture-lanes">
+            <div class="architecture-lane"><div class="architecture-node"><strong>Native engine</strong><span>Windows preview</span></div><div class="architecture-line" aria-hidden="true"></div><div class="architecture-node gateway-node"><strong>Switchyard Gateway</strong><span>Routing &amp; API translation</span></div><div class="architecture-line" aria-hidden="true"></div><div class="architecture-destination">Your API providers</div></div>
+            <div class="architecture-lane"><div class="architecture-node"><strong>Codex integration</strong><span>Preview integration</span></div><div class="architecture-line" aria-hidden="true"></div><div class="architecture-node"><strong>Your Codex setup</strong><span>Installed and authenticated by you</span></div><div class="architecture-detail">An independent engine connection.</div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <section class="gateway-section wrap section-space" id="gateway" aria-labelledby="gateway-title">
+      <div class="gateway-intro"><p class="section-context">Available now</p><h2 id="gateway-title">Switchyard Gateway.</h2><p>A standalone API gateway for your existing tools. Run it on your machine or server, add your provider credentials, and connect compatible clients to one endpoint.</p><a class="button button-primary" href="https://github.com/krutftw/switchyard/releases/tag/v0.1.0">Download the Gateway <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 2v10m-4-4 4 4 4-4M4 14v3h12v-3"/></svg></a><p class="release-note">Gateway v0.1.0 for Windows and Linux x64.<br>The Gateway is separate from the Switchya app.</p></div>
+      <div class="gateway-details"><dl><div><dt>API compatibility</dt><dd>OpenAI Chat Completions, Responses, Anthropic Messages, and Gemini protocols, with streaming.</dd></div><div><dt>Routing and operations</dt><dd>Model aliases, credential pools, cooldowns, and failover, with a built-in dashboard.</dd></div><div><dt>Runs on your infrastructure</dt><dd>A single Rust binary. Upstream access uses your API keys or service accounts.</dd></div></dl><div class="gateway-command"><div><span>With Gateway on your PATH</span><button type="button" class="copy-command" aria-label="Copy the Switchyard Gateway startup command" data-copy="switchyard" hidden>Copy</button></div><code><span aria-hidden="true">$ </span>switchyard</code><span class="copy-feedback" role="status" aria-live="polite"></span></div><a class="text-link" href="https://github.com/krutftw/switchyard#readme">Setup and requirements</a></div>
+    </section>
+
+    <section class="availability-section wrap section-space" id="availability" aria-labelledby="availability-title">
+      <div class="section-heading"><h2 id="availability-title">Downloads and status.</h2><p>Try the Windows portable preview. It includes the native desktop shell and CLI for your local projects.</p></div>
+      <div class="availability-list">
+        <article><div><h3>Switchya for Windows</h3><p>Version 0.1.0-preview.1 · Windows 10/11 x64. Portable ZIP with the desktop app and CLI.</p><p>Requires the Microsoft Visual C++ v14 x64 runtime. The desktop also needs Edge WebView2 Runtime. Install both separately; setup details are in the release notes.</p></div><a class="availability-release" href="https://github.com/krutftw/switchyard/releases/download/switchya-v0.1.0-preview.1/switchya-0.1.0-preview.1-windows-x86_64-portable.zip">Download Windows ZIP <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M10 2v10m-4-4 4 4 4-4M4 14v3h12v-3"/></svg></a></article>
+        <article><div><h3>Switchya CLI and source</h3><p>The CLI is included in the Windows download. Source is available for other platforms.</p></div><a class="availability-release" href="https://github.com/krutftw/switchyard/releases/tag/switchya-v0.1.0-preview.1">Preview release notes <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 4h10v10M16 4 4 16"/></svg></a></article>
+        <article><div><h3>Switchyard Gateway</h3><p>Separate public releases for Windows and Linux x64. Source and setup documentation are available on GitHub.</p></div><a class="availability-release" href="https://github.com/krutftw/switchyard/releases/tag/v0.1.0">Gateway v0.1.0 <svg aria-hidden="true" viewBox="0 0 20 20"><path d="M6 4h10v10M16 4 4 16"/></svg></a></article>
+      </div>
+      <p class="availability-note">Portable ZIP only, with no installer or bundled runtime DLLs. There is no macOS binary in this preview. Live account sign-in and subscription usage remain unverified; Claude quota is unavailable.</p>
+    </section>
+
+  </main>
+
+  <footer class="site-footer wrap"><a class="wordmark" href="/" aria-label="Switchya home"><img src="/assets/switchya-mark.svg" width="28" height="28" alt=""><span>Switchya</span></a><p>Powered by Switchyard Gateway</p><nav aria-label="Footer navigation"><a href="#availability">Release status</a><a href="https://github.com/krutftw/switchyard">Gateway source</a></nav></footer>
+</body>
+</html>

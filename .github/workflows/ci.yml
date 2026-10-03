@@ -31,6 +31,8 @@ jobs:
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
       - name: Dashboard checks
         run: node ui/tests/check.mjs
+      - name: Workspace UI checks
+        run: node --test app-ui/tests/*.test.mjs
 
   test:
     name: Test (${{ matrix.os }})

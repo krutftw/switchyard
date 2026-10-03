@@ -1,4 +1,6 @@
 /target
+/desktop/target
+/desktop/gen
 **/*.rs.bk
 .DS_Store
 Thumbs.db

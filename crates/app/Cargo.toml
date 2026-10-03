@@ -1,0 +1,44 @@
+[package]
+name = "switchyard-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Switchya local agent workspace and terminal client"
+
+[[bin]]
+name = "switchya"
+path = "src/main.rs"
+
+[dependencies]
+switchyard = { path = "../switchyard" }
+switchyard-agent = { path = "../agent" }
+switchyard-agent-adapters = { path = "../agent-adapters" }
+switchyard-core.workspace = true
+switchyard-gateway.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+rand.workspace = true
+subtle.workspace = true
+uuid.workspace = true
+url.workspace = true
+percent-encoding.workspace = true
+thiserror.workspace = true
+clap.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rust-embed = { workspace = true, features = ["include-exclude"] }
+mime_guess.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tower.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Foundation", "Win32_Security", "Win32_Security_Authorization", "Win32_Storage_FileSystem", "Win32_System_Threading"] }
+
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1", features = ["fs", "process"] }

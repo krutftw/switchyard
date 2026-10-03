@@ -1,0 +1,14 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "switchya-site",
+  "workers_dev": false,
+  "routes": [
+    { "pattern": "switchya.com", "custom_domain": true },
+    { "pattern": "www.switchya.com", "custom_domain": true }
+  ],
+  "compatibility_date": "2026-10-03",
+  "assets": {
+    "directory": "./public",
+    "not_found_handling": "404-page"
+  }
+}

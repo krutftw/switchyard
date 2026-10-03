@@ -1,0 +1,62 @@
+[
+  {
+    "path": "_headers",
+    "bytes": 559,
+    "sha256": "c02c9c0b9b59b967aeb5e7a3ba40b2734d4f7666867a668a629c2d2309e2174a"
+  },
+  {
+    "path": "404.html",
+    "bytes": 877,
+    "sha256": "31096a3ff88e7a3e9b4206147c237df15261c9d51644c86cb4a79d227a3dd664"
+  },
+  {
+    "path": "assets/fonts/archivo-latin-var.woff2",
+    "bytes": 90104,
+    "sha256": "e3a28eade21a900c7155a247757f4b2834c07bb7ef07ad7efa55cebaac1e8f5e"
+  },
+  {
+    "path": "assets/fonts/Archivo-OFL.txt",
+    "bytes": 4503,
+    "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b"
+  },
+  {
+    "path": "assets/fonts/jetbrains-mono-latin-var.woff2",
+    "bytes": 40404,
+    "sha256": "18be452724bfdc236c074ca94a249a7f41a86752c7d04ab258ce9ed5651f6a7e"
+  },
+  {
+    "path": "assets/fonts/JetBrainsMono-OFL.txt",
+    "bytes": 4524,
+    "sha256": "403581b69dac5cff4079205e01c6b467e56af449ecbd7247693ddb1baafa005b"
+  },
+  {
+    "path": "assets/switchya-mark.svg",
+    "bytes": 495,
+    "sha256": "5295d8ae25239f81ebec6ffa85ac49d7e56e3cc21693660208dabdc62bcfb7c9"
+  },
+  {
+    "path": "index.html",
+    "bytes": 15693,
+    "sha256": "827356a1fd836ee1b9235b99241b779880f18ecd9949ca8619618fc5fbf326be"
+  },
+  {
+    "path": "robots.txt",
+    "bytes": 66,
+    "sha256": "999c1936523f17f23ef0a3b81084dba3887c062146771eaaed6365df067e4126"
+  },
+  {
+    "path": "site.css",
+    "bytes": 27834,
+    "sha256": "20bf686ed9390fe3915bcb5aa61b6456b5e09a31f7072fe7109d5246f5bca489"
+  },
+  {
+    "path": "site.js",
+    "bytes": 1719,
+    "sha256": "cc15a4c69b7770ab863771e1d1adc8c80ffa498f6cbdddda00d95eaf2b2e7619"
+  },
+  {
+    "path": "sitemap.xml",
+    "bytes": 156,
+    "sha256": "f47b32784befac24598c5c7f92e2f4eed8eae909926f75cb3e10ab19d0e69efe"
+  }
+]

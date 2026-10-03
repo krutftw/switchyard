@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 64" role="img" aria-label="Switchya">
+  <rect width="64" height="64" rx="15" fill="#101820"/>
+  <path d="M46 15H27L16 26V31L48 33V38L37 49H18" fill="none" stroke="#f6f8fb" stroke-width="7" stroke-linecap="round" stroke-linejoin="round"/>
+  <path d="M32 32 44 20" fill="none" stroke="#76c9f8" stroke-width="5" stroke-linecap="round"/>
+  <circle cx="46" cy="15" r="4" fill="#76c9f8"/><circle cx="18" cy="49" r="4" fill="#76c9f8"/>
+  <text x="82" y="44" font-family="Archivo,Arial,sans-serif" font-size="39" font-weight="650" letter-spacing="-1.4" fill="#101820">Switchya</text>
+</svg>

@@ -1,0 +1,36 @@
+[package]
+name = "switchya-desktop"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.90"
+license = "MIT"
+description = "Native desktop shell for the Switchya local agent workspace"
+repository = "https://github.com/krutftw/switchyard"
+
+# Keep GUI system dependencies out of the standalone gateway workspace.
+[workspace]
+
+[dependencies]
+switchyard-app = { path = "../crates/app" }
+tauri = { version = "=2.12.1" }
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_UI_WindowsAndMessaging"] }
+
+[build-dependencies]
+tauri-build = { version = "=2.7.1", features = [] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+strip = true
+
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+opt-level = 1
