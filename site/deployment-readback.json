@@ -1,54 +1,28 @@
 {
-  "verifiedAt": "2026-10-03T07:59:55.869Z",
-  "version": "83a8dfc2-9a22-4688-9258-86d4b4abf056",
+  "verifiedAt": "2026-10-03T09:59:03.259Z",
+  "version": "8fa04428-9edc-4219-a54b-70d44439eb5c",
   "results": [
-    {
-      "url": "https://switchya.com/",
-      "status": 200,
-      "bytes": 14677,
-      "sha256": "70690bc0a18c7cc7121ff7a7bc4e3c4a44606b5b26ebffce852e83390b861da8",
-      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-    },
-    {
-      "url": "https://www.switchya.com/",
-      "status": 200,
-      "bytes": 14677,
-      "sha256": "70690bc0a18c7cc7121ff7a7bc4e3c4a44606b5b26ebffce852e83390b861da8",
-      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-    },
-    {
-      "url": "https://switchya.com/site.css",
-      "status": 200,
-      "bytes": 27834,
-      "sha256": "20bf686ed9390fe3915bcb5aa61b6456b5e09a31f7072fe7109d5246f5bca489",
-      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-    },
-    {
-      "url": "https://switchya.com/site.js",
-      "status": 200,
-      "bytes": 1719,
-      "sha256": "cc15a4c69b7770ab863771e1d1adc8c80ffa498f6cbdddda00d95eaf2b2e7619",
-      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-    },
-    {
-      "url": "https://switchya.com/assets/switchya-mark.svg",
-      "status": 200,
-      "bytes": 495,
-      "sha256": "5295d8ae25239f81ebec6ffa85ac49d7e56e3cc21693660208dabdc62bcfb7c9",
-      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
-    },
     {
       "url": "https://switchya.com/assets/fonts/archivo-latin-var.woff2",
       "status": 200,
       "bytes": 90104,
       "sha256": "e3a28eade21a900c7155a247757f4b2834c07bb7ef07ad7efa55cebaac1e8f5e",
       "cacheControl": "public, max-age=2592000, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/assets/fonts/Archivo-OFL.txt",
+      "status": 200,
+      "bytes": 4503,
+      "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
     },
     {
       "url": "https://switchya.com/assets/fonts/jetbrains-mono-latin-var.woff2",
@@ -56,15 +30,219 @@
       "bytes": 40404,
       "sha256": "18be452724bfdc236c074ca94a249a7f41a86752c7d04ab258ce9ed5651f6a7e",
       "cacheControl": "public, max-age=2592000, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
     },
     {
-      "url": "https://switchya.com/design-readback-missing-20261003",
+      "url": "https://switchya.com/assets/fonts/JetBrainsMono-OFL.txt",
+      "status": 200,
+      "bytes": 4524,
+      "sha256": "403581b69dac5cff4079205e01c6b467e56af449ecbd7247693ddb1baafa005b",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/assets/switchya-mark.svg",
+      "status": 200,
+      "bytes": 495,
+      "sha256": "5295d8ae25239f81ebec6ffa85ac49d7e56e3cc21693660208dabdc62bcfb7c9",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/",
+      "status": 200,
+      "bytes": 15693,
+      "sha256": "827356a1fd836ee1b9235b99241b779880f18ecd9949ca8619618fc5fbf326be",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/robots.txt",
+      "status": 200,
+      "bytes": 66,
+      "sha256": "999c1936523f17f23ef0a3b81084dba3887c062146771eaaed6365df067e4126",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/site.css",
+      "status": 200,
+      "bytes": 27834,
+      "sha256": "20bf686ed9390fe3915bcb5aa61b6456b5e09a31f7072fe7109d5246f5bca489",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/site.js",
+      "status": 200,
+      "bytes": 1719,
+      "sha256": "cc15a4c69b7770ab863771e1d1adc8c80ffa498f6cbdddda00d95eaf2b2e7619",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/sitemap.xml",
+      "status": 200,
+      "bytes": 156,
+      "sha256": "f47b32784befac24598c5c7f92e2f4eed8eae909926f75cb3e10ab19d0e69efe",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://switchya.com/preview-release-readback-missing-20261003",
       "status": 404,
       "bytes": 877,
       "sha256": "31096a3ff88e7a3e9b4206147c237df15261c9d51644c86cb4a79d227a3dd664",
       "cacheControl": "public, max-age=0, must-revalidate, no-transform",
-      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'"
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/assets/fonts/archivo-latin-var.woff2",
+      "status": 200,
+      "bytes": 90104,
+      "sha256": "e3a28eade21a900c7155a247757f4b2834c07bb7ef07ad7efa55cebaac1e8f5e",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/assets/fonts/Archivo-OFL.txt",
+      "status": 200,
+      "bytes": 4503,
+      "sha256": "c3c8402eec0e31dc9a76851235b1c02a0bb821488b2db8e35bcc2ab60ca8fc2b",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/assets/fonts/jetbrains-mono-latin-var.woff2",
+      "status": 200,
+      "bytes": 40404,
+      "sha256": "18be452724bfdc236c074ca94a249a7f41a86752c7d04ab258ce9ed5651f6a7e",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/assets/fonts/JetBrainsMono-OFL.txt",
+      "status": 200,
+      "bytes": 4524,
+      "sha256": "403581b69dac5cff4079205e01c6b467e56af449ecbd7247693ddb1baafa005b",
+      "cacheControl": "public, max-age=2592000, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/assets/switchya-mark.svg",
+      "status": 200,
+      "bytes": 495,
+      "sha256": "5295d8ae25239f81ebec6ffa85ac49d7e56e3cc21693660208dabdc62bcfb7c9",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/",
+      "status": 200,
+      "bytes": 15693,
+      "sha256": "827356a1fd836ee1b9235b99241b779880f18ecd9949ca8619618fc5fbf326be",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/robots.txt",
+      "status": 200,
+      "bytes": 66,
+      "sha256": "999c1936523f17f23ef0a3b81084dba3887c062146771eaaed6365df067e4126",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/site.css",
+      "status": 200,
+      "bytes": 27834,
+      "sha256": "20bf686ed9390fe3915bcb5aa61b6456b5e09a31f7072fe7109d5246f5bca489",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/site.js",
+      "status": 200,
+      "bytes": 1719,
+      "sha256": "cc15a4c69b7770ab863771e1d1adc8c80ffa498f6cbdddda00d95eaf2b2e7619",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/sitemap.xml",
+      "status": 200,
+      "bytes": 156,
+      "sha256": "f47b32784befac24598c5c7f92e2f4eed8eae909926f75cb3e10ab19d0e69efe",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
+    },
+    {
+      "url": "https://www.switchya.com/preview-release-readback-missing-20261003",
+      "status": 404,
+      "bytes": 877,
+      "sha256": "31096a3ff88e7a3e9b4206147c237df15261c9d51644c86cb4a79d227a3dd664",
+      "cacheControl": "public, max-age=0, must-revalidate, no-transform",
+      "contentSecurityPolicy": "default-src 'self'; script-src 'self'; style-src 'self'; font-src 'self'; img-src 'self'; connect-src 'none'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'",
+      "xContentTypeOptions": "nosniff",
+      "xFrameOptions": "DENY",
+      "referrerPolicy": "strict-origin-when-cross-origin"
     },
     {
       "url": "http://switchya.com/",
@@ -76,5 +254,19 @@
       "status": 301,
       "location": "https://www.switchya.com/"
     }
-  ]
+  ],
+  "release": {
+    "url": "https://github.com/krutftw/switchyard/releases/tag/switchya-v0.1.0-preview.1",
+    "status": 200,
+    "assetUrl": "https://github.com/krutftw/switchyard/releases/download/switchya-v0.1.0-preview.1/switchya-0.1.0-preview.1-windows-x86_64-portable.zip",
+    "headStatus": 200,
+    "bytes": 20335861
+  },
+  "homepageChecks": {
+    "exactDownloadLinks": 2,
+    "canonicalApex": true,
+    "runtimeRequirements": true,
+    "retainedGatewayLinks": true,
+    "noAnalytics": true
+  }
 }

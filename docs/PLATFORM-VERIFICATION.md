@@ -43,6 +43,12 @@ The resulting x86-64 ELF development executable dynamically links to the Linux s
 
 No Linux GUI interaction was performed. This developer build is not a Linux release package.
 
+### Known Linux GUI dependency advisory
+
+The Linux desktop dependency graph includes `glib 0.18.5` through GTK `0.18.2` and WebKitGTK `2.0.2`. It is affected by [RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html), an unsound string-variant iterator implementation. The upstream patched line starts at `glib 0.20.0`; this Tauri/GTK stack constrains the dependency to `0.18`, so adding a separate newer version would not replace the affected dependency.
+
+The Windows desktop target graph excludes glib, and the CLI workspace has no glib dependency. This advisory therefore does not enter either Windows deliverable's dependency graph. The Linux native development build retains the advisory pending a compatible upstream fix or reviewed backport. Dependency presence alone does not establish whether the affected function is reachable in this application; that reachability was not tested. No Linux desktop release package is distributed.
+
 ## macOS source checks
 
 Rust/Cargo 1.95.0, cargo-zigbuild 0.23.4 and Zig 0.16.0 checked both `aarch64-apple-darwin` and `x86_64-apple-darwin`, with a deployment target of macOS 11.0:
