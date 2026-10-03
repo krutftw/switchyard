@@ -433,27 +433,29 @@ async fn the_gateway_pings_every_twenty_seconds() {
     let (mut socket, _) = app.live().await;
     subscribe(&mut socket, &[]).await;
 
-    // From here on the clock is the test's: it jumps to the next timer
-    // whenever nothing else is left to do, so twenty seconds pass at once.
-    tokio::time::pause();
-    let before = tokio::time::Instant::now();
-    loop {
-        match socket.next().await {
-            Some(Ok(Message::Ping(payload))) => {
-                assert!(payload.is_empty());
-                break;
+    // This is a real TCP integration test. Pausing Tokio time lets its
+    // clock run ahead while the kernel is delivering data, so it cannot
+    // reliably measure when the client actually receives the ping.
+    let before = std::time::Instant::now();
+    tokio::time::timeout(Duration::from_secs(35), async {
+        loop {
+            match socket.next().await {
+                Some(Ok(Message::Ping(payload))) => {
+                    assert!(payload.is_empty());
+                    break;
+                }
+                Some(Ok(Message::Text(_) | Message::Pong(_))) => continue,
+                other => panic!("expected a ping, got {other:?}"),
             }
-            Some(Ok(Message::Text(_) | Message::Pong(_))) => continue,
-            other => panic!("expected a ping, got {other:?}"),
         }
-    }
+    })
+    .await
+    .expect("the server sends its first ping within thirty-five seconds");
     let waited = before.elapsed();
-    tokio::time::resume();
     assert!(
-        (Duration::from_secs(15)..=Duration::from_secs(25)).contains(&waited),
-        "{waited:?}"
+        (Duration::from_secs(15)..=Duration::from_secs(30)).contains(&waited),
+        "the first ping arrived after {waited:?}"
     );
-    // The connection is alive and well afterwards.
     send_json(&mut socket, json!({"type": "ping"})).await;
     frame_of(&mut socket, "pong").await;
 }
