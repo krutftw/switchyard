@@ -43,6 +43,9 @@ export default function CatalogTab({ catalog, loading, error, onRetry, served })
   const filtering = !!(q.trim() || family);
   const clear = () => setQuery({ cq: null, family: null });
 
+  // The order of the columns is also in models.css: where the list is
+  // narrower than the table, it hides columns by their position (Released
+  // and Provider kinds first). Move one, move it there too.
   const columns = useMemo(
     () => [
       {
@@ -112,7 +115,7 @@ export default function CatalogTab({ catalog, loading, error, onRetry, served })
     <${Notice} tone="info" title="Built into the gateway, read-only">
       This is what the gateway knows about well-known models before you configure anything: limits and reasoning support, keyed by the vendor's model id. A model entry in a provider's settings (display name, context window, max output, reasoning) overrides it for that provider. Models that are not listed still work; their requests pass through without being fitted. <a href=${href('/providers')}>Open providers</a>
     <//>
-    <${Panel} flush>
+    <${Panel} flush class="models-catalog">
       <div class="models-toolbar" role="search" aria-label="Filter the catalog">
         <${Input}
           class="models-search"

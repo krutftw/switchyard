@@ -66,7 +66,9 @@ function patchCredentials(providers, patches) {
 export default function Overview() {
   const live = useStore(liveState);
   const liveOpen = live.status === 'open';
-  const [rangeParam, setRange] = useQueryParam('range', '1h');
+  // A range picked is a history step: Back returns to the previous one.
+  const [rangeParam, setRange] = useQueryParam('range', '1h', { push: true });
+  // A range that does not exist (an old or hand-made link) is shown as 1h.
   const range = rangeParam === '24h' ? '24h' : '1h';
 
   // Slow refreshes behind the live frames; brisk ones when there are none.

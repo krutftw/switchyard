@@ -22,8 +22,8 @@ use super::buckets::{Bucket, OTHER, SecondSlot, merge_groups};
 use super::latency::LatencySlot;
 use super::persist::{LoadReport, Persister, find_in_day, first_kept_day, load_dir};
 use super::types::{
-    BucketSize, GroupBy, Latency, NamedTotals, Range, RequestPage, RequestQuery, StatsTick,
-    StatusFilter, TimePoint, Timeseries, Totals, UsageSummary,
+    BadCursor, BucketSize, GroupBy, Latency, NamedTotals, Range, RequestPage, RequestQuery,
+    StatsTick, StatusFilter, TimePoint, Timeseries, Totals, UsageSummary,
 };
 use crate::gauges::Gauges;
 use crate::record::{RequestRecord, request_id_time_ms};
@@ -391,7 +391,9 @@ fn eq_opt(value: &Option<String>, wanted: &str) -> bool {
 
 /// A [`RequestQuery`] prepared for matching many records.
 struct Filter<'a> {
+    since: Option<i64>,
     model: Option<&'a str>,
+    client_model: Option<&'a str>,
     provider: Option<&'a str>,
     key: Option<&'a str>,
     status: Option<StatusFilter>,
@@ -402,7 +404,9 @@ struct Filter<'a> {
 impl<'a> Filter<'a> {
     fn new(query: &'a RequestQuery) -> Self {
         Filter {
+            since: query.since,
             model: query.model.as_deref(),
+            client_model: query.client_model.as_deref(),
             provider: query.provider.as_deref(),
             key: query.key.as_deref(),
             status: query.status,
@@ -411,6 +415,16 @@ impl<'a> Filter<'a> {
     }
 
     fn matches(&self, r: &RequestRecord) -> bool {
+        if self.since.is_some_and(|since| r.started_at < since) {
+            return false;
+        }
+        // The aggregation name alone: what `by_model` and `group_by=model`
+        // count the request under, so that their rows and this filter agree.
+        if let Some(model) = self.client_model
+            && !r.model_name().eq_ignore_ascii_case(model)
+        {
+            return false;
+        }
         // The aggregation name is compared as well: it is `unknown` for a
         // request without a model, the row the summaries list it under.
         if let Some(model) = self.model
@@ -679,25 +693,29 @@ impl UsageStore {
     /// that finished last. A request that ran for a long time is listed at
     /// the position of its start time, which can be below records that were
     /// already on an earlier page.
+    ///
+    /// An unusable `before` yields an empty page rather than the first page
+    /// again, which a paging client would loop on;
+    /// [`try_requests`](UsageStore::try_requests) reports it instead.
     pub fn requests(&self, query: &RequestQuery) -> RequestPage {
+        self.try_requests(query)
+            .unwrap_or_else(|BadCursor| RequestPage {
+                items: Vec::new(),
+                next_before: None,
+                has_more: false,
+                total: 0,
+                capacity: self.inner.state.lock().capacity,
+            })
+    }
+
+    /// [`requests`](UsageStore::requests), failing with [`BadCursor`] when
+    /// `before` is not a cursor (see [`BadCursor`] for what is).
+    pub fn try_requests(&self, query: &RequestQuery) -> Result<RequestPage, BadCursor> {
         let limit = query.page_size();
         let filter = Filter::new(query);
         let state = self.inner.state.lock();
         let cursor = match query.before.as_deref() {
-            Some(text) => match state.cursor(text) {
-                Some(cursor) => Some(cursor),
-                // An unusable cursor yields an empty page rather than the
-                // first page again, which a paging client would loop on.
-                None => {
-                    return RequestPage {
-                        items: Vec::new(),
-                        next_before: None,
-                        has_more: false,
-                        total: 0,
-                        capacity: state.capacity,
-                    };
-                }
-            },
+            Some(text) => Some(state.cursor(text).ok_or(BadCursor)?),
             None => None,
         };
         let mut items = Vec::with_capacity(limit.min(state.recent.len()));
@@ -721,13 +739,13 @@ impl UsageStore {
             (true, Some(last)) => Some(format!("{}:{}", last.started_at, last.id)),
             _ => None,
         };
-        RequestPage {
+        Ok(RequestPage {
             items,
             next_before,
             has_more,
             total,
             capacity: state.capacity,
-        }
+        })
     }
 
     /// A record still in memory.
@@ -2028,6 +2046,117 @@ mod tests {
         );
     }
 
+    /// `client_model` selects by the name the summaries count a request
+    /// under — and nothing else: `model` also matches the requested and the
+    /// upstream name, so a summary row opened with it could list requests
+    /// the row does not count (an alias's requests under its target's row).
+    #[test]
+    fn client_model_matches_the_summary_rows_exactly() {
+        let store = UsageStore::in_memory();
+        // A request for the alias `fast`, resolved to `fast` and sent to
+        // the upstream model `gpt-5`.
+        let mut alias = Spec {
+            id: "via-alias".to_string(),
+            model: "fast",
+            provider: Some("openai"),
+            key: None,
+            started_at: T0,
+            duration_ms: 10,
+            status: 200,
+        }
+        .build();
+        alias.upstream_model = Some("gpt-5".to_string());
+        store.record(&alias);
+        store.record(&simple("direct", T0 + 1_000, 200));
+        // Resolution never happened: counted under the requested name.
+        let mut unresolved = simple("unresolved", T0 + 2_000, 404);
+        unresolved.client_model = None;
+        unresolved.requested_model = "gpt-5".to_string();
+        store.record(&unresolved);
+        // No model at all.
+        let start = RequestStart::new(
+            Protocol::OpenaiChat,
+            "POST /v1/chat/completions",
+            "",
+            T0 + 3_000,
+        )
+        .with_id("no-model");
+        store.record(&RecordBuilder::new(start).finish(400, T0 + 3_001));
+
+        let by_model: BTreeMap<String, u64> = store
+            .summary(Range::Hour, T0 + 4_000)
+            .by_model
+            .into_iter()
+            .map(|row| (row.name, row.totals.requests))
+            .collect();
+        let run = |value: serde_json::Value| {
+            let page = store.requests(&query(value));
+            let mut found: Vec<String> = page.items.iter().map(|r| r.id.clone()).collect();
+            found.sort();
+            assert_eq!(page.total, found.len());
+            found
+        };
+        // `model=gpt-5` finds the alias's request through its upstream
+        // name; `client_model=gpt-5` finds what the `gpt-5` row counts.
+        assert_eq!(
+            run(json!({"model": "gpt-5"})),
+            ["direct", "unresolved", "via-alias"]
+        );
+        assert_eq!(
+            run(json!({"client_model": "gpt-5"})),
+            ["direct", "unresolved"]
+        );
+        assert_eq!(run(json!({"client_model": "FAST"})), ["via-alias"]);
+        assert_eq!(run(json!({"client_model": "unknown"})), ["no-model"]);
+        for (name, requests) in &by_model {
+            let listed = run(json!({ "client_model": name }));
+            assert_eq!(listed.len() as u64, *requests, "{name}");
+        }
+        // It combines with the other filters.
+        assert_eq!(
+            run(json!({"client_model": "gpt-5", "status": "ok"})),
+            ["direct"]
+        );
+        assert!(run(json!({"client_model": "gpt"})).is_empty());
+    }
+
+    /// `since` keeps the requests that started at or after the instant; it
+    /// is a filter, so `total` counts only those, and it combines with the
+    /// cursor and the other filters.
+    #[test]
+    fn since_keeps_the_requests_started_from_then_on() {
+        let store = UsageStore::in_memory();
+        for i in 0..6 {
+            store.record(&simple(
+                &format!("r{i}"),
+                T0 + i * 1_000,
+                if i == 4 { 500 } else { 200 },
+            ));
+        }
+        let page = store.requests(&query(json!({"since": T0 + 2_000})));
+        assert_eq!(ids(&page), ["r5", "r4", "r3", "r2"]);
+        assert_eq!(page.total, 4);
+        let page = store.requests(&query(
+            json!({"since": (T0 + 2_001).to_string(), "limit": 2}),
+        ));
+        assert_eq!(ids(&page), ["r5", "r4"]);
+        assert_eq!((page.total, page.has_more), (3, true));
+        let next = store.requests(&query(json!({
+            "since": T0 + 2_001, "limit": 2, "before": page.next_before
+        })));
+        assert_eq!(ids(&next), ["r3"]);
+        assert!(!next.has_more);
+        let page = store.requests(&query(json!({"since": T0 + 2_000, "status": "error"})));
+        assert_eq!(ids(&page), ["r4"]);
+        assert!(
+            store
+                .requests(&query(json!({"since": T0 + 9_000})))
+                .items
+                .is_empty()
+        );
+        assert_eq!(store.requests(&query(json!({"since": 0}))).total, 6);
+    }
+
     /// Regression: the list holds the newest N finished requests and
     /// `total` stops there, but nothing in the answer said what N is.
     #[test]
@@ -2133,9 +2262,29 @@ mod tests {
         // A cursor pointing at a record that has since been evicted.
         let page = store.requests(&query(json!({"before": format!("{}:gone", T0 + 4_500)})));
         assert_eq!(ids(&page), ["r4", "r3", "r2", "r1", "r0"]);
-        // Garbage yields nothing instead of the first page.
+        // Garbage yields nothing instead of the first page — and is an
+        // error to whoever asks for one.
         let page = store.requests(&query(json!({"before": "garbage"})));
         assert!(page.items.is_empty() && !page.has_more && page.next_before.is_none());
+        assert_eq!(
+            store.try_requests(&query(json!({"before": "garbage"}))),
+            Err(BadCursor)
+        );
+        // Every form above is a cursor to `try_requests` too, an id that has
+        // left the list but carries its time included.
+        for cursor in [
+            json!("r3"),
+            json!((T0 + 2_000).to_string()),
+            json!(format!("{}:gone", T0 + 4_500)),
+            json!(crate::record::new_request_id()),
+        ] {
+            assert!(
+                store
+                    .try_requests(&query(json!({ "before": cursor })))
+                    .is_ok(),
+                "{cursor}"
+            );
+        }
         // Filters and cursors combine; `total` ignores the cursor.
         store.record(&simple("bad", T0 + 2_500, 503));
         let page = store.requests(&query(json!({"status": "ok", "before": "r3", "limit": 2})));

@@ -26,8 +26,37 @@
     <script src="js/theme-boot.js"></script>
 
     <link rel="icon" href="favicon.svg" type="image/svg+xml" />
+    <!--
+      The two fonts: preloaded, and declared right here rather than in
+      css/tokens.css. On a reload Chrome reuses the parsed tokens.css of the
+      previous page together with the font files it had already fetched, so
+      the fresh preloads went unused and the console said so ("preloaded but
+      not used within a few seconds"). A font face declared in this document
+      is fetched by this document, through its preload. Keep each url() equal
+      to its preload's href, and the preloads `crossorigin`: fonts are always
+      fetched in CORS mode, and a preload in another mode is not reused.
+      (Inline styles are allowed by the policy: style-src 'unsafe-inline'.)
+    -->
     <link rel="preload" href="fonts/archivo-latin-var.woff2" as="font" type="font/woff2" crossorigin />
     <link rel="preload" href="fonts/jetbrains-mono-latin-var.woff2" as="font" type="font/woff2" crossorigin />
+    <style>
+      @font-face {
+        font-family: "Archivo";
+        src: url("fonts/archivo-latin-var.woff2") format("woff2");
+        font-weight: 100 900;
+        font-stretch: 62% 125%;
+        font-style: normal;
+        font-display: swap;
+      }
+
+      @font-face {
+        font-family: "JetBrains Mono";
+        src: url("fonts/jetbrains-mono-latin-var.woff2") format("woff2");
+        font-weight: 100 800;
+        font-style: normal;
+        font-display: swap;
+      }
+    </style>
     <link rel="stylesheet" href="css/tokens.css" />
     <link rel="stylesheet" href="css/base.css" />
     <link rel="stylesheet" href="css/components.css" />

@@ -1,7 +1,7 @@
 //! The generation pipeline (`docs/DESIGN.md` section 8): one client request
 //! from parsing to the reply, with every upstream attempt in between.
 
-use crate::auth::ClientIdentity;
+use crate::auth::{ClientIdentity, KeyTable};
 use crate::failover::{Failover, Failure, FinalError, Limits, Next};
 use crate::gateway::Inner;
 use crate::prepare::{Job, PrepareError, Prepared};
@@ -146,23 +146,47 @@ pub(crate) fn parse_request(
 /// The client key's checks: the model allow-list, then the rate limit (so
 /// a request for a model the key may not use does not count against it).
 ///
-/// The allow-list is matched against the name the client wrote (without its
-/// reasoning suffix) and against the registered name it resolved to, so a
-/// pattern works whichever spelling it uses.
+/// The allow-list is matched against the registered model or alias name.
+/// A fuzzy client spelling must not grant access to a different capability.
 pub(crate) fn check_identity(
+    keys: &KeyTable,
     identity: &ClientIdentity,
     requested: &str,
     resolved: Option<&Resolved>,
+    body: Option<&Value>,
 ) -> Result<(), ApiError> {
+    let identity = keys.refresh(identity)?;
     let written = parse_model_suffix(requested.trim()).base;
-    let allowed = identity.allows_model(written)
-        || resolved.is_some_and(|resolved| identity.allows_model(&resolved.base));
+    let allowed = identity.allows_model(resolved.map_or(written, |resolved| &resolved.base));
     if !allowed {
         return Err(ApiError::permission(format!(
             "this API key is not allowed to use model `{written}`"
         ))
         .with_code("model_not_allowed")
         .with_param("model"));
+    }
+    // Some provider extensions choose another execution model without
+    // returning through the gateway scheduler. Those choices cannot be
+    // authorized by a check of the primary model alone.
+    if identity.has_model_restrictions()
+        && let Some(field) = [
+            "models",
+            "route",
+            "fallbacks",
+            "context_window_fallbacks",
+            "preset",
+        ]
+        .into_iter()
+        .find(|field| {
+            body.and_then(|body| body.get(field))
+                .is_some_and(|value| !value.is_null())
+        })
+    {
+        return Err(ApiError::permission(format!(
+            "this API key cannot use upstream model selection field `{field}`"
+        ))
+        .with_code("model_not_allowed")
+        .with_param(field));
     }
     identity.check_rate(Instant::now())
 }
@@ -289,7 +313,13 @@ impl Inner {
         // between: a key that may not use a model is told so whether or not
         // the model exists.
         let resolution = self.scheduler.resolve(&meta.model);
-        if let Err(error) = check_identity(&identity, &meta.model, resolution.as_ref().ok()) {
+        if let Err(error) = check_identity(
+            &self.keys.load(),
+            &identity,
+            &meta.model,
+            resolution.as_ref().ok(),
+            Some(&json),
+        ) {
             return self.reject(recorder, client, &error);
         }
         let resolved = match resolution {
@@ -463,16 +493,9 @@ impl Inner {
             }
         }
 
-        // 6. Nothing worked.
-        let attempts = failover.attempts();
+        // 6. Nothing worked. (The record logs the `request failed` line,
+        // at a level that depends on the cause: see `recorder`.)
         let error = failover.into_error();
-        tracing::debug!(
-            request = %recorder.id(),
-            attempts,
-            status = error.api.status,
-            "request failed: {}",
-            error.api.message
-        );
         let served = match &last {
             Some(lease) => Served {
                 provider: Some(&lease.credential.provider),

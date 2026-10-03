@@ -38,13 +38,13 @@ export const DEFAULT_RANGE = '24h';
  * refused because every credential of the model was cooling down. Its note
  * names both: the second kind is often most of the row.
  *
- * The stand-in names are filters too: GET /requests takes `model=unknown`
+ * The stand-in names are filters too: GET /requests takes `client_model=unknown`
  * (no model was read), `provider=unknown` (no provider served it),
  * `key=anonymous` and `key=dashboard`, so every row opens the list of the
  * requests it counts.
  */
 export const GROUPS = [
-  { value: 'model', label: 'Model', noun: 'model', plural: 'models', field: 'by_model', param: 'model', sortParam: 'sort', filterParam: 'q', special: { unknown: 'no model resolved' } },
+  { value: 'model', label: 'Model', noun: 'model', plural: 'models', field: 'by_model', param: 'client_model', sortParam: 'sort', filterParam: 'q', special: { unknown: 'no model resolved' } },
   { value: 'provider', label: 'Provider', noun: 'provider', plural: 'providers', field: 'by_provider', param: 'provider', sortParam: 'psort', filterParam: 'pq', special: { unknown: 'no provider: failed before routing, or every credential cooling down' } },
   { value: 'key', label: 'Client key', noun: 'client key', plural: 'client keys', field: 'by_key', param: 'key', sortParam: 'ksort', filterParam: 'kq', special: { anonymous: 'no client key', dashboard: 'playground' } },
 ];

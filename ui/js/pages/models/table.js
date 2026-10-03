@@ -41,8 +41,8 @@ function RouteLine({ route, modelName }) {
   return html`
     <li class="models-route">
       <${StatusLamp} tone=${route.state} title=${route.label} />
-      <span class="models-route-text">
-        <span class="mono">${route.provider}</span>
+      <span class="models-route-text" title=${route.upstream_model !== modelName ? `${route.provider} → ${route.upstream_model}` : route.provider}>
+        <span class="mono models-route-provider">${route.provider}</span>
         ${route.upstream_model !== modelName &&
         html`<span class="models-route-up"><${Icon} name="arrow-right" size=${12} /><span class="mono">${route.upstream_model}</span></span>`}
       </span>
@@ -187,6 +187,10 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
   // (Ignored while the drawer is open: the keyboard then belongs to that layer.)
   useHotkey('/', () => search.current?.focus());
 
+  // The order of the columns is also in models.css: where the list is
+  // narrower than the table, it hides Max output (6th) and Reasoning (7th),
+  // then Context (5th), Kind (2nd) and Routes (4th) by their position. Move
+  // one, move it there too.
   const columns = useMemo(
     () => [
       { key: 'name', header: 'Model', primary: true, sortable: true, render: (row) => html`<${NameCell} row=${row} />` },
@@ -299,7 +303,7 @@ export default function ModelsTab({ rows, providers, providersLoading = false, l
         ${noModels.description}<span> Meanwhile the ${rows.length === 1 ? 'alias below has' : `${rows.length} aliases below have`} nothing to route to.</span>
       <//>
     `}
-    <${Panel} flush footer=${total > PAGE_SIZE ? html`<${Pagination} class="grow" page=${page} pageSize=${PAGE_SIZE} total=${total} noun="models" onPage=${(next) => setQuery({ page: next === 1 ? null : String(next) })} />` : null}>
+    <${Panel} flush class="models-list" footer=${total > PAGE_SIZE ? html`<${Pagination} class="grow" page=${page} pageSize=${PAGE_SIZE} total=${total} noun="models" onPage=${(next) => setQuery({ page: next === 1 ? null : String(next) })} />` : null}>
       <div class="models-toolbar" role="search" aria-label="Filter models">
         <${Input}
           class="models-search"

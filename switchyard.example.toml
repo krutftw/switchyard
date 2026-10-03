@@ -12,7 +12,7 @@
 host = "127.0.0.1"        # "0.0.0.0" to accept connections from other machines
 port = 8317
 body_limit_mb = 64        # largest accepted request body
-cors = true               # let browser apps call the API directly
+cors = true               # let authenticated browser apps call the API directly
 data_dir = "data"         # usage history and request logs; relative to this file
 
 # Serve HTTPS directly (otherwise put a reverse proxy in front):
@@ -24,7 +24,9 @@ data_dir = "data"         # usage history and request logs; relative to this fil
 [admin]
 enabled = true
 # Secret for the dashboard and the admin API. With no secret here and no
-# SWITCHYARD_ADMIN_SECRET in the environment, both are switched off.
+# SWITCHYARD_ADMIN_SECRET in the environment, both are switched off. It
+# travels in an HTTP header, so it may not start or end with a space or
+# contain control characters such as tabs or line breaks.
 secret = ""
 allow_remote = false      # accept admin requests from non-loopback addresses
 ui = true                 # serve the dashboard at /admin/
@@ -178,7 +180,10 @@ retention_days = 30
 # "gemini-2.5-flash(none)", "…(auto)".
 
 # ---------------------------------------------------------------------------
-# Payload rules patch the JSON sent upstream. Paths are dotted ("a.b.0.c").
+# Payload rules patch the JSON sent upstream. Paths are dotted ("a.b.0.c"):
+# a part made of digits indexes an array, "\." is a dot inside a key, and
+# there are no wildcards. A path may not be empty, have an empty part
+# ("a..b", a dot at either end) or hold spaces.
 
 # [[payload.default]]         # set only if the client did not
 # models = ["gemini-*"]

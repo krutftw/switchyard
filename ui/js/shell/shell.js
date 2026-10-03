@@ -307,6 +307,9 @@ function NotFound({ route }) {
 // Shell
 // ---------------------------------------------------------------------------
 
+/** How long after a change of page the skip link refuses a focus it was not tabbed to. */
+const SKIP_GUARD_MS = 1500;
+
 /**
  * takeFocus  the shell replaces something the user was working in (the
  *            sign-in form, the "Try again" of the boot screen), whose focused
@@ -338,6 +341,7 @@ export function Shell({ takeFocus = false } = {}) {
   // A new page starts at the top, with focus on the content for screen
   // readers and keyboard users. Query changes (filters, tabs) leave both alone.
   const firstPage = useRef(true);
+  const routedAt = useRef(0);
   useEffect(() => {
     if (firstPage.current) {
       firstPage.current = false;
@@ -347,10 +351,34 @@ export function Shell({ takeFocus = false } = {}) {
       if (takeFocus && (!at || at === document.body || !document.contains(at))) main.current?.focus({ preventScroll: true });
       return;
     }
+    routedAt.current = Date.now();
     window.scrollTo(0, 0);
-    main.current?.focus({ preventScroll: true });
+    // A page that has put the focus somewhere of its own (its search
+    // field) keeps it; anywhere else (the link that was followed, <body>)
+    // it goes to the page's main region.
+    const at = document.activeElement;
+    const placed = at && at !== main.current && main.current?.contains(at);
+    if (!placed) main.current?.focus({ preventScroll: true });
     setMoreOpen(false);
   }, [currentPath]);
+
+  // "Skip to content" is for the first Tab of a page load. Right after a
+  // change of page nothing else may leave the focus on it, where it shows
+  // over the top bar (a phone's browser handing the focus back to the top
+  // of the document after the fragment changed): the page's main region is
+  // where the focus belongs then. Tab still reaches it as usual.
+  const tabbedAt = useRef(0);
+  useEffect(() => {
+    const onKey = (event) => {
+      if (event.key === 'Tab') tabbedAt.current = Date.now();
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, []);
+  const onSkipFocus = () => {
+    const now = Date.now();
+    if (now - routedAt.current < SKIP_GUARD_MS && now - tabbedAt.current > 1000) main.current?.focus({ preventScroll: true });
+  };
 
   // Ctrl/Cmd+K toggles the palette. It may open over a drawer or a dialog
   // (its commands go through the leave guards like any other navigation),
@@ -414,7 +442,7 @@ export function Shell({ takeFocus = false } = {}) {
   );
 
   return html`
-    <a class="skip-link" href="#main" onClick=${(event) => {
+    <a class="skip-link" href="#main" onFocus=${onSkipFocus} onClick=${(event) => {
       // "#main" would be read as a route: move focus by hand instead.
       event.preventDefault();
       main.current?.focus();

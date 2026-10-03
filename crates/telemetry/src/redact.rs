@@ -191,7 +191,7 @@ pub fn redact_secret_value(name: &str, value: &str) -> String {
     if FULL.iter().any(|needle| c.contains(needle)) {
         return REDACTED.to_string();
     }
-    if c.contains("authorization") {
+    if c.contains("auth") {
         return redact_authorization(value.trim());
     }
     mask(value.trim())
@@ -204,7 +204,22 @@ pub fn redact_secret_value(name: &str, value: &str) -> String {
 /// (`x-original-uri: /v1beta/…?key=…`), a `referer` with an access token,
 /// or the `sec-websocket-protocol` browser clients put an API key in.
 pub fn redact_header_value(name: &str, value: &str) -> String {
-    if is_secret_key(name) {
+    // Custom provider credentials use many names beyond the JSON key rules.
+    // Keep this header-specific so ordinary JSON fields such as "key" are
+    // still usable, and preserve token counter headers.
+    let name_key = compact(name);
+    let credential_header = [
+        "auth",
+        "key",
+        "credential",
+        "signature",
+        "session",
+        "jwt",
+        "assertion",
+    ]
+    .iter()
+    .any(|part| name_key.contains(part));
+    if is_secret_key(name) || credential_header {
         redact_secret_value(name, value)
     } else {
         redact_text(value)
@@ -383,7 +398,7 @@ fn is_secret_query_param(name: &str) -> bool {
         .strip_suffix("[]")
         .or_else(|| lower.strip_suffix("%5b%5d"))
         .unwrap_or(&lower);
-    matches!(lower, "key" | "sig" | "signature") || is_secret_key(lower)
+    matches!(lower, "key" | "sig" | "signature" | "ticket") || is_secret_key(lower)
 }
 
 /// Redacts the values of secret query parameters (`key=`, `api_key=`,
@@ -920,6 +935,35 @@ mod tests {
         assert_eq!(headers["accept"], "text/event-stream, application/json");
         assert_eq!(headers["x-ratelimit-remaining-tokens"], "149984");
         assert_eq!(headers.len(), 8);
+    }
+
+    #[test]
+    fn custom_credential_headers_and_websocket_tickets_are_redacted() {
+        let credential = "opaque-provider-credential-value";
+        for name in [
+            "Ocp-Apim-Subscription-Key",
+            "X-Auth-Key",
+            "x-portkey-virtual-key",
+            "Helicone-Auth",
+            "x-credential",
+            "x-signature",
+            "x-session",
+            "x-jwt",
+            "x-assertion",
+        ] {
+            let redacted = redact_header_value(name, credential);
+            assert_ne!(redacted, credential, "{name}");
+            assert_eq!(redact_header_value(name, &redacted), redacted);
+        }
+        assert_eq!(
+            redact_header_value("x-ratelimit-remaining-tokens", "149984"),
+            "149984"
+        );
+        let url = format!("/v1/responses?ticket={credential}&model=test");
+        let redacted = redact_url(&url);
+        assert!(!redacted.contains(credential));
+        assert!(redacted.ends_with("&model=test"));
+        assert_eq!(redact_url(&redacted), redacted);
     }
 
     #[test]

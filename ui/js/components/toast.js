@@ -13,8 +13,13 @@
 // A toast is for the result of something the user just did. Problems the
 // user must act on belong on the page (Notice, FormError, ErrorState), where
 // they do not disappear.
+//
+// A toast that closes while it has the keyboard focus (its action, its
+// Dismiss button, Escape) hands the focus to the next toast, else back to
+// where it was before it came into the toasts, else to the page's <main>.
 
-import { html, useEffect, useRef } from '../../vendor/preact-htm.js';
+import { html, useEffect, useLayoutEffect, useRef } from '../../vendor/preact-htm.js';
+import { focusableWithin, isFocusable } from '../lib/dom.js';
 import { usePresence } from '../lib/hooks.js';
 import { createStore, useStore } from '../lib/store.js';
 import { Button, IconButton } from './button.js';
@@ -75,8 +80,62 @@ toast.warning = (title, options) => push('caution', title, options);
 toast.error = (title, options) => push('stop', title, options);
 toast.dismiss = dismiss;
 
+// ---------------------------------------------------------------------------
+// Focus: a toast that closes while it has the focus hands it on
+// ---------------------------------------------------------------------------
+
+/** The element of each toast on screen, by id. */
+const elements = new Map();
+
+/** The last element outside the toasts that had the focus. */
+let focusedBefore = null;
+
+/** Focus `el` and say whether it took. */
+function focusOn(el) {
+  if (!el || typeof el.focus !== 'function' || !document.contains(el) || !isFocusable(el)) return false;
+  el.focus({ preventScroll: true });
+  return document.activeElement === el;
+}
+
+/**
+ * The toast with `id` is closing (its own action or Dismiss button, Escape,
+ * toast.dismiss) and has the focus, which would fall to <body> when it
+ * leaves. Hand it on: to the next toast still open (else the one before),
+ * else to the element that had the focus before the toasts got it, else to
+ * the page's <main>.
+ */
+function handOn(id) {
+  const list = store.get();
+  const at = list.findIndex((t) => t.id === id);
+  const others = [...list.slice(at + 1), ...list.slice(0, Math.max(at, 0)).reverse()].filter((t) => !t.closing);
+  for (const other of others) {
+    const el = elements.get(other.id);
+    if (el && focusOn(focusableWithin(el)[0])) return;
+  }
+  if (focusOn(focusedBefore)) return;
+  focusOn(document.querySelector('main'));
+}
+
 function ToastItem({ item }) {
   const { mounted, state } = usePresence(!item.closing, 140);
+  const root = useRef(null);
+
+  // Registered while it is on screen, for handOn.
+  useLayoutEffect(() => {
+    const el = root.current;
+    if (el) elements.set(item.id, el);
+    return () => {
+      if (elements.get(item.id) === el) elements.delete(item.id);
+    };
+  }, [item.id, mounted]);
+
+  // Closing with the focus inside: the browser would drop it on <body> once
+  // the toast has faded out. Runs right after the closing render.
+  useLayoutEffect(() => {
+    if (!item.closing) return;
+    const el = root.current;
+    if (el && el.contains(document.activeElement)) handOn(item.id);
+  }, [item.closing, item.id]);
   const remaining = useRef(item.duration);
   const startedAt = useRef(0);
   const timer = useRef(null);
@@ -128,6 +187,7 @@ function ToastItem({ item }) {
 
   return html`
     <div
+      ref=${root}
       class="toast"
       data-tone=${item.tone}
       data-state=${state}
@@ -167,8 +227,23 @@ function ToastItem({ item }) {
 
 function ToastList() {
   const items = useStore(store);
+  const list = useRef(null);
+  // Remember where the focus was before it came into the toasts, to give it
+  // back there when the last toast holding it closes. Focus events do not
+  // bubble; they do pass the document on their way down.
+  useEffect(() => {
+    const onFocus = (event) => {
+      const target = event.target;
+      if (target && target.nodeType === 1 && !list.current?.contains(target)) focusedBefore = target;
+    };
+    document.addEventListener('focus', onFocus, true);
+    return () => {
+      document.removeEventListener('focus', onFocus, true);
+      focusedBefore = null;
+    };
+  }, []);
   return html`
-    <div class="toasts" role="region" aria-label="Notifications">
+    <div ref=${list} class="toasts" role="region" aria-label="Notifications">
       ${items.map((item) => html`<${ToastItem} key=${item.id} item=${item} />`)}
     </div>
   `;

@@ -759,6 +759,7 @@ impl Scheduler {
                 info: model.info.clone(),
                 hidden: model.hidden,
                 ignored: false,
+                shadows_model: false,
                 alias_targets: None,
                 routes: model
                     .routes
@@ -799,6 +800,8 @@ impl Scheduler {
                 info: alias.info.clone(),
                 hidden: alias.hidden,
                 ignored: alias.targets.is_empty(),
+                shadows_model: !alias.targets.is_empty()
+                    && registry.serves_model_named(&alias.name),
                 alias_targets: Some(alias.raw_targets.clone()),
                 routes,
             });

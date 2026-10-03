@@ -14,9 +14,8 @@ import { cx } from '../lib/dom.js';
 import { useModalLayer, usePresence, useUid } from '../lib/hooks.js';
 import { createStore, useStore } from '../lib/store.js';
 import { Button, IconButton } from './button.js';
-import { Input } from './form.js';
+import { FormError, Input } from './form.js';
 import { Portal } from './portal.js';
-import { Notice } from './surface.js';
 
 // ---------------------------------------------------------------------------
 // Modal
@@ -231,7 +230,7 @@ export function ConfirmDialog({ open, title, message, confirmLabel = 'Confirm', 
           autoFocus
           autocomplete="off"
         />`}
-        ${error && html`<${Notice} tone="stop" title="That did not work">${error.message || String(error)}<//>`}
+        <${FormError} error=${error} title="That did not work" />
       </div>
     <//>
   `;

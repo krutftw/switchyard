@@ -101,10 +101,17 @@ const END = Math.floor(Date.now() / HOUR) * HOUR;
 const X48 = Array.from({ length: 48 }, (_, i) => END - (47 - i) * (HOUR / 2));
 const X24 = Array.from({ length: 24 }, (_, i) => END - (23 - i) * HOUR);
 
+// The third series has a long name: its label is the short one, and `title`
+// keeps the full name for the legend's and the table heading's tooltip.
 const REQUEST_SERIES = [
   { key: 'gpt-4o', label: 'gpt-4o', values: makeSeries(11, 48, 420, 260) },
   { key: 'claude-sonnet-4-5', label: 'claude-sonnet-4-5', values: makeSeries(23, 48, 300, 200) },
-  { key: 'gemini-2.5-pro', label: 'gemini-2.5-pro', values: makeSeries(37, 48, 150, 120) },
+  {
+    key: 'vertex/gemini-2.5-pro-preview-06-05',
+    label: 'gemini-2.5-pro…',
+    title: 'vertex/gemini-2.5-pro-preview-06-05',
+    values: makeSeries(37, 48, 150, 120),
+  },
 ];
 
 const TOKEN_SERIES = [
@@ -174,6 +181,12 @@ const SAMPLE_BODY = {
 // JavaScript number and a temperature written as 1.0.
 const SAMPLE_WIRE =
   '{"model":"gpt-4o","stream":true,"temperature":1.0,"seed":12345678901234567890,"messages":[{"role":"system","content":"You are a terse assistant."},{"role":"user","content":"Summarise the incident report in three bullet points."}],"tools":[],"metadata":{"trace":null,"retries":0,"cached":false}}';
+
+// What a provider's HealthStrip counts: [one, many], so one reads singular.
+const ATTEMPT_NOUN = ['upstream attempt', 'upstream attempts'];
+
+// A request record whose status was 200 but which failed (the stream broke).
+const STREAM_BROKE = { status: 200, ok: false };
 
 const HEALTH = Array.from({ length: 20 }, (_, i) => {
   const random = seeded(100 + i);
@@ -337,6 +350,11 @@ function ButtonsSection() {
     setLoading(true);
     setTimeout(() => setLoading(false), 1600);
   };
+  // A button that turns off under the user's hand is aria-disabled, not
+  // disabled: it looks off and ignores clicks, and the keyboard focus stays
+  // on it instead of dropping to <body>. Press Next with Enter until the end.
+  const [step, setStep] = useState(1);
+  const last = step >= 3;
   return html`
     <${Section} id="buttons" title="Buttons" description="One primary button per view. Labels are verbs that name the action.">
       <div class="kit-grid">
@@ -352,11 +370,16 @@ function ButtonsSection() {
           <${Button}>Medium<//>
           <${Button} size="lg">Large<//>
         <//>
-        <${Example} label="Loading and disabled">
+        <${Example} label="Loading, disabled, aria-disabled">
           <${Button} variant="primary" loading=${loading} onClick=${run}>Save changes<//>
           <${Button} loading>Saving<//>
           <${Button} disabled>Disabled<//>
           <${Button} variant="primary" disabled>Disabled<//>
+          <span class="kit-break" aria-hidden="true"></span>
+          <span class="faint kit-note">aria-disabled: off, and the focus stays on it.</span>
+          <${Button} icon="arrow-left" aria-disabled=${step <= 1 ? 'true' : undefined} onClick=${() => setStep((n) => Math.max(1, n - 1))}>Previous<//>
+          <span class="mono faint">Step ${step} of 3</span>
+          <${Button} iconRight="arrow-right" aria-disabled=${last ? 'true' : undefined} onClick=${() => setStep((n) => Math.min(3, n + 1))}>Next<//>
         <//>
         <${Example} label="Icons, links, copy">
           <${Button} icon="refresh">Refresh<//>
@@ -365,7 +388,7 @@ function ButtonsSection() {
           <${IconButton} icon="edit" label="Edit" variant="secondary" />
           <${IconButton} icon="trash" label="Delete" size="sm" />
           <${CopyButton} value="sy-example-key" label="Copy key" />
-          <${CopyButton} value="curl -s http://127.0.0.1:8317/v1/models" variant="secondary">Copy curl<//>
+          <${CopyButton} value="curl -s http://127.0.0.1:8317/v1/models" variant="secondary">Copy curl (bash/zsh)<//>
           <${Spinner} label="Loading" />
         <//>
       </div>
@@ -392,10 +415,15 @@ function StatusSection() {
           <${Badge} tone="info">Translated<//>
           <${Badge} outline>3 attempts<//>
         <//>
-        <${Example} label="Mono badges, HTTP status">
-          <${Badge} mono>openai-responses<//>
-          <${Badge} mono>anthropic<//>
-          ${[200, 429, 502].map((code) => html`<${Badge} key=${code} mono tone=${toneForStatus(code)}>${code}<//>`)}
+        <${Example} label="Mono badges, HTTP status (toneForStatus)">
+          <span class="stack" style="--gap:var(--space-2)">
+            <span class="row row-wrap" style="--gap:var(--space-2)">
+              <${Badge} mono>openai-responses<//>
+              <${Badge} mono>anthropic<//>
+              ${[101, 200, 429, 502].map((code) => html`<${Badge} key=${code} mono tone=${toneForStatus(code)}>${code}<//>`)}
+            </span>
+            <span class="faint kit-note">A 101 is a WebSocket switched to: info, not a failure. A record's <span class="mono">ok</span> decides before the status does: a stream that broke after its 200 is <${Badge} mono tone=${STREAM_BROKE.ok === false ? 'stop' : toneForStatus(STREAM_BROKE.status)}>200<//>.</span>
+          </span>
         <//>
         <${Example} label="Lamp in a badge, key caps">
           <${Badge} tone="clear" lamp>Healthy<//>
@@ -425,7 +453,8 @@ function StatsSection() {
 
 function TableSection() {
   const [mode, setMode] = useState('data');
-  const [open, setOpen] = useQueryParam('request', '');
+  // The record a drawer opens is a history step: Back closes the drawer.
+  const [open, setOpen] = useQueryParam('request', '', { push: true });
   const [page, setPage] = useState(1);
   const now = useNow(5000);
   const record = SAMPLE_ROWS.find((row) => row.id === open);
@@ -612,8 +641,12 @@ function AttemptsTimeline() {
 }
 
 function ChoiceSection() {
-  const [tab, setTab] = useState('summary');
-  const [range, setRange] = useState('24h');
+  // A tab and a range are what the user picks from a few choices: each pick
+  // is a step in the history, so Back returns to the previous one. They live
+  // in the query (?tab=, ?range=) with `push: true`; text that is typed keeps
+  // the default (replace), or every keystroke would be a step.
+  const [tab, setTab] = useQueryParam('tab', 'summary', { push: true });
+  const [range, setRange] = useQueryParam('range', '24h', { push: true });
   const [view, setView] = useState('chart');
   const [part, setPart] = useState('client-request');
   const [capture, setCapture] = useState('all');
@@ -633,11 +666,12 @@ function ChoiceSection() {
                 { id: 'raw', label: 'Raw events', disabled: true },
               ]}
             />
-            <p class="muted">Showing: <span class="mono">${tab}</span>. Arrow keys move between tabs.</p>
+            <p class="muted">Showing: <span class="mono">${tab}</span>. Arrow keys move between tabs. The tab is in the address with <span class="mono">useQueryParam('tab', 'summary', { push: true })</span>: each pick is a history step, so Back returns to the previous tab.</p>
           </div>
         <//>
-        <${Example} label="Segmented">
+        <${Example} label="Segmented, a history step">
           <${Segmented} label="Time range" value=${range} onChange=${setRange} options=${['1h', '24h', '7d', '30d']} />
+          <span class="faint">Range <span class="mono">${range}</span>, kept in the address; Back returns to the last one.</span>
           <${Segmented}
             label="View"
             size="sm"
@@ -1083,7 +1117,8 @@ function ContentSection() {
           note="A captured body is passed as the string it arrived as. It is re-indented, never re-serialised: 1.0 and the 20-digit seed are shown, and copied, as they were sent."
         />
         <div class="stack">
-          <${CodeBlock} language="text" label="Example request with curl" value=${'curl -s http://127.0.0.1:8317/v1/chat/completions \\\n  -H "Authorization: Bearer $SWITCHYARD_KEY" \\\n  -d \'{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}\''} />
+          <${CodeBlock} language="text" label="Example request with curl for bash/zsh" value=${'curl -s http://127.0.0.1:8317/v1/chat/completions \\\n  -H "Authorization: Bearer $SWITCHYARD_KEY" \\\n  -d \'{"model":"gpt-4o","messages":[{"role":"user","content":"Hi"}]}\''} />
+          <${CodeBlock} language="text" label="A long curl line for bash/zsh without a title" value=${'curl -sS -N http://127.0.0.1:8317/v1/chat/completions -H "Authorization: Bearer $SWITCHYARD_KEY" -H "Content-Type: application/json" -d \'{"model":"gpt-4o","stream":true}\''} note="This bash/zsh example has no title. The copy and wrap buttons still have a bar of their own: a long first line scrolls under nothing." />
           <${Panel} title="Key and value">
             <${KeyValue}
               items=${[
@@ -1158,6 +1193,9 @@ function StatesSection() {
               }}
             />
           </div>
+          <hr />
+          <${LoadMore} hasMore=${false} shown=${1} noun=${['matching request', 'matching requests']} />
+          <p class="faint kit-note">The end of a list of one counts in the singular: pass the noun as a pair, or a plural that ends in "s".</p>
         </div>
       <//>
     <//>
@@ -1176,7 +1214,7 @@ function ChartsSection() {
         <${Switch} label="Simulate a refetch" hint="The old plot stays, dimmed. Nothing jumps." checked=${stale} onChange=${setStale} />
       </div>
       <div class="grid-2">
-        <${Panel} title="Requests by model" description="LineChart, three series">
+        <${Panel} title="Requests by model" description="LineChart, three series. The third has a shortened label; its title, the full name, is the tooltip of its legend entry and of its column in the table view.">
           <${LineChart} x=${X48} series=${REQUEST_SERIES} stale=${stale} label="Requests per half hour by model, last 24 hours" valueFormat=${formatNumber} />
         <//>
         <${Panel} title="Tokens by type" description="AreaChart, stacked">
@@ -1220,7 +1258,9 @@ function ChartsSection() {
             <div class="kit-inline"><span class="faint">Success rate</span><${Meter} value=${0.982} tone="clear" label="Success rate" text=${formatPercent(0.982)} /></div>
             <div class="kit-inline"><span class="faint">Rate limit used</span><${Meter} value=${468} max=${600} tone="caution" label="Rate limit used" text="468 / 600 rpm" /></div>
             <div class="kit-inline"><span class="faint">Budget</span><${Meter} value=${0.34} label="Budget used" /></div>
-            <div class="kit-inline"><span class="faint">Last 200 minutes</span><${HealthStrip} buckets=${HEALTH} label="openai-main key 1" noun="upstream attempts" /></div>
+            <div class="kit-inline"><span class="faint">Last 200 minutes</span><${HealthStrip} buckets=${HEALTH} label="openai-main key 1" noun=${ATTEMPT_NOUN} /></div>
+            <div class="kit-inline"><span class="faint">One attempt, failed</span><${HealthStrip} buckets=${[{ ok: 0, failed: 1, label: 'Last 10 minutes' }]} label="openai-main key 2" noun=${ATTEMPT_NOUN} /></div>
+            <p class="faint kit-note">Its spoken summary counts with the noun pair: "openai-main key 2: 0% of 1 recent upstream attempt succeeded".</p>
             <div class="kit-inline"><span class="faint">Requests</span><${Sparkline} data=${REQUEST_SERIES[1].values.slice(-24)} label="Requests, last 12 hours" /></div>
             <div class="kit-inline"><span class="faint">Three readings</span><${Sparkline} data=${[4, 9, 7]} label="Requests, first three minutes" /></div>
             <div class="kit-inline"><span class="faint">Same, minPoints 6</span><${Sparkline} data=${[4, 9, 7]} minPoints=${6} label="Requests, first three minutes" /></div>
@@ -1275,14 +1315,17 @@ function LiveSection() {
     if (frame.type === 'request.finished') {
       // A request that never reached a provider (no such model, every
       // credential cooling down) has no provider, and may have no model.
-      setEvents((list) => [{ id: data.id, model: data.requested_model, provider: data.provider, status: data.status, duration: data.duration_ms }, ...list].slice(0, 6));
+      setEvents((list) => [{ id: data.id, model: data.requested_model, provider: data.provider, status: data.status, ok: data.ok, duration: data.duration_ms }, ...list].slice(0, 6));
     }
     bump((n) => n + 1);
   });
   // A stream has holes: after a reconnect, and when the gateway says this
   // connection lagged. A page that keeps a list from frames loads it again
   // here (useLiveGap(res.refresh)); this one has nothing to load, so it says so.
-  useLiveGap(({ reason, missed }) => setGap({ reason, missed, at: Date.now() }));
+  // `onDown` is the other half: the moment an open connection is lost (a
+  // page would start polling there), without watching liveState for it.
+  const [down, setDown] = useState(null);
+  useLiveGap(({ reason, missed }) => setGap({ reason, missed, at: Date.now() }), { onDown: () => setDown(Date.now()) });
 
   // p50_ms is made of latency_samples requests of the last hour: with none,
   // the 0 it carries means "no data", not "instant".
@@ -1306,6 +1349,7 @@ function LiveSection() {
               { label: 'Gateway', value: state.hello?.version, mono: true },
               { label: 'Gateway started', value: state.hello?.started_at ? formatRelativeTime(state.hello.started_at) : null },
               { label: 'Frames seen', value: Object.entries(counts.current).map(([type, n]) => `${type} ${n}`).join(', ') || null, mono: true },
+              { label: 'Last down', value: down ? `Connection lost at ${formatTime(down)}` : 'Not since this page opened' },
               { label: 'Last gap', value: gap ? `${gap.reason === 'lagged' ? `Lagged, ${gap.missed == null ? 'some' : formatNumber(gap.missed)} events missed` : 'Reconnected'} at ${formatTime(gap.at)}` : 'None since this page opened' },
             ]}
           />
@@ -1339,7 +1383,7 @@ function LiveSection() {
             { key: 'id', header: 'Request', mono: true, primary: true },
             { key: 'model', header: 'Model', mono: true, render: (r) => r.model ?? DASH },
             { key: 'provider', header: 'Provider', mono: true, render: (r) => r.provider ?? DASH },
-            { key: 'status', header: 'Status', render: (r) => html`<${Badge} mono tone=${toneForStatus(r.status)}>${r.status}<//>` },
+            { key: 'status', header: 'Status', render: (r) => html`<${Badge} mono tone=${r.ok === false ? 'stop' : toneForStatus(r.status)}>${r.status}<//>` },
             { key: 'duration', header: 'Duration', align: 'right', num: true, render: (r) => formatDuration(r.duration) },
           ]}
           empty=${{ icon: 'plug', title: 'Waiting for traffic', description: 'Finished requests appear here as they arrive over the live connection.' }}

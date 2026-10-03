@@ -69,9 +69,17 @@ pub(crate) async fn put_raw(
     ok_json(&config_view(&state, &config))
 }
 
-/// `POST /config/validate`: always 200; the verdict is in the body.
-pub(crate) async fn validate(JsonBody(body): JsonBody<TextBody>) -> ApiResult {
-    let issues = validate_text(&body.text).err().unwrap_or_default();
+/// `POST /config/validate`: always 200; the verdict is in the body. It is
+/// the verdict `PUT /config/raw` would give: the text's issues, or — for a
+/// text that is valid — what saving it would lock out.
+pub(crate) async fn validate(
+    State(state): State<Shared>,
+    JsonBody(body): JsonBody<TextBody>,
+) -> ApiResult {
+    let issues = match validate_text(&body.text) {
+        Ok(config) => state.lockout_issues(&config),
+        Err(issues) => issues,
+    };
     ok_json(&json!({
         "ok": issues.is_empty(),
         "issues": issues,
@@ -96,9 +104,38 @@ pub(crate) async fn patch_settings(
     };
     check_sections(&patch)?;
     let (config, ()) = state
-        .edit_config(move |config, _| apply_settings(config, &patch))
+        .edit_config(move |config, scope| {
+            apply_settings(config, &patch)?;
+            scope.unset(null_paths(&patch));
+            Ok(())
+        })
         .await?;
     ok_json(&config_view(&state, &config))
+}
+
+/// The dotted paths a patch sets to `null` (`routing.cooldown`,
+/// `server.port`): settings to take out of the file, so their default
+/// applies rather than a copy of it written out. The store leaves in the
+/// file any whose value is not the default after all (`admin.secret`, which
+/// `null` keeps like `""`).
+fn null_paths(patch: &Map<String, Value>) -> Vec<String> {
+    fn walk(fields: &Map<String, Value>, prefix: &str, paths: &mut Vec<String>) {
+        for (key, value) in fields {
+            let path = format!("{prefix}.{key}");
+            match value {
+                Value::Null => paths.push(path),
+                Value::Object(inner) => walk(inner, &path, paths),
+                _ => {}
+            }
+        }
+    }
+    let mut paths = Vec::new();
+    for (section, value) in patch {
+        if let Value::Object(fields) = value {
+            walk(fields, section, &mut paths);
+        }
+    }
+    paths
 }
 
 /// Refuses a patch that reaches outside the settings sections.
@@ -330,6 +367,25 @@ mod tests {
         assert!(
             unknown.message.contains("unknown field `keepalive`"),
             "{unknown:?}"
+        );
+    }
+
+    #[test]
+    fn null_paths_name_every_null_of_the_patch() {
+        let patch = patch(json!({
+            "routing": {"strategy": null, "cooldown": {"auth_secs": null, "quota_secs": 5}},
+            "server": {"tls": null, "port": 9000},
+            "auth": {"required": null},
+            "usage": {},
+        }));
+        assert_eq!(
+            null_paths(&patch),
+            [
+                "routing.strategy",
+                "routing.cooldown.auth_secs",
+                "server.tls",
+                "auth.required"
+            ]
         );
     }
 

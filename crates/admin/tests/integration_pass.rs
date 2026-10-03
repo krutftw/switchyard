@@ -594,7 +594,8 @@ async fn invalid_aliases_and_settings_are_refused_too() {
         )
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(paths(&body), ["[0]"]);
+    // At the field itself (A2-7), not the row.
+    assert_eq!(paths(&body), ["[0].cache_read"]);
 
     assert_eq!(app.file(), file);
 }
@@ -651,9 +652,10 @@ async fn a_null_api_key_removes_the_key_in_one_request() {
     assert_eq!(credential["masked_key"], "");
     assert_eq!(credential["proxy"], "http://127.0.0.1:3128");
     assert_eq!(credential["status"], "ready");
+    // The entry says it has no key, so it can be sent back as it is.
     assert_eq!(
         body["config"]["credentials"],
-        json!([{"label": "local", "proxy": "http://127.0.0.1:3128"}])
+        json!([{"api_key": null, "label": "local", "proxy": "http://127.0.0.1:3128"}])
     );
     let config = app.gateway.config();
     let provider = config.provider("local").unwrap();

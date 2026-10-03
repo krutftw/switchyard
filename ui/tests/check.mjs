@@ -261,9 +261,98 @@ assert.equal(classOf('true'), 'tok-atom');
 assert.equal(classOf('null'), 'tok-atom');
 assert.equal(classOf('"a \\"quoted\\" \\\\ string: {x}"'), 'tok-string');
 
-// 10. Status tone mapping.
+// 10. Status tone mapping. A 101 is a WebSocket switched to: information, not a failure.
 const { toneForStatus } = await import(url('js/components/status.js'));
 assert.deepEqual([200, 204, 302, 429, 400, 502, 0].map(toneForStatus), ['clear', 'clear', 'caution', 'caution', 'stop', 'stop', 'off']);
+assert.deepEqual([100, 101, 199, null, undefined].map(toneForStatus), ['info', 'info', 'info', 'off', 'off']);
+const { statusTone } = await import(url('js/pages/requests/cells.js'));
+assert.equal(statusTone({ status: 101, ok: false }), 'stop', 'a broken WebSocket relay is a failed request despite its successful upgrade');
+assert.equal(statusTone({ status: 101, ok: true }), 'clear', 'an orderly WebSocket relay remains successful');
+assert.equal(statusTone({ status: 200, ok: false }), 'stop', 'a stream failure overrides the initial HTTP success');
+assert.equal(statusTone({ status: 429, ok: false }), 'caution', 'rate-limit refusals retain their caution tone');
+
+// 10b. Chart nouns and names: one HealthStrip noun for one attempt, the full
+// name of a shortened series for its title.
+assert.equal(c.countNoun('requests', 1), 'request');
+assert.equal(c.countNoun('requests', 2), 'requests');
+assert.equal(c.countNoun('upstream attempts', 1), 'upstream attempt', 'a string noun is a plural; its singular drops the s');
+assert.equal(c.countNoun(['person', 'people'], 1), 'person');
+assert.equal(c.countNoun(['person', 'people'], 0), 'people');
+assert.equal(c.countNoun(['upstream attempt'], 3), 'upstream attempts');
+assert.equal(c.countNoun('access', 1), 'access', 'a word ending in ss is left alone');
+assert.equal(c.seriesTitle({ key: 'k', label: 'gpt-4o…', title: 'openai/gpt-4o-2024-08-06' }), 'openai/gpt-4o-2024-08-06');
+assert.equal(c.seriesTitle({ key: 'k', label: 'gpt-4o' }), 'gpt-4o');
+assert.equal(c.seriesTitle({ key: 'k' }), 'k');
+assert.equal(c.seriesTitle({ key: 'k', label: { type: 'span' } }), undefined, 'a label that is markup has no title of its own');
+
+// 10c. Replay: one answer to "can the playground send this record again",
+// for the request drawer and the playground alike.
+{
+  const replay = await import(url('js/lib/replay.js'));
+  const { PROTOCOL_IDS } = await import(url('js/pages/playground/protocols.js'));
+  assert.deepEqual(replay.REPLAY_PROTOCOLS, PROTOCOL_IDS, 'the protocols the playground replays are the ones it speaks');
+  const rec = (client_protocol, endpoint) => ({ client_protocol, endpoint });
+  const body = { client_request: '{"model":"m"}' };
+  for (const [protocol, endpoint] of [
+    ['openai-chat', 'POST /v1/chat/completions'],
+    ['openai-responses', 'POST /v1/responses'],
+    ['openai-responses', 'GET /v1/responses (WebSocket)'],
+    ['anthropic', 'POST /v1/messages'],
+    ['gemini', 'POST /v1beta/models/gemini-2.0-flash:generateContent'],
+    ['gemini', 'POST /v1beta/models/x:streamGenerateContent'],
+    ['openai-chat', 'POST /admin/api/playground'],
+    ['anthropic', undefined],
+  ]) {
+    assert.equal(replay.canReplayInPlayground(rec(protocol, endpoint), body), true, `${protocol} ${endpoint}`);
+    assert.equal(replay.replayProblem(rec(protocol, endpoint), body), null);
+  }
+  assert.equal(replay.replayProblem(rec('openai-chat', 'POST /v1/embeddings'), body), 'endpoint');
+  assert.equal(replay.replayProblem(rec('anthropic', 'POST /v1/messages/count_tokens'), body), 'endpoint');
+  assert.equal(replay.replayProblem(rec('openai-chat', 'POST /v1/realtime'), body), 'endpoint');
+  assert.equal(replay.replayProblem(rec('ollama', 'POST /api/chat'), body), 'protocol');
+  assert.equal(replay.replayProblem(null, body), 'protocol');
+  // The body: asked about only when bodies are passed, and checked first (the playground's order).
+  assert.equal(replay.replayProblem(rec('ollama', 'POST /api/chat'), null), 'no-body');
+  assert.equal(replay.replayProblem(rec('openai-chat', 'POST /v1/chat/completions'), { client_request: '' }), 'no-body');
+  assert.equal(replay.canReplayInPlayground(rec('openai-chat', 'POST /v1/chat/completions'), undefined), false, 'bodies passed but not loaded: no');
+  assert.equal(replay.canReplayInPlayground(rec('openai-chat', 'POST /v1/chat/completions')), true, 'without bodies only the kind of request is judged');
+  assert.equal(replay.canReplayInPlayground(rec('openai-chat', 'POST /v1/embeddings')), false);
+  // The two pages use it, and keep no copy of their own.
+  const source = (rel) => fs.readFileSync(path.join(ui, rel), 'utf8');
+  assert.match(source('js/pages/requests/detail.js'), /canReplayInPlayground\(record, bodies\)/);
+  assert.match(source('js/pages/playground.js'), /replayProblem\(record, source\.data\.bodies\)/);
+  for (const rel of ['js/pages/playground.js', 'js/pages/requests/record.js', 'js/pages/requests/detail.js']) {
+    assert.doesNotMatch(source(rel), /generateContent\$/, `${rel} keeps no copy of the endpoint list`);
+  }
+}
+
+// 10d. The providers page model: a failure on one model is that model's
+// trouble, not the provider's; discovery that is off says so.
+{
+  const { providerHealth, discoveryInfo } = await import(url('js/pages/providers/model.js'));
+  const at = 1_000_000;
+  const cred = (extra) => ({ id: 'p:1', status: 'ready', disabled: false, disabled_by: null, usable: true, cooldown_until: null, model_cooldowns: [], requests: 0, successes: 0, failures: 0, consecutive_failures: 0, last_error: null, ...extra });
+  const prov = (credentials, extra = {}) => ({ name: 'p', kind: 'mock', enabled: true, model_count: 8, discover: true, config: { models: [] }, discovery: { state: 'off' }, credentials, ...extra });
+  const failure = (cls, model) => ({ status: 500, class: cls, message: 'x', at: at - 10, model });
+  // One model-scoped failure: Ready, and the model is named, resting or not.
+  let h = providerHealth(prov([cred({ requests: 1, failures: 1, consecutive_failures: 1, last_error: failure('server', 'mock-error-500'), model_cooldowns: [{ model: 'mock-error-500', until: at + 30_000, reason: 'server' }] })]), at);
+  assert.deepEqual([h.label, h.detail], ['Ready', 'mock-error-500 resting']);
+  h = providerHealth(prov([cred({ requests: 1, failures: 1, consecutive_failures: 1, last_error: failure('server', 'mock-error-500') })]), at);
+  assert.deepEqual([h.label, h.detail], ['Ready', 'mock-error-500 failed']);
+  // A transport failure is the upstream as a whole.
+  h = providerHealth(prov([cred({ requests: 1, failures: 1, consecutive_failures: 1, last_error: failure('transport', 'm'), model_cooldowns: [{ model: 'm', until: at + 30_000, reason: 'transport' }] })]), at);
+  assert.equal(h.label, 'Failing');
+  // Failures on two models and no success: Failing (one credential, or two).
+  h = providerHealth(prov([cred({ requests: 2, failures: 2, consecutive_failures: 2, last_error: failure('server', 'b'), model_cooldowns: [{ model: 'a', until: at + 30_000, reason: 'server' }] })]), at);
+  assert.equal(h.label, 'Failing');
+  h = providerHealth(prov([cred({ id: 'p:1', requests: 1, failures: 1, last_error: failure('server', 'a') }), cred({ id: 'p:2', requests: 1, failures: 1, last_error: failure('server', 'b') })]), at);
+  assert.equal(h.label, 'Failing');
+  // openai-compat with discovery off and no models: says so, in both places.
+  const compat = prov([cred({})], { kind: 'openai-compat', discover: false, model_count: 0 });
+  assert.equal(discoveryInfo(compat, at).short, 'discovery off');
+  h = providerHealth(compat, at);
+  assert.equal(h.detail, 'discovery is off');
+}
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
@@ -485,10 +574,19 @@ const { formatJson } = await import(url('js/components/code.js'));
   assert.equal(formatJson('[]'), '[]');
   assert.equal(formatJson('{"truncated": tr'), null);
   assert.equal(formatJson('data: {"a":1}'), null);
-  // A body with an inline image: megabytes inside one string.
-  const image = `{"image":"${'A'.repeat(3_000_000)}\\n${'B'.repeat(3_000_000)}","n":1}`;
+  // Ordinary inline strings are formatted; bounded input/depth/output work
+  // preserves raw text for larger documents instead of expanding it.
+  const image = `{"image":"${'A'.repeat(1000)}\\n${'B'.repeat(1000)}","n":1}`;
   assert.equal(formatJson(image).length, image.length + '\n  '.length * 2 + ' '.length * 2 + '\n'.length);
   assert.equal(highlightJson(`{"k":"${'x'.repeat(190_000)}"}`).length, 5);
+  const large = JSON.stringify({ value: 'x'.repeat(200_000) });
+  assert.equal(formatJson(large), null);
+  assert.deepEqual(highlightJson(large), [large]);
+  assert.equal(formatJson('['.repeat(65) + '0' + ']'.repeat(65)), null);
+  const incomplete = '{"value":"unfinished';
+  assert.deepEqual(highlightJson(incomplete), [incomplete]);
+  const expanding = '['.repeat(64) + Array(8000).fill('0').join(',') + ']'.repeat(64);
+  assert.ok(formatJson(expanding) === null, 'indentation has a fixed output budget');
 }
 
 // 15. Arrow keys in Tabs and Segmented skip disabled items and wrap.
@@ -545,6 +643,22 @@ for (const name of ['stop', 'arrow-left', 'grip']) assert.ok(ICON_NAMES.includes
   assert.doesNotMatch(boot.attrs, /\b(type="module"|async|defer)\b/, 'it blocks: the theme is set before the first paint');
   assert.ok(boot.at < page.indexOf('rel="stylesheet"'), 'and it comes before the stylesheets');
   assert.ok(boot.at < page.indexOf('<body'), 'in the head');
+
+  // Fonts: each preload is in CORS mode and is what an @font-face in this
+  // document fetches. A face declared in a stylesheet file is not: on a
+  // reload Chrome reuses that sheet with the font it fetched for the previous
+  // page, and the console reports the preload as unused.
+  const preloads = [...page.matchAll(/<link\b[^>]*\brel="preload"[^>]*>/g)].map((m) => m[0]).filter((tag) => /\bas="font"/.test(tag));
+  assert.equal(preloads.length, 2, 'both fonts are preloaded');
+  const faces = [...page.matchAll(/@font-face\s*\{[^}]*src:\s*url\("([^"]+)"\)/g)].map((m) => m[1]);
+  for (const tag of preloads) {
+    assert.match(tag, /\scrossorigin(?:[\s=/>])/, 'a font preload is crossorigin: fonts are fetched in CORS mode');
+    assert.ok(faces.includes(/href="([^"]+)"/.exec(tag)[1]), `${tag} is the url() of an @font-face in index.html`);
+  }
+  assert.equal(faces.length, preloads.length);
+  for (const sheet of walk(path.join(ui, 'css')).filter((file) => file.endsWith('.css'))) {
+    assert.doesNotMatch(fs.readFileSync(sheet, 'utf8').replace(/\/\*[\s\S]*?\*\//g, ''), /@font-face/, `${path.basename(sheet)} declares no font face: index.html does`);
+  }
 
   // The bootstrap itself, against the least it needs of a browser.
   const source = fs.readFileSync(path.join(ui, 'js', 'theme-boot.js'), 'utf8');
@@ -622,6 +736,27 @@ for (const name of ['stop', 'arrow-left', 'grip']) assert.ok(ICON_NAMES.includes
   // A notice wraps on phones; legend labels are cut, not pushed out.
   assert.match(components, /@media \(max-width: 720px\)\s*\{\s*\.notice\s*\{[^}]*flex-wrap:\s*wrap/);
   assert.match(rule(components, '.chart-legend-label'), /text-overflow:\s*ellipsis/);
+  // So is a long series name heading a column of a chart's table view.
+  assert.match(rule(components, '.chart-table-head'), /text-overflow:\s*ellipsis/);
+  assert.match(rule(components, '.chart-table-head'), /max-width/);
+  // A stale StatGroup dims its readings, as the guide's example implies.
+  assert.match(components, /\.stat-group\[data-stale\] \.stat-value,\s*\.stat-group\[data-stale\] \.stat-trend\s*\{[^}]*opacity:/);
+  // The trend gives way in a narrow cell; the value does not.
+  assert.match(rule(components, '.stat-trend'), /flex:\s*0 1 auto/);
+  assert.match(rule(components, '.stat-trend'), /min-width:\s*0/);
+  // A CodeBlock without a title still has a bar for its tools: nothing floats over the code.
+  assert.match(rule(components, '.code-bar[data-untitled]'), /justify-content:\s*flex-end/);
+  assert.doesNotMatch(components, /\.code-floating/);
+  // Touch targets: on coarse pointers the small controls get a 44px hit area.
+  const coarse = /@media \(pointer: coarse\)\s*\{([\s\S]*?)\n\}/g;
+  const coarseRules = [...components.matchAll(coarse)].map((m) => m[1]).join('\n');
+  for (const selector of ['.icon-btn::before', '.switch::before', '.check::before', '.tag-x::before', '.th-sort::before', '.seg-opt::before']) {
+    assert.ok(coarseRules.includes(selector), `${selector} gives a hit area on coarse pointers`);
+  }
+  assert.match(coarseRules, /height:\s*max\(100%, var\(--tap-min\)\)/);
+  assert.match(css('tokens.css'), /--tap-min:\s*44px/);
+  // A text field's input fills the field, so a tap anywhere in the outline lands in it.
+  assert.match(rule(components, '.input-el'), /align-self:\s*stretch/);
 }
 
 // 20. The guide tells the truth about the things this check can see.
@@ -633,9 +768,60 @@ for (const name of ['stop', 'arrow-left', 'grip']) assert.ok(ICON_NAMES.includes
   assert.match(guide, /cargo run -p switchyard/);
   assert.equal(fs.existsSync(path.resolve(ui, '..', 'tools', 'ui-dev.mjs')), false);
   assert.equal(fs.existsSync(path.join(ui, 'tests', 'dev-server.mjs')), false);
-  for (const name of ['useLeaveGuard', 'registerLeaveGuard', 'mayLeave', 'useLiveGap', 'keepPrevious', 'isPrevious', 'inLayer', 'returnFocus', 'errorTitle', 'sortMenu', 'data-row-key', 'lampLabel', 'tipFormat', 'minPoints', '--sticky-top', '--toast-lift', '--surface-bg', 'formatCountdownWords', 'formatDurationWords', 'formatTimestamp', 'sentence(', 'clearable', 'onClear', 'toneWord', 'toneLabel', 'overlayLocked']) {
+  for (const name of ['useLeaveGuard', 'registerLeaveGuard', 'mayLeave', 'useLiveGap', 'keepPrevious', 'isPrevious', 'inLayer', 'returnFocus', 'errorTitle', 'sortMenu', 'data-row-key', 'lampLabel', 'tipFormat', 'minPoints', '--sticky-top', '--toast-lift', '--surface-bg', 'formatCountdownWords', 'formatDurationWords', 'formatTimestamp', 'sentence(', 'clearable', 'onClear', 'toneWord', 'toneLabel', 'overlayLocked', 'canReplayInPlayground', 'replayProblem', 'live.onDown', '{ onDown', '--tap-min', 'never sit over the code']) {
     assert.ok(guide.includes(name), `the guide documents ${name}`);
   }
+  // The touch-target sentence says what the CSS does, not more.
+  assert.doesNotMatch(guide, /Touch targets are 44px on coarse pointers; the control tokens already grow/, 'controls are 34 to 46px tall on touch screens, not 44');
+  assert.match(guide, /34px \(`sm`\), 40px \(`md`\) and 46px\s+\(`lg`\)/);
+  const tokens = fs.readFileSync(path.join(ui, 'css', 'tokens.css'), 'utf8');
+  const coarseTokens = /@media \(pointer: coarse\)\s*\{\s*:root\s*\{([^}]*)\}/.exec(tokens)[1];
+  assert.match(coarseTokens, /--control-h-sm:\s*34px/);
+  assert.match(coarseTokens, /--control-h-md:\s*40px/);
+  assert.match(coarseTokens, /--control-h-lg:\s*46px/);
+}
+
+// The client-model drill-down, and the API's explicit model/credential fields.
+{
+  const { default: matchesFilters, FILTER_KEYS } = await import(url('js/pages/requests/record.js'));
+  const record = { started_at: 1000, client_model: 'alias', requested_model: 'alias(high)', upstream_model: 'target', status: 200, ok: true };
+  assert.ok(FILTER_KEYS.includes('client_model') && FILTER_KEYS.includes('since'));
+  assert.equal(matchesFilters(record, { client_model: 'ALIAS', since: '1000' }), true);
+  assert.equal(matchesFilters(record, { client_model: 'target' }), false);
+  assert.equal(matchesFilters(record, { client_model: 'alias', model: 'target' }), true);
+  assert.equal(matchesFilters(record, { since: '1001' }), false);
+  assert.equal(matchesFilters(record, { since: '1e3' }), false);
+  assert.equal(matchesFilters(record, { client_model: 'alias' }, true), false);
+  assert.equal(matchesFilters({ started_at: 1000 }, { client_model: 'unknown' }), true);
+  const { GROUPS } = await import(url('js/pages/usage/data.js'));
+  assert.equal(GROUPS.find((group) => group.value === 'model').param, 'client_model');
+  const { buildRows } = await import(url('js/pages/models/logic.js'));
+  assert.equal(buildRows([{ name: 'alias', alias_targets: ['base'], shadows_model: true, routes: [], info: {} }], [])[0].shadows_model, true);
+  const { draftFromConfig, configFromDraft } = await import(url('js/pages/providers/model.js'));
+  const draft = draftFromConfig({ name: 'local', kind: 'openai-compat', credentials: [{ api_key: null }, { api_key: null, label: 'second' }] });
+  assert.deepEqual(configFromDraft(draft).config.credentials.map((row) => row.api_key), [null, null]);
+  draft.credentials[1].label = 'renamed';
+  draft.credentials.reverse();
+  assert.equal(configFromDraft(draft).config.credentials[0].label, 'renamed');
+  draft.credentials.pop();
+  assert.deepEqual(configFromDraft(draft).config.credentials.map((row) => row.api_key), [null]);
+}
+
+// Text exports preserve one field and shell snippets preserve one literal.
+{
+  const { psQuote } = await import(url('js/pages/keys/util.js'));
+  for (const quote of ["'", '\u2018', '\u2019', '\u201a', '\u201b']) {
+    assert.equal(psQuote(`left${quote}right`), `'left${quote}${quote}right'`);
+  }
+  assert.equal(psQuote('plain-name'), "'plain-name'");
+  const { csvCell, toCsv } = await import(url('js/pages/usage/export.js'));
+  assert.equal(csvCell('plain name'), '"plain name"');
+  assert.equal(csvCell('one;two\tthree'), '"one;two\tthree"');
+  assert.equal(csvCell('a "quoted" label'), '"a ""quoted"" label"');
+  assert.equal(csvCell('=total'), '"\'=total"');
+  assert.equal(csvCell(12), '12');
+  assert.equal(csvCell(null), '');
+  assert.equal(toCsv([['name', 'count'], ['one;two', 2]]), '"name","count"\r\n"one;two",2\r\n');
 }
 
 // 21. Components in a document: see dom.mjs.

@@ -192,9 +192,10 @@ impl ClientNames {
     /// nested and the flat form, and the deprecated `functions[]`).
     pub(crate) fn from_request(request: Option<&Value>) -> Self {
         let mut declared: Vec<String> = Vec::new();
+        let mut seen = HashSet::new();
         let mut push = |name: Option<&str>| {
             if let Some(name) = name.filter(|n| !n.is_empty())
-                && !declared.iter().any(|d| d == name)
+                && seen.insert(name.to_string())
             {
                 declared.push(name.to_string());
             }
@@ -332,5 +333,21 @@ mod tests {
         assert_eq!(names.restore("unknown"), "unknown");
         assert_eq!(names.restore("yyy"), "yyy");
         assert_eq!(ClientNames::from_request(None).restore("x_y"), "x_y");
+    }
+
+    #[test]
+    fn repeated_client_declarations_keep_first_order_and_unambiguous_names() {
+        let request = json!({
+            "tools": [
+                {"type": "function", "function": {"name": "alpha.fn"}},
+                {"type": "custom", "custom": {"name": "beta.fn"}},
+                {"type": "function", "function": {"name": "alpha.fn"}}
+            ],
+            "functions": [{"name": "beta.fn"}, {"name": "gamma.fn"}]
+        });
+        let names = ClientNames::from_request(Some(&request));
+        assert_eq!(names.declared, ["alpha.fn", "beta.fn", "gamma.fn"]);
+        assert_eq!(names.restore("alpha_fn"), "alpha.fn");
+        assert_eq!(names.restore("beta_fn"), "beta.fn");
     }
 }

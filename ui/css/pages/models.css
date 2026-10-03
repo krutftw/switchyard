@@ -128,8 +128,19 @@
   overflow: hidden;
 }
 
+/* Where the cell is too narrow, the upstream model gives way first and a
+   long provider name is cut after it, each with an ellipsis (the whole
+   route is the cell's title). */
+.models-route-provider {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
 .models-route-up {
   display: inline-flex;
+  flex: 0 1000 auto;
   align-items: center;
   gap: var(--space-1);
   min-width: 0;
@@ -155,6 +166,134 @@
    fetched): they may hold an address or a path with no place to break. */
 .models-said {
   overflow-wrap: anywhere;
+}
+
+/* ---- The table in a narrower list ------------------------------------------ */
+
+/* Every column fits from a panel of about 1130px (a wide window). Below
+   that, at laptop and tablet widths, the columns that only repeat what the
+   detail drawer says give way, so the table never scrolls sideways: first
+   Max output and Reasoning, then Context, then Kind (an alias already shows
+   its targets under its name). Narrower still, the names and the routes are
+   cut shorter (the upstream model of a route first); in the narrowest
+   lists (a tablet with the sidebar open) the routes go to the drawer and
+   each row keeps its name and whether it can serve now. Measured on the
+   panel, so a collapsed sidebar gives the columns back. Phones have the
+   cards instead.
+
+   The columns are picked by position; their order is set in table.js. */
+.models-list {
+  container: models-list / inline-size;
+}
+
+@media (min-width: 721px) {
+  @container models-list (max-width: 1129px) {
+    .models-table :is(th, td):is(:nth-child(6), :nth-child(7)) {
+      display: none;
+    }
+  }
+
+  @container models-list (max-width: 899px) {
+    .models-table :is(th, td):nth-child(5) {
+      display: none;
+    }
+  }
+
+  @container models-list (max-width: 809px) {
+    .models-table :is(th, td):nth-child(2) {
+      display: none;
+    }
+  }
+
+  @container models-list (max-width: 739px) {
+    .models-name-id {
+      max-width: 24ch;
+    }
+
+    .models-name-sub {
+      max-width: 26ch;
+    }
+
+    .models-route-text {
+      max-width: 24ch;
+    }
+  }
+
+  @container models-list (max-width: 589px) {
+    .models-table :is(th, td):nth-child(4) {
+      display: none;
+    }
+
+    /* Two columns left: the name takes back the room the routes gave up. */
+    .models-name-id {
+      max-width: 30ch;
+    }
+
+    .models-name-sub {
+      max-width: 32ch;
+    }
+
+    /* The filters share a line under the search field, as on a phone. */
+    .models-search {
+      flex-basis: 100%;
+      max-width: none;
+    }
+
+    .models-filter {
+      flex: 1 1 9rem;
+    }
+
+    .models-toolbar-end {
+      flex-basis: 100%;
+      justify-content: flex-end;
+    }
+  }
+}
+
+/* The catalog the same way: Released and Provider kinds give way first, then
+   Family (the filter above says it), Max output, Display name, Reasoning,
+   and in the narrowest lists Routed here by; the id and the context window
+   stay. Positions as set in catalog.js. */
+.models-catalog {
+  container: models-catalog / inline-size;
+}
+
+@media (min-width: 721px) {
+  @container models-catalog (max-width: 1179px) {
+    .models-table :is(th, td):is(:nth-child(4), :nth-child(8)) {
+      display: none;
+    }
+  }
+
+  @container models-catalog (max-width: 949px) {
+    .models-table :is(th, td):nth-child(3) {
+      display: none;
+    }
+  }
+
+  @container models-catalog (max-width: 869px) {
+    .models-table :is(th, td):nth-child(6) {
+      display: none;
+    }
+  }
+
+  @container models-catalog (max-width: 759px) {
+    .models-table :is(th, td):nth-child(2) {
+      display: none;
+    }
+  }
+
+  @container models-catalog (max-width: 629px) {
+    .models-table :is(th, td):nth-child(7) {
+      display: none;
+    }
+  }
+
+  @container models-catalog (max-width: 529px) {
+    .models-table :is(th, td):nth-child(9) {
+      display: none;
+    }
+  }
 }
 
 /* Copy buttons appear with the row on devices that hover; touch always shows them. */

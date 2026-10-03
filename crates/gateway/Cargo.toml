@@ -28,6 +28,9 @@ percent-encoding.workspace = true
 # Client keys are compared as SHA-256 digests in constant time.
 sha2.workspace = true
 subtle.workspace = true
+# Client WebSocket tickets: 32 random bytes, URL-safe base64.
+rand.workspace = true
+base64.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 

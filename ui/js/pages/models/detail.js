@@ -244,7 +244,7 @@ function CallIt({ row, status }) {
       </div>
       <${CodeBlock}
         language="text"
-        title=${`${current.label} with curl`}
+        title=${`${current.label} with curl for bash/zsh`}
         value=${command}
         note=${auth
           ? html`The command reads the client key from <span class="mono">SWITCHYARD_KEY</span>. Keys are on the <a href=${href('/keys')}>API keys</a> page. The address is the one the gateway listens on; behind a reverse proxy use its public URL.`

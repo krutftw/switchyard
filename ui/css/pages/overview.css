@@ -57,6 +57,12 @@
   font-variant-numeric: tabular-nums;
 }
 
+/* The file on disk is refused: one more line, with the way to fix it. */
+.overview-verdict-refused {
+  font-size: var(--text-sm);
+  color: var(--text-2);
+}
+
 .overview-facts {
   display: flex;
   flex-wrap: wrap;
@@ -249,13 +255,6 @@
 .overview-feed-note .status {
   flex-wrap: wrap;
   white-space: normal;
-}
-
-/* The gateway does not answer: the numbers are the last ones heard. They
-   stay readable, and step back. */
-.overview-vitals[data-stale] .stat-value,
-.overview-vitals[data-stale] .stat-trend {
-  opacity: 0.55;
 }
 
 /* "Not refreshed since 14:03:27", after a panel's description. */

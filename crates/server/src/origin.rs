@@ -19,6 +19,54 @@ use http::header::{HOST, ORIGIN};
 use http::request::Parts;
 use http::uri::Authority;
 use http::{HeaderValue, Uri};
+use std::net::IpAddr;
+
+/// Anonymous access uses the listener's network position as its credential.
+/// Do not trust a browser's same-origin verdict for an arbitrary DNS name.
+/// Authenticated reverse-proxy clients do not use this restriction.
+pub(crate) fn anonymous_host_is_allowed(parts: &Parts, configured_host: &str) -> bool {
+    let allowed = |host: &str| {
+        let host = host.trim_start_matches('[').trim_end_matches(']');
+        let configured = configured_host
+            .trim_start_matches('[')
+            .trim_end_matches(']');
+        host.eq_ignore_ascii_case(configured)
+            || host.eq_ignore_ascii_case("localhost")
+            || host.parse::<IpAddr>().is_ok_and(|address| {
+                address.to_canonical().is_loopback()
+                    || configured
+                        .parse::<IpAddr>()
+                        .is_ok_and(|bound| bound.is_unspecified())
+            })
+    };
+    let mut hosts = parts.headers.get_all(HOST).iter();
+    if let Some(host) = hosts.next()
+        && (hosts.next().is_some()
+            || !host
+                .to_str()
+                .ok()
+                .and_then(|host| host.parse::<Authority>().ok())
+                .is_some_and(|host| allowed(host.host())))
+    {
+        return false;
+    }
+    if parts
+        .uri
+        .authority()
+        .is_some_and(|host| !allowed(host.host()))
+    {
+        return false;
+    }
+    // Also check the browser origin when a local reverse proxy rewrites Host.
+    parts.headers.get_all(ORIGIN).iter().all(|origin| {
+        origin
+            .to_str()
+            .ok()
+            .and_then(|origin| origin.parse::<Uri>().ok())
+            .and_then(|origin| origin.host().map(str::to_owned))
+            .is_some_and(|host| allowed(&host))
+    })
+}
 
 /// Whether the request was made by a web page whose origin is not this
 /// server's, as far as the browser tells.
@@ -108,6 +156,43 @@ mod tests {
         assert!(!foreign(&[]));
         assert!(!foreign(&[("host", "gateway.example:8317")]));
         assert!(!foreign(&[("authorization", "Bearer sy-key")]));
+    }
+
+    #[test]
+    fn anonymous_names_are_bound_to_the_listener() {
+        for host in ["127.0.0.1:8317", "[::1]:8317", "localhost:8317"] {
+            assert!(anonymous_host_is_allowed(
+                &parts(&[("host", host)]),
+                "127.0.0.1"
+            ));
+        }
+        assert!(!anonymous_host_is_allowed(
+            &parts(&[
+                ("host", "unconfigured.example:8317"),
+                ("sec-fetch-site", "same-origin")
+            ]),
+            "127.0.0.1"
+        ));
+        assert!(!anonymous_host_is_allowed(
+            &parts(&[
+                ("host", "localhost:8317"),
+                ("origin", "https://unconfigured.example"),
+                ("sec-fetch-site", "same-origin")
+            ]),
+            "127.0.0.1"
+        ));
+        assert!(anonymous_host_is_allowed(
+            &parts(&[("host", "gateway.example:8317")]),
+            "gateway.example"
+        ));
+        assert!(!anonymous_host_is_allowed(
+            &parts(&[("host", "192.0.2.1:8317")]),
+            "127.0.0.1"
+        ));
+        assert!(anonymous_host_is_allowed(
+            &parts(&[("host", "192.0.2.1:8317")]),
+            "0.0.0.0"
+        ));
     }
 
     #[test]

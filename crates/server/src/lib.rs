@@ -26,6 +26,7 @@
 //! | GET | `/v1beta/models`, `/v1beta/models/{name}` | Gemini shape |
 //! | POST | `/v1beta/models/{model}:{method}` | `generateContent`, `streamGenerateContent`, `countTokens`; also under `/v1/models/` |
 //! | GET | `/v1/realtime` | WebSocket relay |
+//! | POST | `/v1/ws-ticket` | single-use WebSocket ticket |
 //! | POST | `/v1/embeddings`, `/v1/images/generations`, `/v1/moderations`, `/v1/audio/speech` | raw JSON proxy |
 //!
 //! Everything else is a `404`, a known path with another method a `405`,
@@ -48,6 +49,17 @@
 //!
 //! Settings are read from the live configuration on each request:
 //! `server.body_limit_mb`, `server.cors`, `streaming.keepalive_secs`.
+//!
+//! # WebSocket tickets
+//!
+//! `POST /v1/ws-ticket`, authenticated with a client key like any request,
+//! answers `201 {"ticket", "expires_in": 30}`. The WebSocket routes accept
+//! the ticket as `?ticket=` in place of a key — once, within 30 seconds — and
+//! run the socket as the key that bought it. Browsers cannot set headers on
+//! a WebSocket; this keeps the key itself out of URLs. Minting creates no
+//! request record. With `auth.required = false` a client without a key gets
+//! a ticket for the anonymous identity. Neither `key` nor `ticket` is ever
+//! passed upstream or logged.
 //!
 //! # Responses over WebSocket
 //!

@@ -388,6 +388,13 @@ pub struct ModelEntry {
     /// as a model ([`crate::Scheduler::models_routable`]). It is in the
     /// table only so that the mistake can be seen. Always false for models.
     pub ignored: bool,
+    /// For aliases: whether the name equals, ignoring case, the name of a
+    /// model a provider serves — a model the alias hides (also when it
+    /// targets that model). Spelled exactly alike, the alias takes the name
+    /// over in lookups and listings; spelled differently, each exact
+    /// spelling reaches its own entry and other spellings reach the alias.
+    /// False for an ignored alias (which hides nothing) and for models.
+    pub shadows_model: bool,
     /// For aliases: the targets as configured (`"gpt-5(high)"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub alias_targets: Option<Vec<String>>,

@@ -17,8 +17,9 @@
 //! Both are pure functions of a **single schema**. They rewrite by key name,
 //! so they must never be handed a whole request body.
 //!
-//! Schemas come from clients, so the cleaner is bounded: inlining `$ref`s may
-//! copy at most a few times the size of the schema (see [`INLINE_FACTOR`]) and
+//! Schemas come from clients, so the cleaner is bounded: inlining `$ref`s and
+//! transformation growth share an allowance based on the original schema
+//! (see [`INLINE_FACTOR`]). Reference expansion
 //! never nests deeper than [`MAX_INLINE_DEPTH`]; references beyond either
 //! limit degrade to a `{"type": "object", "description": "See: <name>"}`
 //! stub, which is what the reference implementation does with every
@@ -117,7 +118,7 @@ fn sanitize(schema: &Value, mode: Mode) -> Value {
         measured: HashMap::new(),
     };
     prepare(&mut root, &mut ctx, 0);
-    transform(&mut root, mode);
+    transform_bounded(&mut root, mode, &mut ctx.budget);
     prune(&mut root, mode);
     root
 }
@@ -150,12 +151,12 @@ struct RefCtx<'a> {
     /// The schema as the caller passed it; `$ref` pointers resolve against it.
     root: &'a Value,
     /// References being expanded on the current path, to detect recursion.
-    stack: Vec<String>,
+    stack: Vec<*const Value>,
     /// What is left of the inlining allowance, in the unit of [`measure`].
     budget: usize,
     /// Size and nesting depth of the definitions looked at so far, by
-    /// reference, so a definition used a thousand times is measured once.
-    measured: HashMap<String, (usize, usize)>,
+    /// resolved node identity, so aliases of a definition are measured once.
+    measured: HashMap<*const Value, (usize, usize)>,
 }
 
 impl<'a> RefCtx<'a> {
@@ -183,15 +184,19 @@ impl<'a> RefCtx<'a> {
     /// and must not push the schema past [`MAX_INLINE_DEPTH`]. The allowance
     /// is charged here.
     fn take(&mut self, reference: &str, depth: usize) -> Option<Map<String, Value>> {
-        if self.stack.len() >= MAX_REF_DEPTH || self.stack.iter().any(|open| open == reference) {
+        if self.stack.len() >= MAX_REF_DEPTH || self.budget == 0 {
             return None;
         }
         let target = self.resolve(reference)?;
-        let (size, levels) = match self.measured.get(reference) {
+        let identity = std::ptr::from_ref(target);
+        if self.stack.contains(&identity) {
+            return None;
+        }
+        let (size, levels) = match self.measured.get(&identity) {
             Some(known) => *known,
             None => {
                 let fresh = measure(target);
-                self.measured.insert(reference.to_string(), fresh);
+                self.measured.insert(identity, fresh);
                 fresh
             }
         };
@@ -335,7 +340,9 @@ fn inline_ref(value: &mut Value, ctx: &mut RefCtx<'_>, depth: usize) -> usize {
                     }
                 }
                 *value = Value::Object(merged);
-                ctx.stack.push(reference);
+                // The immutable source tree keeps node identities stable.
+                ctx.stack
+                    .push(std::ptr::from_ref(ctx.resolve(&reference).unwrap()));
                 pushed += 1;
             }
             None => {
@@ -557,7 +564,16 @@ fn plain_text(value: &Value) -> String {
     }
 }
 
+#[cfg(test)]
 fn transform(value: &mut Value, mode: Mode) {
+    let mut budget = MAX_INLINE_BYTES;
+    transform_bounded(value, mode, &mut budget);
+}
+
+/// Growth is charged after each local rewrite, before an ancestor can copy
+/// or stringify its output. Local rewrites perform a fixed number of merges
+/// and serializations; an oversized result cannot multiply at later levels.
+fn transform_bounded(value: &mut Value, mode: Mode, budget: &mut usize) {
     let Value::Object(map) = value else {
         return;
     };
@@ -567,26 +583,51 @@ fn transform(value: &mut Value, mode: Mode) {
                 if let Value::Object(named) = child {
                     named
                         .iter_mut()
-                        .for_each(|(_, schema)| transform(schema, mode));
+                        .for_each(|(_, schema)| transform_bounded(schema, mode, budget));
                 }
             }
             "items" => match child {
-                Value::Array(tuple) => tuple.iter_mut().for_each(|s| transform(s, mode)),
-                single => transform(single, mode),
+                Value::Array(tuple) => tuple
+                    .iter_mut()
+                    .for_each(|s| transform_bounded(s, mode, budget)),
+                single => transform_bounded(single, mode, budget),
             },
-            "additionalProperties" | "not" | "contains" | "then" | "else" => transform(child, mode),
+            "additionalProperties" | "not" | "contains" | "then" | "else" => {
+                transform_bounded(child, mode, budget)
+            }
             "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
                 if let Value::Array(list) = child {
-                    list.iter_mut().for_each(|s| transform(s, mode));
+                    list.iter_mut()
+                        .for_each(|s| transform_bounded(s, mode, budget));
                 }
             }
             _ => {}
         }
     }
+    let before = measure_map(map);
     convert(map, mode);
     flatten(map);
     settle_enum(map);
     settle_nullable_properties(map);
+    let growth = measure_map(map).saturating_sub(before);
+    if growth > *budget {
+        map.clear();
+        map.insert("type".to_string(), Value::String("object".to_string()));
+        map.insert(
+            "description".to_string(),
+            Value::String("Schema omitted: transformation budget exceeded".to_string()),
+        );
+        *budget = 0;
+    } else {
+        *budget -= growth;
+    }
+}
+
+fn measure_map(map: &Map<String, Value>) -> usize {
+    map.iter().fold(2 + map.len(), |size, (key, value)| {
+        size.saturating_add(key.len() + 3)
+            .saturating_add(measure(value).0)
+    })
 }
 
 /// Flattening can put an `enum` and a foreign `type` on the same node: the
@@ -785,8 +826,12 @@ fn branch_score(branch: &Value) -> u8 {
 fn flatten(map: &mut Map<String, Value>) {
     // Conditional branches contribute their properties.
     for branch in ["then", "else"] {
-        let Some(Value::Object(extra)) = map.get(branch).and_then(|b| b.get("properties")).cloned()
-        else {
+        // Consume the branch before merging: keeping it here duplicates all
+        // already transformed descendants until the later prune pass.
+        let Some(Value::Object(mut branch)) = map.shift_remove(branch) else {
+            continue;
+        };
+        let Some(Value::Object(extra)) = branch.shift_remove("properties") else {
             continue;
         };
         add_properties(map, &extra);
@@ -1231,5 +1276,54 @@ fn normalize_dialect(value: &mut Value) {
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod bounded_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn conditional_transform_consumes_the_source_branch() {
+        let mut value = json!({"then": {"properties": {
+            "outer": {"else": {"properties": {"inner": {"type": "string"}}}}
+        }}});
+        transform(&mut value, Mode::JsonSchema);
+        assert!(value.get("then").is_none());
+        let outer = &value["properties"]["outer"];
+        assert!(outer.get("else").is_none());
+        assert_eq!(outer["properties"]["inner"]["type"], "string");
+    }
+
+    #[test]
+    fn exhausted_transform_allowance_produces_a_stable_stub() {
+        let mut value = json!({"enum": [1, 2]});
+        let mut budget = 0;
+        transform_bounded(&mut value, Mode::Legacy, &mut budget);
+        assert_eq!(value["type"], "object");
+        assert_eq!(
+            value["description"],
+            "Schema omitted: transformation budget exceeded"
+        );
+        assert_eq!(sanitize_schema_legacy(&value), value);
+        assert_eq!(budget, 0);
+    }
+
+    #[test]
+    fn reference_aliases_share_measurement_and_recursion_identity() {
+        let root = json!({"$defs": {"a~b": {"type": "string"}}});
+        let mut ctx = RefCtx {
+            root: &root,
+            stack: Vec::new(),
+            budget: 1024,
+            measured: HashMap::new(),
+        };
+        assert!(ctx.take("#/$defs/a~0b", 0).is_some());
+        assert!(ctx.take("#/$defs/a~b", 0).is_some());
+        assert_eq!(ctx.measured.len(), 1);
+        ctx.stack
+            .push(std::ptr::from_ref(ctx.resolve("#/$defs/a~0b").unwrap()));
+        assert!(ctx.take("#/$defs/a~b", 0).is_none());
     }
 }

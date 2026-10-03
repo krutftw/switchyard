@@ -453,11 +453,6 @@ impl<'a> Failover<'a> {
         }
     }
 
-    /// Number of upstream attempts made so far.
-    pub(crate) fn attempts(&self) -> u32 {
-        self.attempts
-    }
-
     /// What to tell the client now that the loop is over.
     ///
     /// The last upstream failure decides: its own error body and status

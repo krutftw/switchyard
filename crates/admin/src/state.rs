@@ -47,12 +47,25 @@ pub(crate) type Shared = Arc<AdminState>;
 ///
 /// An edit sets it as soon as it knows the place — which, for an entry of a
 /// list, is only known inside the store's lock.
+///
+/// An edit may also name settings it put back to their default and that
+/// should leave the file rather than be written out ([`Scope::unset`]).
 #[derive(Debug, Default)]
-pub(crate) struct Scope(String);
+pub(crate) struct Scope {
+    prefix: String,
+    unset: Vec<String>,
+}
 
 impl Scope {
     pub fn set(&mut self, prefix: impl Into<String>) {
-        self.0 = prefix.into();
+        self.prefix = prefix.into();
+    }
+
+    /// Takes the settings at these dotted paths (`server.port`,
+    /// `routing.cooldown`) out of the file, so their default applies — see
+    /// [`ConfigStore::update_unsetting`](switchyard_config_store::ConfigStore::update_unsetting).
+    pub fn unset(&mut self, paths: Vec<String>) {
+        self.unset = paths;
     }
 }
 
@@ -142,7 +155,7 @@ impl AdminState {
     {
         let mut scope = Scope::default();
         let result = self.edit_config_scoped(edit, &mut scope).await;
-        result.map_err(|failure| failure.relative_to(&scope.0))
+        result.map_err(|failure| failure.relative_to(&scope.prefix))
     }
 
     async fn edit_config_scoped<T, F>(
@@ -162,20 +175,26 @@ impl AdminState {
         let result = self
             .gateway
             .config_store()
-            .update(|config| {
+            .update_unsetting(|config| {
                 let before = config.clone();
                 let outcome = edit(config, scope).and_then(|value| {
                     changed = *config != before;
                     if changed {
                         writable(config)?;
-                        self.stays_reachable(config)?;
+                        // As for the raw editor: a result that breaks a rule
+                        // is refused by the store with its issues (the same
+                        // wording on every route), and only a valid one is
+                        // checked for what it would do.
+                        if config.validate().is_empty() {
+                            self.stays_reachable(config)?;
+                        }
                     }
                     Ok(value)
                 });
                 match outcome {
                     Ok(value) => {
                         output = Some(value);
-                        Ok(())
+                        Ok(std::mem::take(&mut scope.unset))
                     }
                     Err(error) => {
                         let message = error.message.clone();
@@ -210,40 +229,67 @@ impl AdminState {
     /// exactly that. Turning the admin interface off stays possible where it
     /// cannot happen by accident: in the configuration file itself.
     fn stays_reachable(&self, config: &Config) -> Result<(), ApiFailure> {
-        let issue = |path: &str, message: &str| {
-            ApiFailure::invalid_config(vec![ConfigIssue {
-                path: path.to_string(),
-                message: message.to_string(),
-            }])
-        };
+        let issues = self.lockout_issues(config);
+        if issues.is_empty() {
+            Ok(())
+        } else {
+            Err(ApiFailure::invalid_config(issues))
+        }
+    }
+
+    /// What would lock the dashboard out (see
+    /// [`stays_reachable`](Self::stays_reachable)), as issues: empty when
+    /// the admin interface stays on with a secret. For a configuration that
+    /// already passed validation; `POST /config/validate` lists these the
+    /// way `PUT /config/raw` refuses them.
+    pub fn lockout_issues(&self, config: &Config) -> Vec<ConfigIssue> {
+        const WAY_OUT: &str = "keep an admin secret, or edit the configuration file itself to \
+                               switch the admin interface off";
+        let mut issues = Vec::new();
         if !config.admin.enabled {
-            return Err(issue(
-                "admin.enabled",
-                "turning this off here would lock the dashboard out; to switch the admin \
-                 interface off, edit the configuration file itself",
-            ));
+            issues.push(ConfigIssue {
+                path: "admin.enabled".to_string(),
+                message: "turning this off here would lock the dashboard out; to switch the \
+                          admin interface off, edit the configuration file itself"
+                    .to_string(),
+            });
         }
         let from_env = self
             .options
             .secret_override
             .as_deref()
             .is_some_and(|secret| !secret.trim().is_empty());
-        let from_file = resolve_secret(&config.admin.secret).is_ok_and(|secret| !secret.is_empty());
-        if !from_env && !from_file {
-            return Err(issue(
-                "admin.secret",
-                "is missing: saving this would leave the admin interface without a secret and \
-                 lock the dashboard out; keep an admin secret, or edit the configuration file \
-                 itself to switch the admin interface off",
-            ));
+        if !from_env {
+            let message = match resolve_secret(&config.admin.secret) {
+                Ok(secret) if !secret.is_empty() => None,
+                Ok(_) => Some(format!(
+                    "is missing: saving this would leave the admin interface without a secret \
+                     and lock the dashboard out; {WAY_OUT}"
+                )),
+                // A reference names a variable, not a secret: it may be
+                // shown.
+                Err(variable) => Some(format!(
+                    "names the environment variable `{variable}`, which is not set (or empty) \
+                     for the gateway: saving this would leave the admin interface without a \
+                     secret and lock the dashboard out; set the variable and restart first, \
+                     or {WAY_OUT}"
+                )),
+            };
+            if let Some(message) = message {
+                issues.push(ConfigIssue {
+                    path: "admin.secret".to_string(),
+                    message,
+                });
+            }
         }
-        Ok(())
+        issues
     }
 
     /// Replaces the whole file (the raw editor) and waits for the gateway.
     pub async fn replace_config_text(&self, text: &str) -> Result<Arc<Config>, ApiFailure> {
         // A text that does not validate is refused by the store below, with
         // its issues; only a valid one can be checked for what it would do.
+        // `POST /config/validate` follows the same order.
         if let Ok(config) = switchyard_config_store::validate_text(text) {
             self.stays_reachable(&config)?;
         }

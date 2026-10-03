@@ -75,6 +75,29 @@ pub enum UpstreamBody {
 }
 
 impl UpstreamBody {
+    /// Collects at most `cap` decompressed bytes, rejecting an oversized body.
+    pub(crate) async fn collect_limited(self, cap: usize) -> Result<Bytes, UpstreamError> {
+        match self {
+            UpstreamBody::Full(bytes) if bytes.len() <= cap => Ok(bytes),
+            UpstreamBody::Full(_) => Err(UpstreamError::transport(
+                "read: upstream response exceeds the byte limit",
+            )),
+            UpstreamBody::Stream(mut stream) => {
+                let mut out = bytes::BytesMut::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    if chunk.len() > cap.saturating_sub(out.len()) {
+                        return Err(UpstreamError::transport(
+                            "read: upstream response exceeds the byte limit",
+                        ));
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+                Ok(out.freeze())
+            }
+        }
+    }
+
     /// Reads the whole body, whichever form it is in.
     pub async fn collect(self) -> Result<Bytes, UpstreamError> {
         match self {
@@ -588,6 +611,19 @@ impl UpstreamClient {
             .await
     }
 
+    /// An already described non-streaming request whose caller bounds the
+    /// response body (notably paginated model discovery).
+    pub(crate) async fn send_built_unbuffered(
+        &self,
+        target: &Target,
+        built: BuiltRequest,
+        body: Bytes,
+        timeouts: Timeouts,
+    ) -> Result<UpstreamResponse, UpstreamError> {
+        self.send_built_as(target, built, body, BodyMode::Unbuffered, timeouts)
+            .await
+    }
+
     async fn send_built_as(
         &self,
         target: &Target,
@@ -715,6 +751,34 @@ async fn execute(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn limited_collection_accepts_the_boundary_and_rejects_overflow() {
+        let body = || {
+            UpstreamBody::Stream(
+                futures::stream::iter([
+                    Ok(Bytes::from_static(b"ab")),
+                    Ok(Bytes::from_static(b"cd")),
+                ])
+                .boxed(),
+            )
+        };
+        assert_eq!(body().collect_limited(4).await.unwrap(), b"abcd"[..]);
+        assert!(body().collect_limited(3).await.is_err());
+        assert!(
+            UpstreamBody::Full(Bytes::from_static(b"abcd"))
+                .collect_limited(3)
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            UpstreamBody::Full(Bytes::new())
+                .collect_limited(0)
+                .await
+                .unwrap(),
+            Bytes::new()
+        );
+    }
 
     /// A server that answers a TLS ClientHello with plain HTTP.
     async fn plain_http_server() -> std::net::SocketAddr {

@@ -588,8 +588,10 @@ p.play-tool-send {
   font-size: inherit;
 }
 
+/* The name keeps its width (up to its cap) and the note gives way: a short
+   name such as "error" is never cut to "e…" by the note beside it. */
 .play-frame-name {
-  flex: 0 1 auto;
+  flex: 0 0 auto;
   max-width: 44%;
   overflow: hidden;
   text-overflow: ellipsis;

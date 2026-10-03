@@ -13,7 +13,10 @@ serde_json.workspace = true
 thiserror.workspace = true
 bytes.workspace = true
 indexmap.workspace = true
-toml.workspace = true
+# `preserve_order`: tables are read in file order, so the fields a payload
+# rule sets (an `IndexMap`, and the JSON objects inside it) keep the order
+# the operator wrote them in instead of coming back sorted.
+toml = { workspace = true, features = ["preserve_order"] }
 url.workspace = true
 regex.workspace = true
 uuid.workspace = true

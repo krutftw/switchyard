@@ -360,10 +360,10 @@ fn values_the_stricter_validation_refuses_are_left_out_and_reported() {
     let report = imported.not_imported.join("\n");
     for needle in [
         "host: not an address or a host name",
-        "2 of the client API keys: written as `env:` or `${}` with no name after it",
-        "the management secret-key: written as `env:` or `${}`",
-        "gemini-api-key[0]: the api-key is written as `env:` or `${}`",
-        "provider `pools`: 1 of the keys are written as `env:` or `${}`",
+        "2 of the client API keys: written as an environment reference",
+        "the management secret-key: written as an environment reference",
+        "gemini-api-key[0]: the api-key is written as an environment reference",
+        "provider `pools`: 1 of the keys are written as an environment reference",
         "the model pool `my pool` cannot become a virtual model",
         "the model pool `deep(high)` cannot become a virtual model",
         "1 of the models have a thinking range whose min is above its max",
@@ -785,7 +785,15 @@ payload:
             .collect::<Vec<_>>(),
         ["7", "dup"]
     );
-    assert_eq!(config.admin.secret, "quote\" and \\ backslash\nnewline");
+    // A secret with a line break cannot travel in a header, and the file
+    // would be refused (A2-4): it is reported, not imported.
+    assert_eq!(config.admin.secret, "");
+    assert!(
+        imported.not_imported.iter().any(|line| line
+            .starts_with("the management secret-key: an admin secret must not contain control")),
+        "{:?}",
+        imported.not_imported
+    );
     assert_eq!(
         names(config),
         ["gemini", "bad-name", "openai-compat", "bad-name-2"]
@@ -1077,39 +1085,32 @@ fn payload_values_are_typed_and_names_are_not() {
     }
 }
 
-/// A secret that happens to be written like an environment reference is
-/// the one thing that is imported as written and still means something
-/// else: that is said, without showing it.
+/// Importing must not turn literal source secrets into host environment access.
 #[test]
-fn secrets_that_read_as_environment_references_are_pointed_out() {
+fn secrets_that_read_as_environment_references_are_left_out() {
     let imported = import(
         "api-keys: [\"env:CLIENT_SECRET_NAME\", plain-client-key-0001]\n\
          remote-management: {secret-key: \"${ADMIN_SECRET_NAME}\"}\n\
          gemini-api-key:\n  - api-key: \"env:UPSTREAM_SECRET_NAME\"\n  - api-key: gm-plain-0000000001\n",
     );
-    let notes = imported.notes.join("\n");
-    assert!(
-        notes.contains("3 of the imported keys and secrets are written like a reference"),
-        "{notes}"
+    assert_eq!(imported.config.auth.keys.len(), 1);
+    assert_eq!(imported.config.auth.keys[0].key, "plain-client-key-0001");
+    assert!(imported.config.admin.secret.is_empty());
+    assert_eq!(
+        imported.config.providers[0].api_keys,
+        ["gm-plain-0000000001"]
     );
+    let report = imported.not_imported.join("\n");
+    assert!(report.contains("client API keys: written as an environment reference"));
+    assert!(report.contains("management secret-key: written as an environment reference"));
+    assert!(report.contains("gemini-api-key[0]"));
     for name in [
         "CLIENT_SECRET_NAME",
         "ADMIN_SECRET_NAME",
         "UPSTREAM_SECRET_NAME",
     ] {
-        assert!(!notes.contains(name), "{notes}");
+        assert!(!imported.text.contains(name));
     }
-    assert!(imported.text.contains("#   - 3 of the imported keys"));
-    // Nothing to say for ordinary keys.
-    let ordinary = import("api-keys: [plain-client-key-0001]\n");
-    assert!(
-        !ordinary
-            .notes
-            .iter()
-            .any(|note| note.contains("environment variable")),
-        "{:?}",
-        ordinary.notes
-    );
 }
 
 /// Deterministic pseudo-random numbers (xorshift64*), for the test below.

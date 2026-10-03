@@ -1005,6 +1005,143 @@ output = 10.0
     );
 }
 
+/// Regression (A2-1): a setting put back to its default can be taken out of
+/// the file instead of being written as an explicit value, so the default
+/// applies — and a later change of it too.
+#[test]
+fn unset_settings_leave_the_file() {
+    let text = r#"# Gateway
+
+[server]
+port = 9000
+
+[routing]
+# Rotate in turn.
+strategy = "fill-first"   # caches
+max_attempts = 5
+
+# Cooldowns, tuned by hand.
+
+[routing.cooldown]
+auth_secs = 60
+"#;
+    let unset = |change: &dyn Fn(&mut Config), paths: &[&str]| {
+        let mut config = validate_text(text).unwrap();
+        change(&mut config);
+        let paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
+        let rendered =
+            switchyard_config_store::merge::render_update_unsetting(text, &config, &paths).unwrap();
+        assert_eq!(validate_text(&rendered.text).unwrap(), config);
+        rendered
+    };
+
+    // A key goes with the comments about it; the rest stays.
+    let rendered = unset(
+        &|c| c.routing.strategy = RoutingStrategy::RoundRobin,
+        &["routing.strategy"],
+    );
+    assert_eq!(rendered.strategy, Strategy::Merged);
+    assert_eq!(
+        rendered.text,
+        text.replace(
+            "# Rotate in turn.\nstrategy = \"fill-first\"   # caches\n",
+            ""
+        )
+    );
+
+    // A whole table; the paragraph set apart above it stays. Another key
+    // changes in the same edit.
+    let rendered = unset(
+        &|c| {
+            c.routing.cooldown = Default::default();
+            c.routing.max_attempts = 4;
+        },
+        &["routing.cooldown"],
+    );
+    assert_eq!(
+        rendered.text,
+        text.replace("max_attempts = 5", "max_attempts = 4")
+            .replace("[routing.cooldown]\nauth_secs = 60\n", "")
+    );
+
+    // A key the file does not have: nothing to write.
+    let rendered = unset(&|_| {}, &["streaming.keepalive_secs", "nope.deeper"]);
+    assert_eq!(rendered.strategy, Strategy::Unchanged);
+    assert_eq!(rendered.text, text);
+
+    // A default spelled out in the file goes even though nothing changes;
+    // so does the header of the table it leaves empty.
+    let explicit = text.replace("port = 9000", "port = 8317");
+    let config = validate_text(&explicit).unwrap();
+    let rendered = switchyard_config_store::merge::render_update_unsetting(
+        &explicit,
+        &config,
+        &["server.port".to_string()],
+    )
+    .unwrap();
+    assert_eq!(
+        rendered.text,
+        explicit.replace("[server]\nport = 8317\n\n", "")
+    );
+    assert_eq!(validate_text(&rendered.text).unwrap(), config);
+
+    // A value that is not the default cannot be left out: it is written.
+    let rendered = unset(&|c| c.server.port = 9100, &["server.port"]);
+    assert_eq!(rendered.text, text.replace("port = 9000", "port = 9100"));
+}
+
+/// Regression (A2-8): the fields of a payload rule keep the order they have
+/// in the file — they are read in that order, and saving rules leaves the
+/// rules it does not change exactly as they were written.
+#[test]
+fn payload_rules_keep_the_order_of_their_fields() {
+    let text = r#"[[payload.override]]
+models = ["gpt-*"]
+set = { "zeta" = 1, "alpha" = { "y" = 1, "b" = 2 }, "mid" = 3 }
+
+[[payload.override]]
+models = ["claude-*"]
+set = { "top_p" = 0.9, "metadata" = { "z" = "1", "a" = "2" }, "max_tokens" = 100 }
+"#;
+    let parsed = validate_text(text).unwrap();
+    let keys: Vec<&str> = parsed.payload.overrides[1]
+        .set
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(keys, ["top_p", "metadata", "max_tokens"]);
+
+    // One value of the first rule changes: its other fields stay where they
+    // are, the second rule is untouched.
+    let out = edit(text, |c| {
+        c.payload.overrides[0].set["alpha"] = serde_json::json!({"y": 1, "b": 3});
+    });
+    assert_eq!(
+        out,
+        text.replace("\"b\" = 2", "\"b\" = 3"),
+        "the edited rule keeps its field order"
+    );
+
+    // The first rule goes: the second keeps its text byte for byte.
+    let out = edit(text, |c| {
+        c.payload.overrides.remove(0);
+    });
+    assert_eq!(
+        out,
+        "[[payload.override]]\nmodels = [\"claude-*\"]\nset = { \"top_p\" = 0.9, \"metadata\" = { \"z\" = \"1\", \"a\" = \"2\" }, \"max_tokens\" = 100 }\n"
+    );
+
+    // The same rules sent back with their fields in another order (as a
+    // client that sorted them would): nothing to write.
+    let mut config = parsed.clone();
+    for rule in &mut config.payload.overrides {
+        rule.set.sort_keys();
+    }
+    let rendered = render_update(text, &config).unwrap();
+    assert_eq!(rendered.strategy, Strategy::Unchanged);
+    assert_eq!(rendered.text, text);
+}
+
 #[test]
 fn aliases_are_matched_by_name() {
     let text = r#"# first alias

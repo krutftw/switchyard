@@ -28,6 +28,9 @@ use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 pub const KEY: &str = "sy-test-key-0123456789";
 /// A second client key, restricted to the mock models.
 pub const SECOND_KEY: &str = "sy-second-key-abcdefghij";
+/// A third client key, present only with [`Settings::limited_rpm`]: its
+/// requests per minute are limited.
+pub const LIMITED_KEY: &str = "sy-limited-key-klmnopqrst";
 /// The key the fake upstream expects from the gateway.
 pub const UPSTREAM_KEY: &str = "upstream-key-1";
 
@@ -40,6 +43,9 @@ pub struct Settings {
     pub body_limit_mb: u64,
     pub shutdown_grace: Duration,
     pub tls: Option<TlsFiles>,
+    /// Adds the client key [`LIMITED_KEY`] (name `limited`) with this many
+    /// requests per minute.
+    pub limited_rpm: Option<u32>,
 }
 
 impl Default for Settings {
@@ -51,11 +57,20 @@ impl Default for Settings {
             body_limit_mb: 1,
             shutdown_grace: Duration::from_secs(5),
             tls: None,
+            limited_rpm: None,
         }
     }
 }
 
 fn config(settings: &Settings, upstream: &str) -> String {
+    let limited = settings
+        .limited_rpm
+        .map(|rpm| {
+            format!(
+                "[[auth.keys]]\nkey = \"{LIMITED_KEY}\"\nname = \"limited\"\nrate_limit_rpm = {rpm}\n"
+            )
+        })
+        .unwrap_or_default();
     format!(
         r#"
 [server]
@@ -73,6 +88,8 @@ name = "tester"
 key = "{SECOND_KEY}"
 name = "second"
 models = ["mock-*"]
+
+{limited}
 
 [streaming]
 keepalive_secs = {keepalive_secs}

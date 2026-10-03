@@ -2,12 +2,14 @@
 //! routing, streaming, logging and usage.
 
 use super::values::{
-    boolean, clamp_u32, clamp_u64, go_duration_secs, is_bcrypt_hash, is_empty_reference,
+    boolean, clamp_u32, clamp_u64, go_duration_secs, is_bcrypt_hash, is_environment_reference,
     is_valid_host, lookup, strategy, string_list, text,
 };
-use super::{EMPTY_REFERENCE, Importer, PAYLOAD_FLAT, PAYLOAD_NESTED};
+use super::{ENVIRONMENT_REFERENCE, Importer, PAYLOAD_FLAT, PAYLOAD_NESTED};
 use switchyard_core::Config;
-use switchyard_core::config::{ClientKey, RequestLogMode, TlsConfig, parse_proxy};
+use switchyard_core::config::{
+    ClientKey, RequestLogMode, TlsConfig, header_value_issue, parse_proxy,
+};
 
 /// Placeholder client keys of the source program's template. It refuses to
 /// serve while one of them is configured, so they are not carried over.
@@ -107,10 +109,16 @@ impl Importer<'_> {
                  SWITCHYARD_ADMIN_SECRET) to use the dashboard"
                     .to_string(),
             );
-        } else if is_empty_reference(&secret) {
+        } else if is_environment_reference(&secret) {
             self.not_imported.push(format!(
-                "the management secret-key: {EMPTY_REFERENCE}. admin.secret is empty; set it \
+                "the management secret-key: {ENVIRONMENT_REFERENCE}. admin.secret is empty; set it \
                  (or SWITCHYARD_ADMIN_SECRET) to use the dashboard"
+            ));
+        } else if let Some(problem) = header_value_issue(&secret) {
+            // The dashboard sends it in a header; the file would be refused.
+            self.not_imported.push(format!(
+                "the management secret-key: an admin secret {problem}. admin.secret is empty; \
+                 set it (or SWITCHYARD_ADMIN_SECRET) to use the dashboard"
             ));
         } else {
             config.admin.secret = secret;
@@ -131,14 +139,14 @@ impl Importer<'_> {
         };
         let keys = source.map(string_list).unwrap_or_default();
         let mut placeholders = 0usize;
-        let mut unnamed = 0usize;
+        let mut references = 0usize;
         for key in keys {
             if TEMPLATE_KEYS.contains(&key.as_str()) {
                 placeholders += 1;
                 continue;
             }
-            if is_empty_reference(&key) {
-                unnamed += 1;
+            if is_environment_reference(&key) {
+                references += 1;
                 continue;
             }
             config.auth.keys.push(ClientKey {
@@ -155,9 +163,9 @@ impl Importer<'_> {
                  file (your-api-key-…)"
             ));
         }
-        if unnamed > 0 {
+        if references > 0 {
             self.not_imported.push(format!(
-                "{unnamed} of the client API keys: {EMPTY_REFERENCE}"
+                "{references} of the client API keys: {ENVIRONMENT_REFERENCE}"
             ));
         }
         if config.auth.keys.is_empty() {

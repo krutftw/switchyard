@@ -212,10 +212,22 @@ async fn first_run_creates_the_config_and_serves() {
     let client_key = config.auth.keys[0].key.clone();
     assert_eq!(admin_secret.len(), 32);
     assert!(client_key.starts_with("sy-") && client_key.len() == 43);
+    // Regression (A2-2): the file says the flag decided the port, and does
+    // not name a dashboard URL this run does not serve.
+    let text = std::fs::read_to_string(&config_path).unwrap();
+    assert!(
+        text.contains("# This first run used --port 0 (a free port chosen at start-up)"),
+        "{text}"
+    );
+    assert!(!text.contains(":8317/admin/"), "{text}");
     let banner = server.stderr();
     assert!(banner.contains("First run"), "{banner}");
-    assert_eq!(banner.matches(&admin_secret).count(), 1, "{banner}");
-    assert_eq!(banner.matches(&client_key).count(), 1, "{banner}");
+    assert_eq!(banner.matches(&admin_secret).count(), 0, "{banner}");
+    assert_eq!(banner.matches(&client_key).count(), 0, "{banner}");
+    assert!(
+        banner.contains("credentials are omitted from startup logs"),
+        "{banner}"
+    );
     assert!(banner.contains("is running"), "{banner}");
     assert!(banner.contains(&format!("listening  {base}")), "{banner}");
     assert!(

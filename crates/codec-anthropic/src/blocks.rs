@@ -292,8 +292,15 @@ fn decode_document(block: &Value) -> Part {
 // Portable renderings of Anthropic-only user blocks
 // ---------------------------------------------------------------------------
 
+fn escape_content(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 fn escape_attribute(value: &str) -> String {
-    value.replace('&', "&amp;").replace('"', "&quot;")
+    escape_content(value).replace('"', "&quot;")
 }
 
 /// What other protocols are shown in place of a user block only the Messages
@@ -373,7 +380,15 @@ pub(crate) fn portable_parts(block: &Value) -> Vec<Part> {
             }
         }
         rendered.push_str(">\n");
-        rendered.push_str(&texts.join("\n\n"));
+        // Content stays inside the codec's attribution wrapper, including
+        // when the source text itself discusses markup. This is a faithful
+        // text representation, not an instruction-trust boundary.
+        for (index, text) in texts.iter().enumerate() {
+            if index != 0 {
+                rendered.push_str("\n\n");
+            }
+            rendered.push_str(&escape_content(text));
+        }
         rendered.push_str(&format!("\n</{tag}>"));
         out.push(Part::text(rendered));
     }
@@ -778,6 +793,42 @@ pub(crate) fn tool_input(kind: ToolCallKind, arguments: &str) -> Value {
 mod tests {
     use super::*;
     use pretty_assertions::assert_eq;
+
+    #[test]
+    fn portable_content_escapes_markup_in_attributes_and_text() {
+        let search = json!({
+            "type": "search_result", "title": "A \"quote\" & <tag>",
+            "source": "https://e.test/?x=1&y=2",
+            "content": [{"type": "text", "text": "<b>literal</b> & item"},
+                        {"type": "text", "text": "héllo"}]
+        });
+        assert_eq!(
+            portable_parts(&search),
+            vec![Part::text(
+                "<search_result title=\"A &quot;quote&quot; &amp; &lt;tag&gt;\" \
+                 source=\"https://e.test/?x=1&amp;y=2\">\n\
+                 &lt;b&gt;literal&lt;/b&gt; &amp; item\n\nhéllo\n</search_result>"
+            )]
+        );
+        let document = json!({
+            "type": "document", "title": "Notes", "context": "x < y",
+            "source": {"type": "content", "content": "x < y & z > y"}
+        });
+        assert_eq!(
+            portable_parts(&document),
+            vec![Part::text(
+                "<document title=\"Notes\" context=\"x &lt; y\">\n\
+                 x &lt; y &amp; z &gt; y\n</document>"
+            )]
+        );
+        // Native replay retains the structured source verbatim and drops
+        // only its portable representation, so content is not duplicated.
+        for block in [search, document] {
+            let decoded = decode_user_block(&block);
+            let original = opaque(&block);
+            assert_eq!(native_parts(&decoded), vec![&original]);
+        }
+    }
 
     #[test]
     fn citation_shapes_decode() {

@@ -24,7 +24,7 @@ import { useStore } from '../lib/store.js';
 import AliasesTab, { useAliasDraft } from './models/aliases.js';
 import CatalogTab from './models/catalog.js';
 import ModelDrawer from './models/detail.js';
-import { buildRows, nextCooldownEnd, pinsOwnModel } from './models/logic.js';
+import { buildRows, nextCooldownEnd } from './models/logic.js';
 import ModelsTab from './models/table.js';
 
 await loadStyles('pages/models.css');
@@ -36,7 +36,8 @@ const PUSHED = 'modelsDrawerPushed';
 const PALETTE_LIMIT = 200;
 
 export default function Models() {
-  const [tabParam, setTab] = useQueryParam('tab', 'models');
+  // Picking a tab is a step in the history: Back returns to the one before.
+  const [tabParam, setTab] = useQueryParam('tab', 'models', { push: true });
   const tab = TABS.includes(tabParam) ? tabParam : 'models';
   const [open] = useQueryParam('open', '');
 
@@ -113,18 +114,12 @@ export default function Models() {
     }
     for (const row of rows ?? []) {
       if (!row.isAlias) names.add(row.name.toLowerCase());
-      // An alias that pins a depth on the model of its own name stands in front of that model.
-      else if (pinsOwnModel(row)) names.add(row.name.toLowerCase());
-    }
-    // A discovered model that a saved alias replaces is in neither list any
-    // more, and no field of GET /models or GET /providers names it: the
-    // gateway only says so in a warning sentence of GET /status.
-    for (const warning of status.data?.warnings ?? []) {
-      const hit = /^alias `([^`]+)` hides the model of the same name/.exec(String(warning));
-      if (hit) names.add(hit[1].toLowerCase());
+      // The API identifies models hidden by aliases, including discovered
+      // models no longer listed under their own name.
+      else if (row.shadows_model) names.add(row.name.toLowerCase());
     }
     return names;
-  }, [providers.data, rows, status.data]);
+  }, [providers.data, rows]);
 
   // Which upstream model ids are routed to, and by which providers (for the catalog).
   const served = useMemo(() => {

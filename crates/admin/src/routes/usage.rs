@@ -1,20 +1,84 @@
 //! Usage statistics, the request list and the application log. The
-//! telemetry crate's result types are returned verbatim; its query types
-//! read query strings leniently (an unknown value falls back to the default
-//! instead of failing the request).
+//! telemetry crate's result types are returned verbatim. Query values are
+//! validated at the API boundary before its lenient query types read them.
 //!
 //! The usage store answers from memory under a lock and reads files for
 //! old records and captured bodies, so every call runs off the async
 //! threads.
 
-use super::{Params, PathParam};
+use super::{Params, PathParam, QueryParams, query_error};
 use crate::Shared;
 use crate::error::{ApiFailure, ApiResult, ok_json};
 use crate::state::blocking;
 use axum::extract::State;
 use serde_json::json;
+use switchyard_core::config::ConfigIssue;
 use switchyard_core::util::now_unix_ms;
-use switchyard_telemetry::{LogQuery, RequestQuery, UsageQuery};
+use switchyard_telemetry::{
+    BadCursor, BucketSize, GroupBy, LogLevel, LogQuery, Range, RequestQuery, StatusFilter,
+    UsageQuery,
+};
+
+fn parsed<T: std::str::FromStr>(name: &str, value: &str, message: &str) -> Result<(), ApiFailure> {
+    if value.is_empty() || value.parse::<T>().is_err() {
+        Err(query_error(name, message))
+    } else {
+        Ok(())
+    }
+}
+
+impl QueryParams for UsageQuery {
+    fn validate(name: &str, value: &str) -> Result<(), ApiFailure> {
+        match name {
+            "range" => parsed::<Range>(name, value, "must be 1h, 24h, 7d or 30d"),
+            "bucket" => parsed::<BucketSize>(name, value, "must be auto, minute, hour or day"),
+            "group_by" => parsed::<GroupBy>(name, value, "must be none, model, provider or key"),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl QueryParams for RequestQuery {
+    fn validate(name: &str, value: &str) -> Result<(), ApiFailure> {
+        match name {
+            "limit" => parsed::<usize>(
+                name,
+                value,
+                "must be a nonnegative whole number within the supported range",
+            ),
+            "status" => parsed::<StatusFilter>(
+                name,
+                value,
+                "must be ok, error, an HTTP status from 100 to 599, or a class from 1xx to 5xx",
+            ),
+            "since" => parsed::<i64>(name, value, "must be a whole number of unix milliseconds"),
+            "before" if value.is_empty() => Err(query_error(
+                name,
+                "must be a request cursor or unix-millisecond timestamp",
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+impl QueryParams for LogQuery {
+    fn validate(name: &str, value: &str) -> Result<(), ApiFailure> {
+        match name {
+            "limit" => parsed::<usize>(
+                name,
+                value,
+                "must be a nonnegative whole number within the supported range",
+            ),
+            "level" => parsed::<LogLevel>(name, value, "must be trace, debug, info, warn or error"),
+            "before" => parsed::<u64>(
+                name,
+                value,
+                "must be a nonnegative whole number within the supported range",
+            ),
+            _ => Ok(()),
+        }
+    }
+}
 
 /// `GET /usage/summary?range=`.
 pub(crate) async fn summary(
@@ -44,13 +108,23 @@ pub(crate) async fn timeseries(
     ok_json(&series)
 }
 
-/// `GET /requests?limit=&before=&model=&provider=&key=&status=&q=`.
+/// `GET /requests?limit=&before=&since=&model=&client_model=&provider=&key=&status=&q=`.
+/// A `since` that is not a whole number is refused while the query string
+/// is read; a `before` that is not a cursor here, by name, rather than
+/// answered with an empty page.
 pub(crate) async fn requests(
     State(state): State<Shared>,
     Params(query): Params<RequestQuery>,
 ) -> ApiResult {
     let telemetry = state.gateway.telemetry().clone();
-    let page = blocking(move || telemetry.usage().requests(&query)).await?;
+    let page = blocking(move || telemetry.usage().try_requests(&query))
+        .await?
+        .map_err(|bad: BadCursor| {
+            ApiFailure::bad_query(ConfigIssue {
+                path: "before".to_string(),
+                message: bad.to_string(),
+            })
+        })?;
     ok_json(&page)
 }
 

@@ -222,7 +222,7 @@ impl Persister {
         if batch.is_empty() {
             return Ok(0);
         }
-        fs::create_dir_all(&self.dir)?;
+        crate::private_files::create_dir_all(&self.dir)?;
         let mut by_day: BTreeMap<String, String> = BTreeMap::new();
         let mut written = 0;
         for record in &batch {
@@ -236,11 +236,10 @@ impl Persister {
         }
         for (day, text) in by_day {
             let path = file_for_day(&self.dir, &day);
-            let mut file = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .read(true)
-                .open(&path)?;
+            let mut file = crate::private_files::open(
+                OpenOptions::new().create(true).append(true).read(true),
+                &path,
+            )?;
             if io_state.checked.insert(day) && !ends_with_newline(&mut file)? {
                 // A crash left half a line behind; terminate it so the next
                 // record does not get glued onto the garbage.

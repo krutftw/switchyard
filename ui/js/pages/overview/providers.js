@@ -154,7 +154,7 @@ export default function ProviderBoard({ providers, recent, onExpire }) {
         if (!health.known) {
           return attemptsFailed ? html`<span class="faint" title="The request records could not be loaded">${DASH}</span>` : html`<${Skeleton} width="124px" height="12px" />`;
         }
-        return html`<${HealthStrip} buckets=${healthOf(row)?.buckets ?? []} label=${`${row.name}, ${windowWords}`} noun="upstream attempts" />`;
+        return html`<${HealthStrip} buckets=${healthOf(row)?.buckets ?? []} label=${`${row.name}, ${windowWords}`} noun=${['upstream attempt', 'upstream attempts']} />`;
       },
     },
     {

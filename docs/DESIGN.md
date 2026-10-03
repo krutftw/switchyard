@@ -57,9 +57,8 @@ other.
 
 * Rust 2024 edition, stable toolchain. `cargo clippy -p <crate> --all-targets -- -D warnings`
   and `cargo test -p <crate>` must pass for your crate.
-* Always build with `CARGO_TARGET_DIR=C:/Users/Administrator/AppData/Local/Temp/sy-target`
-  (the checkout path is long; a short target dir avoids Windows path limits).
-  Other agents build concurrently; "Blocking waiting for file lock" just means wait.
+* On Windows, use a short `CARGO_TARGET_DIR` when a deep checkout path exceeds
+  linker path limits. Coordinate builds that share the same target directory.
 * Only edit files inside the crate (or `ui/` sub-tree) you own. Never edit the
   root `Cargo.toml`, `crates/core`, or another crate. If you need a dependency
   that is not in `[workspace.dependencies]`, declare it with an explicit
@@ -329,7 +328,13 @@ Watches the file (notify, debounced ~300 ms) and applies valid changes live;
 an invalid file is rejected with the issues logged and the old config kept.
 Admin edits go through `update(|&mut Config|)`: validate → write the file
 **preserving comments and formatting** (toml_edit: merge the new value tree
-into the existing document, touching only what changed) → apply. An edit is
+into the existing document, touching only what changed) → apply. An edit may
+also name settings it put back to their default (`update_unsetting`, used
+for `null` in `PATCH /settings`): those keys leave the file — a table left
+empty loses its header — so the default applies rather than a copy of it.
+Tables are read in file order (toml `preserve_order`), and the configuration
+an edit leaves live is read back from the text it wrote, so maps such as a
+payload rule's `set` list their fields as the file does. An edit is
 refused while the file on disk holds an invalid manual edit (it would be
 overwritten); replacing the whole text is the way out. Applying a config
 rebuilds the scheduler once (keeping credential state), checks Vertex
@@ -345,8 +350,13 @@ Listener address, TLS and data dir need a restart (reported as such).
 1. Parse body as JSON → `Codec::request_meta` (model, stream). Errors are
    rendered in the client protocol's envelope.
 2. Split the reasoning suffix off the model name.
-3. Client key checks: model allow-list, rate limit (requests/minute).
-4. Resolve the model to candidate routes (alias targets in order).
+3. Resolve the model to its registered name and candidate routes (alias
+   targets in order).
+4. Revalidate the client identity against the current key table; check the
+   registered model or alias name against its current allow-list, then the
+   rate limit (requests/minute). Restricted keys cannot use upstream
+   alternative-model selectors (`models`, `route`, `fallbacks`,
+   `context_window_fallbacks`, `preset`).
 5. Attempt loop, at most `routing.max_attempts` upstream calls:
    pick a credential (excluding ones already tried) → build the upstream body
    (passthrough or translation, §2) → payload rules → send.
@@ -405,11 +415,20 @@ authentication.
 * **Auth**: key from `Authorization: Bearer`, else the raw `Authorization`
   value, `x-api-key`, `x-goog-api-key`, query `key`; first *matching*
   candidate wins. Missing/invalid → 401 in the route's protocol envelope.
-  `auth.required = false` admits anonymous clients.
+  `auth.required = false` admits anonymous clients. Every gateway operation
+  rechecks issued identities against current key settings, including
+  revocation and changed model restrictions or rate limits.
 * **CORS** (when `server.cors`): `*` origin, any header, preflight 204 before
-  auth.
+  auth. Requests that perform work still require a key when sent by another
+  origin's web page, even with CORS enabled. Anonymous requests require a
+  trusted Host and browser Origin: the configured listener name, localhost
+  or loopback IP; IP literals are also allowed for wildcard listeners.
+  Unconfigured DNS names cannot gain anonymous access through a same-origin
+  browser verdict. Authenticated proxy hostnames remain supported. With CORS
+  off, foreign browser origins are rejected for authenticated requests too.
 * **Bodies**: limit `server.body_limit_mb`; gzip / br / zstd request bodies
-  are decoded.
+  are decoded. Raw JSON side endpoints serialize the same parsed body used
+  to authorize its model, including requests labeled text/plain.
 * **Headers out**: `x-request-id` on every response; `Retry-After` from
   errors; when `upstream.passthrough_headers`, the upstream's rate-limit and
   request-id headers.
@@ -424,11 +443,41 @@ authentication.
 
 ## 10. WebSockets
 
+### Tickets — `POST /v1/ws-ticket`
+
+A browser cannot set headers on a WebSocket, and a key in the URL (`?key=`)
+ends up in proxy logs, history and the console. So a client may buy a
+ticket with its key instead and open the socket with `?ticket=<ticket>`:
+
+* `POST /v1/ws-ticket`, authenticated like any client request
+  (`Authorization: Bearer`, `x-api-key`, `x-goog-api-key`, `?key=`), any body
+  ignored → `201 {"ticket":"<43 url-safe chars>","expires_in":30}`,
+  `cache-control: no-store`. Wrong or missing key → the usual 401.
+* A ticket is accepted as `?ticket=` on every WebSocket upgrade route
+  (`GET /v1/responses`, `GET /v1/realtime`) and nowhere else; it is looked
+  at only when no key on the request matched. It is good for **one**
+  request (any request presenting it uses it up, whatever comes of it) within
+  30 seconds. Unknown, expired or used → the same 401 `invalid API key` as a
+  wrong key.
+* It stands for the key that bought it, as configured when it is used: key
+  name and id on the records, model allow-list, rate limit (the key's own
+  window). A key disabled or removed in between takes its tickets with it.
+* Minting is not a generation request: no request record, no usage, no
+  rate-limit hit. Each key has at most 32 tickets outstanding (minting more
+  drops its oldest); tickets live in memory only.
+* With `auth.required = false` minting works without a key: the ticket is
+  for the anonymous client, and stops working if keys become required.
+* Tickets are credentials: never logged, never passed upstream (the relay
+  drops `ticket` from the query like `key`), never on a record.
+
 ### Responses over WebSocket — `GET /v1/responses`
 
-Same auth as HTTP, on the upgrade request. Each client message is one JSON
-object; each server message is one Responses streaming event as a text frame
-(no SSE framing, no `[DONE]`).
+Same auth as HTTP (or a ticket, above), on the upgrade request. Each client
+message is one JSON object; each server message is one Responses streaming
+event as a text frame (no SSE framing, no `[DONE]`). Access is checked between
+messages and every second while idle or streaming. Removing/disabling a key,
+changing its model allow-list or rate limit, or requiring keys after an
+anonymous connection opened closes it with 1008 and cancels its active turn.
 
 Client messages: `response.create` (a Responses request body plus `type`),
 `response.append` (legacy; same as a follow-up create). One turn at a time;
@@ -461,7 +510,12 @@ Validation errors are sent as
 `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?}}`
 and keep the connection open, as do turns the pipeline rejects as the
 request's own fault (400/403/404/409/413/422). Other failed turns send the
-error frame and then close (1011). Ping every `streaming.keepalive_secs`; a
+error frame and then close (1011). The error frame of a turn the pipeline
+ran — refused, or an `error` event in the middle of its stream — also
+carries `"request_id"`, the id of the turn's request record (what an HTTP
+request gets as `x-request-id`); frames for messages that never became a
+request (validation errors, a full queue) have none. A `429` puts
+`retry-after` into `error.headers`. Ping every `streaming.keepalive_secs`; a
 client that stays silent through two pings during a turn, or for ten minutes
 between turns, is dropped. Message size limit = `server.body_limit_mb`.
 
@@ -471,10 +525,16 @@ reached over HTTP streaming whatever protocol it speaks.
 
 ### Realtime relay — `GET /v1/realtime?model=…`
 
-Authenticates the client, picks an `openai`-kind credential for the model,
-opens `wss://<base>/realtime?model=<upstream model>` with the credential, and
+Authenticates the client (headers, `?key=`, an
+`openai-insecure-api-key.<key>` subprotocol, or a ticket), picks an
+`openai`-kind credential for the model, opens
+`wss://<base>/realtime?model=<upstream model>` with the credential, and
 relays text/binary/ping/pong/close frames both ways until either side closes.
-Records one request record per session (duration, bytes).
+Access changes close both sides with 1008, checked between messages and on a
+one-second timer. Upstream error frames have decoded string values scrubbed
+of the upstream credential before forwarding, including JSON-escaped values;
+ordinary content remains unchanged. Records one request record per session
+(duration, bytes).
 
 ### Admin events — `GET /admin/api/ws?ticket=…` (§11)
 
@@ -496,9 +556,25 @@ single-use ticket valid 30 s.
 
 **Secrets in responses** are masked (`mask_secret`); secret references
 (`env:NAME`) are shown as written. In update payloads, a secret field equal to
-its masked form or empty means "keep the current value".
+its masked form or empty means "keep the current value". One caveat: short
+keys (and some long ones) share a mask, and a mask alone cannot say which of
+several such keys it stands for. Sending back as many equal masks as there
+are stored keys keeps them all in their stored order; an edit that is
+ambiguous — fewer equal masks than stored keys, i.e. one of them was
+deleted — is refused with `422` rather than guessed (`AMBIGUOUS_MASK` in
+`config-store`: the issue on `api_keys[j]` / `credentials[j].api_key` says
+the value "is masked like several stored secrets that cannot be told
+apart"; error bodies carry no separate code), and reordering keys with
+identical masks cannot be expressed at all (send the keys in full, or give
+them labels). A
+credential without a key is sent and shown as `"api_key": null`, so a
+provider entry round-trips exactly.
 
 All bodies are JSON. Errors: `{"error":{"message":"…","issues":[{"path","message"}]?}}`.
+A repeated query parameter, or a query value a route refuses (`since` and
+`before` of `GET /requests`), is a `400` whose issue path is the
+parameter's name; other unreadable query values fall back to their
+defaults.
 
 ```
 GET    /status
@@ -518,30 +594,33 @@ POST   /providers                     create (ProviderConfig)
 GET    /providers/{name}
 PUT    /providers/{name}              replace
 DELETE /providers/{name}
-POST   /providers/{name}/test         {"model"?} → {"ok","latency_ms","status","model","error"?}
+POST   /providers/{name}/test         {"model"?} → {"ok","latency_ms","status","model","credential","error"?}
 POST   /providers/{name}/discover     → {"models":[ModelInfo]}
 POST   /credentials/{id}/reset        clear cooldowns
 POST   /credentials/{id}/enable | /disable
 
 GET    /models                        client-facing model table with routes and availability
+                                      (aliases: `shadows_model` when they hide a served model)
 GET    /catalog                       built-in model catalog
 GET    /aliases   PUT /aliases        [AliasConfig]
 GET    /payload   PUT /payload        PayloadConfig
 GET    /pricing   PUT /pricing        [PriceConfig]
 
 GET    /keys                          client keys (masked) with usage
-POST   /keys                          {"name","models"?,"rate_limit_rpm"?,"key"?} → {"id","key"} (full key shown once)
+POST   /keys                          {"name","models"?,"rate_limit_rpm"?,"key"?} → 201 {"id","key","is_reference"}
+                                      (full key shown once)
 PATCH  /keys/{id}                     {"name"?,"enabled"?,"models"?,"rate_limit_rpm"?}
 DELETE /keys/{id}
-POST   /keys/{id}/reveal              → {"key"}
+POST   /keys/{id}/reveal              → {"key","is_reference"}
 
 GET    /usage/summary?range=1h|24h|7d|30d
 GET    /usage/timeseries?range=&bucket=&group_by=model|provider|key
-GET    /requests?limit=&before=&model=&provider=&key=&status=&q=
+GET    /requests?limit=&before=&since=&model=&client_model=&provider=&key=&status=&q=
+                                      client_model: the by_model name; since: started_at >= unix ms
 GET    /requests/{id}                 record + captured bodies when available
 DELETE /usage                         clear statistics
 
-GET    /logs?limit=&level=&q=&before=
+GET    /logs?limit=&level=&q=&target=&before=
 
 POST   /playground                    {"protocol","body","model"?,"stream"?} → runs through the pipeline
                                       as the built-in "dashboard" client; returns the protocol's JSON or SSE
@@ -579,6 +658,18 @@ switchyard version
 ```
 
 Config lookup: `--config`, `SWITCHYARD_CONFIG`, `./switchyard.toml`. If no
-file exists `serve` creates one (as `init` does) and prints the admin secret,
-the client key and the dashboard URL once. Logs go to stderr (pretty when a
+file exists `serve` creates one (as `init` does) and prints the dashboard URL
+and configuration path. It shows the admin secret and client key once only
+when stderr is a terminal; redirected startup logs tell the operator to read
+them from the file. The explicit `init` command still prints its new secrets.
+When that first run has `--host`
+or `--port`, the file says so at `[server]` (the flag overrides the values
+below it, which apply without it) and its `[admin]` comment names the
+dashboard URL of that run. Logs go to stderr (pretty when a
 terminal, JSON otherwise).
+
+The CLIProxyAPI importer leaves out source secrets written as `env:NAME` or
+`${NAME}` and lists them in its not-imported report. These are literal text
+in the source format but environment lookups in Switchyard; importing must
+not silently grant a foreign file access to the gateway's environment.
+An operator can add an intentional reference after reviewing the output.

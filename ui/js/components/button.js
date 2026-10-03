@@ -38,7 +38,15 @@ export function Spinner({ size = 'md', label, class: className }) {
  *           `disabled` button drops the keyboard focus on <body>, and the
  *           user who pressed Enter on "Save" would be back at the top of the
  *           page when the save is done.
- * disabled  really disabled: not focusable, not clickable
+ * disabled  really disabled: not focusable, not clickable. Use it for a
+ *           button that is off from the start; for one that turns off while
+ *           the user may be on it, use aria-disabled.
+ * aria-disabled  "true" (or true): looks disabled and ignores clicks
+ *           (including the Enter that would submit its form), but stays
+ *           focusable and keeps the focus, like `loading` without the
+ *           spinner. For a control that turns off under the user's hand:
+ *           Next on the last page, Save once nothing is unsaved. Screen
+ *           readers announce it as dimmed.
  * href      renders a link that looks like a button
  * block     full width
  * Any other prop (type, onClick, aria-*, title, form) is passed on.
@@ -56,9 +64,11 @@ export function Button({
   class: className,
   children,
   onClick,
+  'aria-disabled': ariaDisabled,
   ...rest
 }) {
   const iconSize = size === 'sm' ? 14 : 16;
+  const off = ariaDisabled === true || ariaDisabled === 'true';
   const content = html`
     <span class="btn-content">
       ${icon && html`<${Icon} name=${icon} size=${iconSize} />`}
@@ -75,18 +85,20 @@ export function Button({
     'data-loading': loading ? '' : undefined,
     'aria-busy': loading ? 'true' : undefined,
   };
-  // While loading, a click (a real one, Enter or Space, or the implicit
-  // submit of a form whose default button this is) does nothing.
-  const click = loading
-    ? (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      }
-    : onClick;
+  // While loading or aria-disabled, a click (a real one, Enter or Space, or
+  // the implicit submit of a form whose default button this is) does nothing.
+  const click =
+    loading || off
+      ? (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+        }
+      : onClick;
   if (href != null) {
-    return html`<a ...${shared} href=${disabled ? undefined : href} aria-disabled=${disabled || loading ? 'true' : undefined} onClick=${click} ...${rest}>${content}</a>`;
+    // An aria-disabled link keeps its href, which is what keeps it focusable.
+    return html`<a ...${shared} href=${disabled ? undefined : href} aria-disabled=${disabled || loading || off ? 'true' : undefined} onClick=${click} ...${rest}>${content}</a>`;
   }
-  return html`<button ...${shared} type=${type} disabled=${disabled} aria-disabled=${loading && !disabled ? 'true' : undefined} onClick=${click} ...${rest}>${content}</button>`;
+  return html`<button ...${shared} type=${type} disabled=${disabled} aria-disabled=${(loading || off) && !disabled ? 'true' : undefined} onClick=${click} ...${rest}>${content}</button>`;
 }
 
 /**

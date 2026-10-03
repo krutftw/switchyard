@@ -71,11 +71,15 @@ pub struct PresentedCredentials {
     pub x_goog_api_key: Option<String>,
     /// The `key` query parameter.
     pub query_key: Option<String>,
+    /// The `ticket` query parameter of a WebSocket upgrade: a single-use
+    /// ticket from [`crate::Gateway::issue_ws_ticket`]. Only WebSocket
+    /// routes should fill it in; looking at a ticket uses it up.
+    pub ws_ticket: Option<String>,
 }
 
 impl PresentedCredentials {
     /// Reads the three credential headers out of a request's headers and
-    /// takes the `key` query parameter as given.
+    /// takes the `key` query parameter as given. No ticket.
     pub fn from_headers(headers: &HeaderMap, query_key: Option<String>) -> Self {
         let text = |name: &str| {
             headers
@@ -88,6 +92,7 @@ impl PresentedCredentials {
             x_api_key: text("x-api-key"),
             x_goog_api_key: text("x-goog-api-key"),
             query_key,
+            ws_ticket: None,
         }
     }
 }
@@ -100,6 +105,26 @@ impl fmt::Debug for PresentedCredentials {
             .field("x_api_key", &self.x_api_key.is_some())
             .field("x_goog_api_key", &self.x_goog_api_key.is_some())
             .field("query_key", &self.query_key.is_some())
+            .field("ws_ticket", &self.ws_ticket.is_some())
+            .finish()
+    }
+}
+
+/// A single-use ticket for a client WebSocket, from
+/// [`crate::Gateway::issue_ws_ticket`]. `Debug` never shows the ticket.
+#[derive(Clone)]
+pub struct WsTicket {
+    /// The ticket: 43 URL-safe characters, to be sent as `?ticket=`.
+    pub ticket: String,
+    /// Seconds it stays valid (30).
+    pub expires_in: u64,
+}
+
+impl fmt::Debug for WsTicket {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("WsTicket")
+            .field("ticket", &"[redacted]")
+            .field("expires_in", &self.expires_in)
             .finish()
     }
 }

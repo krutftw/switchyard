@@ -226,7 +226,7 @@ async fn invalid_sections_are_refused_with_issues() {
         .put("/pricing", json!([{"model": "", "input": -1, "output": 2}]))
         .await;
     assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY, "{body}");
-    assert_eq!(issue_paths(&body), ["[0].model", "[0]"]);
+    assert_eq!(issue_paths(&body), ["[0].model", "[0].input"]);
 
     // 400: not the shape at all.
     let (status, body) = app.put("/aliases", json!({"name": "fast"})).await;

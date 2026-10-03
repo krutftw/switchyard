@@ -40,7 +40,6 @@ import {
   QUICK_STARTS,
   applyCredentialFrame,
   discoveryInfo,
-  entryToSend,
   hasCountdown,
   hasPendingDiscovery,
   kindInfo,
@@ -126,7 +125,8 @@ export default function Providers() {
   const [kind, setKind] = useQueryParam('kind', '');
   const [sortParam, setSortParam] = useQueryParam('sort', '');
   const [openName, setOpenName] = useQueryParam('open', '');
-  const [tab, setTab] = useQueryParam('tab', 'credentials');
+  // The detail drawer's tab is a step in the history: Back returns to the one before.
+  const [tab, setTab] = useQueryParam('tab', 'credentials', { push: true });
   const [editName] = useQueryParam('edit', '');
   const [newParam] = useQueryParam('new', '');
 
@@ -199,7 +199,7 @@ export default function Providers() {
     try {
       // The freshest entry, so an edit made elsewhere a moment ago is not undone.
       const fresh = await api.get(providerPath(name));
-      const view = await api.put(providerPath(name), entryToSend(fresh.config, { enabled }));
+      const view = await api.put(providerPath(name), { ...fresh.config, enabled });
       providers.mutate((data) => replaceProvider(data, view));
       toast.success(enabled ? `Provider ${name} enabled` : `Provider ${name} disabled`, {
         description: enabled ? 'The router uses it again.' : 'The router skips it until it is enabled.',

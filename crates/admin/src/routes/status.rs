@@ -24,13 +24,14 @@ pub(crate) async fn status(
     let telemetry = gateway.telemetry();
     let now = now_unix_ms();
 
-    // What is in service: the credentials of a provider that is switched
-    // off are not, and neither is an alias without a routable target.
+    // What is in service: no credential that is switched off — by its
+    // provider, in its own entry or at runtime (status `disabled`, whatever
+    // `disabled_by` says) — and no alias without a routable target.
     let snapshot = scheduler.snapshot();
     let credentials = snapshot
         .iter()
         .flat_map(|p| p.credentials.iter())
-        .filter(|c| !c.provider_disabled());
+        .filter(|c| c.disabled_by.is_none());
     let credentials_total = credentials.clone().count();
     let credentials_ready = credentials
         .filter(|c| c.status == CredentialStatus::Ready)
@@ -84,8 +85,14 @@ pub(crate) async fn login() -> ApiResult {
 }
 
 /// Sells a single-use ticket for `GET /ws`.
-pub(crate) async fn ws_ticket(State(state): State<Shared>) -> ApiResult {
-    let ticket = state.tickets.lock().issue(Instant::now());
+pub(crate) async fn ws_ticket(
+    State(state): State<Shared>,
+    Extension(context): Extension<AuthContext>,
+) -> ApiResult {
+    let ticket = state
+        .tickets
+        .lock()
+        .issue(context.secret_digest, Instant::now());
     ok_json(&json!({
         "ticket": ticket,
         "expires_in": TICKET_TTL.as_secs(),

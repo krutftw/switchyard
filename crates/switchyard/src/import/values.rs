@@ -160,18 +160,10 @@ pub(super) fn is_bcrypt_hash(secret: &str) -> bool {
             .any(|p| secret.starts_with(p))
 }
 
-/// A secret that reads as an environment reference naming no variable
-/// (`env:`, `${}`). The source program uses such text as the secret itself;
-/// Switchyard's configuration refuses it, so it cannot be carried over.
-pub(super) fn is_empty_reference(secret: &str) -> bool {
-    let secret = secret.trim();
-    match secret.strip_prefix("env:") {
-        Some(name) => name.trim().is_empty(),
-        None => secret
-            .strip_prefix("${")
-            .and_then(|rest| rest.strip_suffix('}'))
-            .is_some_and(|name| name.trim().is_empty()),
-    }
+/// A source secret that Switchyard would reinterpret as an environment lookup.
+/// The importer must leave it out rather than silently change its meaning.
+pub(super) fn is_environment_reference(secret: &str) -> bool {
+    switchyard_core::config::is_secret_reference(secret)
 }
 
 /// Whether the configuration accepts `host` as `server.host`. Asked of the
@@ -510,11 +502,11 @@ mod tests {
 
     #[test]
     fn what_the_stricter_validation_refuses() {
-        for empty in ["env:", " env:  ", "${}", "${ }"] {
-            assert!(is_empty_reference(empty), "{empty}");
+        for empty in ["env:", " env:  ", "${}", "${ }", "env:NAME", "${NAME}"] {
+            assert!(is_environment_reference(empty), "{empty}");
         }
-        for named in ["env:NAME", "${NAME}", "plain", "", "$", "${"] {
-            assert!(!is_empty_reference(named), "{named}");
+        for named in ["plain", "", "$", "${"] {
+            assert!(!is_environment_reference(named), "{named}");
         }
         for host in ["127.0.0.1", "0.0.0.0", "::", "[::1]", "gw.internal"] {
             assert!(is_valid_host(host), "{host}");

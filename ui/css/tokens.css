@@ -20,22 +20,8 @@
  * paint by js/theme-boot.js, loaded in the <head> of index.html.
  */
 
-@font-face {
-  font-family: "Archivo";
-  src: url("../fonts/archivo-latin-var.woff2") format("woff2");
-  font-weight: 100 900;
-  font-stretch: 62% 125%;
-  font-style: normal;
-  font-display: swap;
-}
-
-@font-face {
-  font-family: "JetBrains Mono";
-  src: url("../fonts/jetbrains-mono-latin-var.woff2") format("woff2");
-  font-weight: 100 800;
-  font-style: normal;
-  font-display: swap;
-}
+/* The @font-face rules for Archivo and JetBrains Mono are in index.html, next
+   to their preloads (it says why). */
 
 :root {
   /* ---- Type ------------------------------------------------------------ */

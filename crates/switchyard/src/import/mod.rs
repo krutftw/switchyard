@@ -32,7 +32,6 @@ use std::collections::BTreeSet;
 use std::path::Path;
 use switchyard_config_store::validate_text;
 use switchyard_core::Config;
-use switchyard_core::config::is_secret_reference;
 use values::{boolean, integer, lookup, pick_in, text};
 
 /// Largest source file read. A real configuration is a few kilobytes.
@@ -42,10 +41,9 @@ const MAX_INPUT_BYTES: u64 = 8 * 1024 * 1024;
 const PAYLOAD_NESTED: &str = "requests.payload";
 const PAYLOAD_FLAT: &str = "payload";
 
-/// Why a secret written as `env:` or `${}` is left out. The text is fixed,
-/// so the secret itself never reaches the report.
-const EMPTY_REFERENCE: &str = "written as `env:` or `${}` with no name after it, which \
-     Switchyard reads as a reference to an environment variable that is not named; left out";
+/// Imported secrets remain literals; never promote them into host lookups.
+const ENVIRONMENT_REFERENCE: &str = "written as an environment reference (env:NAME or ${NAME}); \
+     the source uses that text literally but Switchyard would read the host environment; left out";
 
 /// The result of converting one source document.
 #[derive(Clone, Debug)]
@@ -104,10 +102,10 @@ pub fn run(args: &ImportArgs, env: EnvLookup<'_>) -> Result<ImportOutput, CliErr
     let mut stdout = format!(
         "imported {} into {}\n",
         clean(&input.display().to_string()),
-        shown.display()
+        clean(&shown.display().to_string())
     );
     for line in &report.summary {
-        stdout.push_str(&format!("  {line}\n"));
+        stdout.push_str(&format!("  {}\n", clean(line)));
     }
     let payload_rules = imported.config.payload.default.len()
         + imported.config.payload.overrides.len()
@@ -116,12 +114,12 @@ pub fn run(args: &ImportArgs, env: EnvLookup<'_>) -> Result<ImportOutput, CliErr
     if !report.warnings.is_empty() {
         stdout.push_str("to look at:\n");
         for warning in &report.warnings {
-            stdout.push_str(&format!("  - {warning}\n"));
+            stdout.push_str(&format!("  - {}\n", clean(warning)));
         }
     }
     stdout.push_str(&format!(
         "next: review the file, then run `switchyard check --config \"{}\"`\n",
-        shown.display()
+        clean(&shown.display().to_string())
     ));
 
     let mut stderr = String::new();
@@ -218,17 +216,6 @@ pub fn convert(yaml_text: &str, source_name: &str) -> Result<Imported, ConvertEr
         )));
     }
 
-    // The one case in which a secret that is imported as written still
-    // means something else here.
-    let references = environment_lookalikes(&config);
-    if references > 0 {
-        importer.notes.push(format!(
-            "{references} of the imported keys and secrets are written like a reference to an \
-             environment variable (env:NAME or ${{NAME}}). CLIProxyAPI uses such text as the \
-             secret itself; Switchyard reads the variable instead"
-        ));
-    }
-
     let mut not_imported = std::mem::take(&mut importer.not_imported);
     not_imported.extend(importer.leftover_report());
     let not_imported: Vec<String> = not_imported.iter().map(|line| clean(line)).collect();
@@ -254,24 +241,6 @@ pub fn convert(yaml_text: &str, source_name: &str) -> Result<Imported, ConvertEr
         not_imported,
         notes,
     })
-}
-
-/// How many of the imported secrets Switchyard would not use as they are
-/// written, but look up in the environment.
-fn environment_lookalikes(config: &Config) -> usize {
-    let upstream = config.providers.iter().flat_map(|provider| {
-        provider.api_keys.iter().chain(
-            provider
-                .credentials
-                .iter()
-                .map(|credential| &credential.api_key),
-        )
-    });
-    std::iter::once(&config.admin.secret)
-        .chain(config.auth.keys.iter().map(|key| &key.key))
-        .chain(upstream)
-        .filter(|secret| is_secret_reference(secret))
-        .count()
 }
 
 /// One mapping of the source document together with its normalised path

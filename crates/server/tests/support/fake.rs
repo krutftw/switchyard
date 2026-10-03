@@ -241,7 +241,8 @@ fn last_input_text(body: &Value) -> String {
 
 /// A recording Responses endpoint. The n-th request is answered by
 /// response `resp_n`: a function call when the last input says "use tool",
-/// a message "answer n" otherwise.
+/// a message "answer n" otherwise. A stream whose last input says "fail
+/// midway" breaks with an `error` event after `response.created`.
 async fn responses(
     State(shared): State<Shared>,
     RawQuery(query): RawQuery,
@@ -278,6 +279,15 @@ async fn responses(
         &json!({"type": "response.created", "sequence_number": 0,
                 "response": response("in_progress", json!([]))}),
     )];
+    if last_input_text(&body).contains("fail midway") {
+        // A stream that breaks after its first event.
+        events.push(sse(
+            Some("error"),
+            &json!({"type": "error", "sequence_number": 1, "code": "server_error",
+                    "message": "the upstream fell over", "param": null}),
+        ));
+        return event_stream(futures::stream::iter(events.into_iter().map(Ok)));
+    }
     if wants_tool {
         let mut added = item.clone();
         added["arguments"] = json!("");

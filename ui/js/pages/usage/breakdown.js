@@ -72,6 +72,7 @@ function breakable(name) {
  * group     GROUPS entry (data.js)
  * rows      its breakdown rows; undefined while loading
  * range     RANGES entry
+ * since     start of the summary's window, from the API
  * slots     colour slots of the group when the charts above are stacked by
  *           it: rows with a slot wear their chart colour. null for a table
  *           the charts do not show, which then has no colour keys at all.
@@ -81,7 +82,7 @@ function breakable(name) {
  * stickyTop px the page's own sticky controls take below the top bar, so the
  *           column headings stop under them
  */
-export default function Breakdown({ group, rows, range, slots, loading, stale, stickyTop = 0 }) {
+export default function Breakdown({ group, rows, range, since, slots, loading, stale, stickyTop = 0 }) {
   const [sort, setSort] = useQueryParam(group.sortParam, DEFAULT_SORT);
   const [query, setQuery] = useQueryParam(group.filterParam, '');
   const [showAll, setShowAll] = useState(false);
@@ -204,7 +205,7 @@ export default function Breakdown({ group, rows, range, slots, loading, stale, s
 
   // Every row is a filter of the request list, the stand-in names included
   // ("unknown", "anonymous": see GROUPS in data.js).
-  const open = (row) => navigate('/requests', { query: { [group.param]: row.name } });
+  const open = (row) => navigate('/requests', { query: { [group.param]: row.name, since } });
 
   const description = loading && !rows ? null : `${plural(all.length, group.noun, group.plural)} in ${range.phrase}. Select a row to see its requests.`;
 

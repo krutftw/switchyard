@@ -3,8 +3,9 @@
 
 import { html, useEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Badge, Button, Input, Select } from '../../components/index.js';
+import { formatDate, formatTime, formatTimestamp } from '../../lib/format.js';
 import { useDebounced, useHotkey, useIsPhone } from '../../lib/hooks.js';
-import { NO_MODEL, NO_MODEL_FILTER, NO_PROVIDER_FILTER } from './record.js';
+import { NO_MODEL, NO_MODEL_FILTER, NO_PROVIDER, NO_PROVIDER_FILTER } from './record.js';
 
 const STATUS_OPTIONS = [
   { value: 'ok', label: 'Succeeded' },
@@ -60,10 +61,11 @@ function keyOptionsOf(keys) {
 
 // The requests the gateway files under "unknown" for want of a name: the
 // ones refused before a model could be read (`model=unknown`) and the ones
-// that failed before routing (`provider=unknown`). Shown in the words the
+// no provider served (`provider=unknown`): they failed before routing, or
+// every credential of the model was cooling down. Shown in the words the
 // table uses for them.
 const NO_MODEL_OPTION = { value: NO_MODEL_FILTER, label: NO_MODEL };
-const NO_PROVIDER_OPTION = { value: NO_PROVIDER_FILTER, label: 'Not routed' };
+const NO_PROVIDER_OPTION = { value: NO_PROVIDER_FILTER, label: NO_PROVIDER };
 
 /**
  * One option per name, and the `nameless` one after them when it is on
@@ -88,7 +90,7 @@ function selected(options, value) {
 }
 
 /**
- * filters   { status, model, provider, key, q } from the URL
+ * filters   { status, model, client_model, since, provider, key, q } from the URL
  * onChange  (patch) => void: writes the changed filters to the URL
  * onClear   () => void: removes every filter
  * models, providers  names to offer; undefined while they load
@@ -99,6 +101,7 @@ export default function FilterBar({ filters, onChange, onClear, models, noModel,
   const phone = useIsPhone();
   const input = useRef(null);
   const selects = useRef(null);
+  const chips = useRef(null);
 
   // The search box keeps its own text and writes it to the URL once typing
   // pauses. `written` is the last value this box put there: a different
@@ -142,15 +145,33 @@ export default function FilterBar({ filters, onChange, onClear, models, noModel,
   };
 
   const statusOptions = useMemo(() => withCurrent(STATUS_OPTIONS, filters.status), [filters.status]);
-  // "No model" is on offer while the gateway has such requests; "Not routed"
+  // "No model" is on offer while the gateway has such requests; "No provider"
   // only names the filter when a link brought it (the Usage page's rows).
   const modelOptions = useMemo(() => withCurrent(nameOptions(models, NO_MODEL_OPTION, noModel, filters.model), filters.model), [models, noModel, filters.model]);
   const providerOptions = useMemo(() => withCurrent(nameOptions(providers, NO_PROVIDER_OPTION, false, filters.provider), filters.provider), [providers, filters.provider]);
   const keyOptions = useMemo(() => withCurrent(keyOptionsOf(keys), filters.key), [keys, filters.key]);
 
-  const active = [filters.status, filters.model, filters.provider, filters.key].filter(Boolean).length;
+  const active = [filters.status, filters.model, filters.client_model, filters.since, filters.provider, filters.key].filter(Boolean).length;
   const [expanded, setExpanded] = useState(active > 0);
   const showSelects = !phone || expanded;
+
+  // Links from Overview and Usage carry the exact client-facing model and
+  // the start of the displayed window. Keep these distinct from the wider
+  // Model selector (which also matches requested and upstream names).
+  const linked = [];
+  if (filters.client_model) linked.push({ key: 'client_model', label: `Model: ${filters.client_model}`, title: `Client-facing model: ${filters.client_model}` });
+  if (filters.since) {
+    const value = String(filters.since);
+    const start = Number(value);
+    const valid = /^[+-]?\d+$/.test(value) && Number.isSafeInteger(start) && Number.isFinite(new Date(start).getTime());
+    linked.push({ key: 'since', label: valid ? `Since ${formatDate(start)} ${formatTime(start).slice(0, 5)}` : `Since: ${value}`, title: valid ? formatTimestamp(start, { zone: true }) : `Invalid start time: ${value}` });
+  }
+  const removeLinked = (key, event) => {
+    // Focus a surviving control before this chip removes itself.
+    const remaining = [...(chips.current?.querySelectorAll('button') ?? [])].find((button) => button !== event.currentTarget);
+    (remaining ?? input.current)?.focus();
+    onChange({ [key]: null });
+  };
 
   return html`
     <div class="req-filters" role="search" aria-label="Filter requests">
@@ -171,7 +192,7 @@ export default function FilterBar({ filters, onChange, onClear, models, noModel,
         />
         ${phone &&
         html`
-          <${Button} size="sm" icon="filter" aria-expanded=${expanded ? 'true' : 'false'} aria-controls="req-filter-selects" onClick=${() => setExpanded(!expanded)}>
+          <${Button} size="sm" icon="filter" aria-expanded=${expanded ? 'true' : 'false'} aria-controls=${showSelects ? 'req-filter-selects' : undefined} onClick=${() => setExpanded(!expanded)}>
             <span>Filters</span>
             ${active > 0 && html`<${Badge} tone="info">${active}<//>`}
           <//>
@@ -214,6 +235,11 @@ export default function FilterBar({ filters, onChange, onClear, models, noModel,
           />
           ${(active > 0 || filters.q) &&
           html`<${Button} class="req-filters-clear" variant="ghost" size="sm" icon="x" onClick=${clearAll}>Clear filters<//>`}
+        </div>
+      `}
+      ${linked.length > 0 && html`
+        <div class="req-filter-chips" ref=${chips} aria-label="Linked request filters">
+          ${linked.map((chip) => html`<${Button} key=${chip.key} class="req-filter-chip" size="sm" iconRight="x" title=${chip.title} aria-label=${`Remove ${chip.label} filter`} onClick=${(event) => removeLinked(chip.key, event)}><span>${chip.label}</span><//>`)}
         </div>
       `}
     </div>

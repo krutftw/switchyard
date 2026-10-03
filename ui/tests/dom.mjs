@@ -19,7 +19,7 @@ const { Button, IconButton } = await import('../js/components/button.js');
 const { Tabs, Segmented } = await import('../js/components/nav.js');
 const { Field, Form, FormError, Input, NumberInput, TagInput, useIssues } = await import('../js/components/form.js');
 const { Menu } = await import('../js/components/menu.js');
-const { ConfirmHost, Drawer, Modal, confirm } = await import('../js/components/overlay.js');
+const { ConfirmDialog, ConfirmHost, Drawer, Modal, confirm } = await import('../js/components/overlay.js');
 const { toast, Toaster } = await import('../js/components/toast.js');
 const { Table } = await import('../js/components/table.js');
 const { Panel, Stat, StatGroup, Timeline } = await import('../js/components/surface.js');
@@ -27,6 +27,7 @@ const { Badge, StatusLamp, toneWord } = await import('../js/components/status.js
 const { CodeBlock } = await import('../js/components/code.js');
 const { BarChart, HealthStrip, LineChart, Sparkline } = await import('../js/components/charts.js');
 const { CommandPalette } = await import('../js/shell/palette.js');
+const { LoadMore } = await import('../js/components/surface.js');
 
 const { document, window, dispatch, sleep, text, until } = installDom();
 
@@ -798,6 +799,350 @@ function mount(vnode) {
   await view.unmount();
 }
 
+// ---- Modal layers: a delete confirmed from a menu in a drawer it closes ---
+{
+  // A row opens a drawer; the drawer's menu asks to delete the row's thing;
+  // confirming closes the dialog and the drawer and removes the row. Every
+  // opener on the way is gone or going: the menu (closed long ago), its
+  // button (in the closing drawer), the row. The focus must end on the
+  // page's <main>, or on the row the page names, never on <body>.
+  const where = () => {
+    const at = document.activeElement;
+    return at === document.body ? '<body>' : `<${at.localName}${at.id ? ` id="${at.id}"` : ''}>`;
+  };
+  async function deleteFromDrawerMenu({ fromRow, named }) {
+    function Host() {
+      const [rows, setRows] = useState(['alpha', 'beta']);
+      const [open, setOpen] = useState(fromRow ? null : 'alpha');
+      const del = async (name) => {
+        const ok = await confirm({ danger: true, title: `Delete ${name}?`, confirmLabel: 'Delete', action: async () => {}, returnFocus: named ? () => document.querySelector('#row-beta') : undefined });
+        if (!ok) return;
+        setOpen(null);
+        setRows((list) => list.filter((r) => r !== name));
+      };
+      return html`
+        <main id="main" tabindex="-1">${rows.map((r) => html`<div key=${r} id=${`row-${r}`} tabindex="0" onClick=${() => setOpen(r)}>${r}</div>`)}</main>
+        <${Drawer} open=${open != null} onClose=${() => setOpen(null)} title=${open ?? ''}>
+          <${Menu} label="Actions" items=${[{ label: 'Delete', onSelect: () => del(open) }]} />
+        <//>
+        <${ConfirmHost} />
+      `;
+    }
+    document.activeElement.blur();
+    const view = mount(html`<${Host} />`);
+    if (fromRow) {
+      const row = document.querySelector('#row-alpha');
+      row.focus();
+      row.click();
+    }
+    await until(() => document.querySelector('.drawer')?.contains(document.activeElement), 'focus in the drawer');
+    await sleep(120);
+    const trigger = document.querySelector('.drawer [aria-label="Actions"]');
+    trigger.focus();
+    trigger.click();
+    const item = await until(() => document.querySelector('.menu [role="menuitem"]'), 'the menu');
+    await sleep(60);
+    item.click();
+    await until(() => document.querySelector('.modal')?.contains(document.activeElement), 'focus in the dialog');
+    await sleep(500); // the menu has long gone
+    const yes = [...document.querySelectorAll('.modal button')].find((b) => text(b) === 'Delete');
+    yes.focus();
+    yes.click();
+    const want = named ? '#row-beta' : '#main';
+    await until(() => document.activeElement === document.querySelector(want), `the focus to reach ${want}`, 1500);
+    await sleep(500); // every layer has left the document
+    assert.ok(document.activeElement === document.querySelector(want), `and to stay there; it is on ${where()}`);
+    await view.unmount();
+  }
+  await deleteFromDrawerMenu({ fromRow: true, named: false });
+  await deleteFromDrawerMenu({ fromRow: true, named: true });
+  await deleteFromDrawerMenu({ fromRow: false, named: false });
+  await deleteFromDrawerMenu({ fromRow: false, named: true });
+}
+
+// ---- Controls that remove themselves hand the focus on --------------------
+{
+  const { ErrorState, Notice, Pagination } = await import('../js/components/surface.js');
+  const where = () => {
+    const at = document.activeElement;
+    return at === document.body ? '<body>' : `<${at.localName}${at.id ? ` id="${at.id}"` : ''}${at.className ? ` class="${at.className}"` : ''}>`;
+  };
+
+  // ErrorState: a retry that works swaps it for the content, whose first
+  // control gets the focus (the content is put in before the error state
+  // leaves, which must not pass for what stood before it).
+  {
+    let setOk;
+    function Host() {
+      const [ok, set] = useState(false);
+      setOk = set;
+      return html`<main id="main" tabindex="-1"><button id="before">Filters</button>${ok ? html`<div class="content"><button id="first">Copy</button></div>` : html`<${ErrorState} error=${new ApiError(503, 'the gateway is not ready')} onRetry=${() => {}} />`}<button id="after">Next</button></main>`;
+    }
+    const view = mount(html`<${Host} />`);
+    assert.equal(text(document.querySelector('.empty-desc')), 'The gateway is not ready.', 'the message is printed as a sentence');
+    const retry = document.querySelector('.empty-action button');
+    retry.focus();
+    setOk(true);
+    await until(() => document.activeElement === document.querySelector('#first'), "the focus to go to what took the error state's place");
+    // A page that places the focus itself meanwhile is left alone.
+    setOk(false);
+    await until(() => document.querySelector('.empty-action button'));
+    document.querySelector('.empty-action button').focus();
+    setOk(true);
+    setTimeout(() => document.querySelector('#before').focus(), 10);
+    await sleep(200);
+    assert.ok(document.activeElement === document.querySelector('#before'), `a focus the page placed wins; it is on ${where()}`);
+    await view.unmount();
+  }
+
+  // Table: the retry keeps the error state (its button spinning, still
+  // focused) until the rows are in; then the first row takes the focus.
+  {
+    let set;
+    function Host() {
+      const [state, setState] = useState({ error: new ApiError(503, 'down'), loading: false, rows: undefined });
+      set = setState;
+      return html`<main id="main" tabindex="-1"><${Table} columns=${[{ key: 'name', header: 'Name', primary: true }]} rows=${state.rows} loading=${state.loading} error=${state.error} onRetry=${() => {}} onRowClick=${() => {}} /></main>`;
+    }
+    const view = mount(html`<${Host} />`);
+    const retry = await until(() => document.querySelector('.table-state-cell button'), 'the error state');
+    retry.focus();
+    set((s) => ({ ...s, loading: true }));
+    await until(() => retry.getAttribute('aria-busy') === 'true', 'the retry button to spin');
+    assert.ok(document.activeElement === retry, `the error state stays while retrying, with the focus; it is on ${where()}`);
+    assert.equal(document.querySelectorAll('tbody tr[aria-hidden]').length, 0, 'no skeleton rows in its place');
+    set({ error: null, loading: false, rows: [{ id: 'a', name: 'alpha' }, { id: 'b', name: 'beta' }] });
+    await until(() => document.activeElement === document.querySelector('tbody tr[data-row-key="a"]'), `the first row to take the focus`);
+    await view.unmount();
+  }
+
+  // Notice: an action that makes its notice go hands the focus to what
+  // follows the notice.
+  {
+    let setShown;
+    function Host() {
+      const [shown, set] = useState(true);
+      setShown = set;
+      return html`<main id="main" tabindex="-1">${shown && html`<${Notice} tone="caution" title="Could not refresh" action=${html`<button id="again">Try again</button>`}>The rows are old.<//>`}<section><button id="live">Live</button></section></main>`;
+    }
+    const view = mount(html`<${Host} />`);
+    document.querySelector('#again').focus();
+    setShown(false);
+    await until(() => document.activeElement === document.querySelector('#live'), `the focus to go to what follows the notice`);
+    await view.unmount();
+  }
+
+  // LoadMore: when the last batch is in, the end-of-list line takes the focus.
+  {
+    let setMore;
+    function Host() {
+      const [more, set] = useState(true);
+      setMore = set;
+      return html`<main id="main" tabindex="-1"><${LoadMore} hasMore=${more} onLoad=${() => {}} shown=${120} noun="requests" /></main>`;
+    }
+    const view = mount(html`<${Host} />`);
+    document.querySelector('.loadmore button').focus();
+    setMore(false);
+    await until(() => document.activeElement === document.querySelector('.loadmore-end'), `the end-of-list line to take the focus`);
+    await view.unmount();
+  }
+
+  // Pagination: Next onto the last page keeps the focus (aria-disabled, not disabled).
+  {
+    const pages = [];
+    function Host() {
+      const [page, setPage] = useState(1);
+      return html`<${Pagination} page=${page} pageSize=${10} total=${25} onPage=${(p) => (pages.push(p), setPage(p))} />`;
+    }
+    const view = mount(html`<${Host} />`);
+    const byLabel = (label) => document.querySelectorAll('button').find((b) => b.getAttribute('aria-label') === label);
+    const prev = byLabel('Previous page');
+    const next = byLabel('Next page');
+    assert.equal(prev.hasAttribute('disabled'), false, 'Previous on the first page is not `disabled`');
+    assert.equal(prev.getAttribute('aria-disabled'), 'true');
+    next.focus();
+    next.click();
+    await until(() => pages.length === 1);
+    next.click();
+    await until(() => next.getAttribute('aria-disabled') === 'true', 'Next to turn off on the last page');
+    assert.equal(next.hasAttribute('disabled'), false, 'a disabled button would drop the focus on <body>');
+    assert.ok(document.activeElement === next, `Next keeps the focus; it is on ${where()}`);
+    next.click();
+    await sleep(20);
+    assert.deepEqual(pages, [2, 3], 'clicks on an end are ignored');
+    await view.unmount();
+  }
+
+  // Toasts: closing the one that has the focus hands it to the next toast,
+  // and the last one gives it back to where it was before.
+  {
+    const view = mount(html`<main id="main" tabindex="-1"><button id="before">Save</button></main><${Toaster} />`);
+    await sleep(20); // the toaster starts listening for where the focus is
+    document.querySelector('#before').focus();
+    toast.info('One', { duration: 0 });
+    toast.success('Two', { duration: 0, action: { label: 'Undo', onClick: () => {} } });
+    await until(() => document.querySelectorAll('.toast').length === 2, 'two toasts');
+    const dismiss = () => document.querySelectorAll('.toast [aria-label="Dismiss"]');
+    dismiss()[0].focus();
+    dismiss()[0].click();
+    const undo = [...document.querySelectorAll('.toast button')].find((b) => text(b) === 'Undo');
+    await until(() => document.activeElement === undo, `the next toast to take the focus`);
+    dispatch(undo, 'keydown', { key: 'Escape' });
+    await until(() => document.activeElement === document.querySelector('#before'), `the focus to go back to where it was before the toasts`);
+    await until(() => !document.querySelector('.toast'), 'the toasts to leave');
+    assert.ok(document.activeElement === document.querySelector('#before'));
+    await view.unmount();
+  }
+}
+
+// ---- Button: an aria-disabled mode that keeps the focus -------------------
+{
+  const clicks = [];
+  function Host({ off }) {
+    return html`<form onSubmit=${(event) => (event.preventDefault(), clicks.push('submit'))}><${Button} id="save" type="submit" aria-disabled=${off ? 'true' : undefined} onClick=${() => clicks.push('click')}>Save changes<//></form>`;
+  }
+  const view = mount(html`<${Host} off=${true} />`);
+  const save = document.querySelector('#save');
+  save.focus();
+  const press = dispatch(save, 'click', { detail: 0 });
+  assert.equal(press.defaultPrevented, true, 'the click (and so the submit it would cause) is cancelled');
+  assert.deepEqual(clicks, [], 'onClick is not called');
+  assert.equal(save.hasAttribute('disabled'), false);
+  assert.equal(save.getAttribute('aria-disabled'), 'true');
+  assert.ok(document.activeElement === save, 'it keeps the focus');
+  render(html`<${Host} off=${false} />`, view.root);
+  save.click();
+  assert.deepEqual(clicks, ['click']);
+  assert.equal(save.hasAttribute('aria-disabled'), false);
+  await view.unmount();
+}
+
+// ---- Forms: no rebuild when a message appears, no clamp-and-submit --------
+{
+  // A control without a label that gains a warning with the first character
+  // typed keeps its element, the focus and the text.
+  function Grows() {
+    const [v, setV] = useState('');
+    const [n, setN] = useState(null);
+    return html`
+      <${Input} id="grows" value=${v} onChange=${setV} warning=${v ? 'Keys this short are easy to guess.' : undefined} />
+      <${NumberInput} id="count" value=${n} onChange=${setN} min=${0} hint=${n != null ? 'per minute' : undefined} />
+    `;
+  }
+  const view = mount(html`<${Grows} />`);
+  const field = document.querySelector('#grows');
+  field.focus();
+  field.value = 'a';
+  dispatch(field, 'input');
+  await until(() => document.querySelector('.field-warning'), 'the warning');
+  assert.ok(document.querySelector('#grows') === field, 'the input was rebuilt when the warning appeared');
+  assert.ok(document.activeElement === field, 'and the focus was lost with it');
+  assert.equal(field.value, 'a');
+  assert.equal(field.getAttribute('aria-describedby'), document.querySelector('.field-warning').getAttribute('id'));
+  const count = document.querySelector('#count');
+  count.focus();
+  count.value = '5';
+  dispatch(count, 'input');
+  await until(() => document.querySelector('.field-hint'), 'the hint');
+  assert.ok(document.querySelector('#count') === count && document.activeElement === count, 'a NumberInput is not rebuilt either');
+  assert.ok(field.closest('.field') && !field.closest('.field').hasAttribute('data-bare'), 'with a message the field is a box');
+  field.value = '';
+  dispatch(field, 'input');
+  await until(() => field.closest('.field').hasAttribute('data-bare'), 'without one it is bare (display: contents)');
+  assert.ok(document.querySelector('#grows') === field);
+  await view.unmount();
+
+  // Typing 0 in a min-1 field and pressing Save: the blur that the press
+  // causes does not clamp to 1 and let the same click save it.
+  const saved = [];
+  function Weight() {
+    const [v, setV] = useState(5);
+    return html`<${Form} onSubmit=${() => saved.push(v)}>
+      <${NumberInput} id="weight" label="Weight" value=${v} onChange=${setV} min=${1} max=${100} />
+      <${Button} id="save" type="submit" variant="primary">Save<//>
+    <//>`;
+  }
+  const form = mount(html`<${Weight} />`);
+  const weight = document.querySelector('#weight');
+  const save = document.querySelector('#save');
+  weight.focus();
+  weight.value = '0';
+  dispatch(weight, 'input');
+  await until(() => weight.hasAttribute('data-entry-invalid'), 'the field to be marked');
+  dispatch(save, 'pointerdown');
+  save.focus(); // the press moves the focus: the field blurs
+  await sleep(20);
+  assert.equal(weight.value, '0', 'the press of Save clamped the field');
+  assert.ok(weight.hasAttribute('data-entry-invalid'), 'the field keeps its mark');
+  dispatch(document.querySelector('form'), 'submit');
+  assert.deepEqual(saved, [], 'the form refused the submit');
+  assert.ok(document.activeElement === weight, 'and gave the field the focus');
+  // Leaving it any other way still settles it.
+  dispatch(document.body, 'pointerdown');
+  await sleep(5);
+  weight.blur();
+  await until(() => weight.value === '1', 'an ordinary blur to clamp');
+  dispatch(document.querySelector('form'), 'submit');
+  assert.deepEqual(saved, [1]);
+  await form.unmount();
+}
+
+// ---- Forms: FormError lists what is not already said ----------------------
+{
+  // A 422 message quotes its first three issues; the list shows the rest.
+  const issues = [
+    { path: 'providers[0].name', message: 'is required' },
+    { path: 'server.port', message: 'must be between 1 and 65535' },
+    { path: 'routing.max_attempts', message: 'must be 1 or more' },
+    { path: 'admin.secret', message: 'is too short' },
+  ];
+  const error = new ApiError(422, 'the configuration is not valid: providers[0].name: is required; server.port: must be between 1 and 65535; routing.max_attempts: must be 1 or more (and 1 more)', { issues });
+  const view = mount(html`<${FormError} error=${error} />`);
+  const items = () => document.querySelectorAll('.issue-list li').map((li) => text(li));
+  assert.deepEqual(items(), ['admin.secretis too short'], 'only the issue the message does not quote is listed');
+  await view.unmount();
+
+  // A 409 for a broken file quotes the file's issue: nothing to list.
+  const disk = new ApiError(409, 'the configuration file on disk is not valid, so the change was not saved; fix or restore the file. What is wrong with the file: line 3, column 9: invalid number', { issues: [{ path: 'line 3, column 9', message: 'invalid number' }] });
+  const conflict = mount(html`<${FormError} error=${disk} />`);
+  assert.equal(document.querySelector('.issue-list'), null);
+  await conflict.unmount();
+
+  // Claims last one render: a field that stops asking for its issue gives it back.
+  const taken = new ApiError(409, 'a key named `build-bot` already exists', { issues: [{ path: 'name', message: 'is already used by another key' }] });
+  let setEdited;
+  function Host() {
+    const [edited, set] = useState(false);
+    setEdited = set;
+    const found = useIssues(taken);
+    return html`<${Input} label="Name" value="" error=${edited ? undefined : found.at('name')} /><${FormError} error=${taken} issues=${found} />`;
+  }
+  const claims = mount(html`<${Host} />`);
+  assert.match(text(document.querySelector('.notice-text')), /Check the highlighted field\./);
+  assert.equal(document.querySelector('.issue-list'), null);
+  setEdited(true);
+  await until(() => document.querySelector('.issue-list'), 'the issue to be listed once its field no longer shows it');
+  assert.doesNotMatch(text(document.querySelector('.notice-text')), /highlighted/, 'nothing is highlighted any more');
+  assert.deepEqual(document.querySelectorAll('.issue-list li').map((li) => text(li)), ['nameis already used by another key']);
+  await claims.unmount();
+
+  // The error notice of a dialog: any Error, as a sentence.
+  const plain = mount(html`<${FormError} error=${new Error('the key is in use by a running request')} title="That did not work" />`);
+  assert.equal(text(document.querySelector('.notice-text')), 'The key is in use by a running request.');
+  await plain.unmount();
+
+  // ConfirmDialog uses the same issue rendering, not a message-only notice.
+  const dialog = mount(html`<${ConfirmDialog} open title="Remove entry?" confirmLabel="Remove"
+    onConfirm=${async () => { throw new ApiError(422, 'entry cannot be removed', { issues: [{ path: 'entry', message: 'is in use' }] }); }} />`);
+  const remove = await until(() => [...document.querySelectorAll('.modal button')].find((b) => text(b) === 'Remove'));
+  await sleep(20); // the dialog's opening effect clears any previous error
+  remove.click();
+  await until(() => document.querySelector('.modal .issue-list'), 'the confirmation error issues');
+  assert.match(text(document.querySelector('.modal .notice-text')), /^Entry cannot be removed\./);
+  assert.equal(text(document.querySelector('.modal .issue-list')), 'entryis in use');
+  await dialog.unmount();
+}
+
 // ---- Command palette: a command runs after focus is back -----------------
 {
   let setOpen;
@@ -1309,6 +1654,65 @@ function mount(vnode) {
   await small.unmount();
 }
 
+// ---- Counts of one, full names, and code tools that never cover code -------
+{
+  const view = mount(html`
+    <span class="h1"><${HealthStrip} label="openai" noun=${['upstream attempt', 'upstream attempts']} buckets=${[{ ok: 0, failed: 1 }]} /></span>
+    <span class="h2"><${HealthStrip} label="openai" noun="upstream attempts" buckets=${[{ ok: 1, failed: 0 }]} /></span>
+    <span class="h3"><${HealthStrip} buckets=${[{ ok: 1, failed: 0 }]} /></span>
+    <span class="h4"><${HealthStrip} noun=${['upstream attempt', 'upstream attempts']} buckets=${[{ ok: 1, failed: 1 }]} /></span>
+    <div class="lm1"><${LoadMore} hasMore=${false} shown=${1} noun="requests" /></div>
+    <div class="lm2"><${LoadMore} hasMore=${false} shown=${1} noun=${['matching request', 'matching requests']} /></div>
+    <div class="lm3"><${LoadMore} hasMore=${false} shown=${12} noun="requests" /></div>
+    <div class="lm4"><${LoadMore} hasMore=${true} shown=${12} noun=${['request', 'requests']} onLoad=${() => {}} /></div>
+    <div class="lm5"><${LoadMore} hasMore=${false} /></div>
+    <div class="cb1"><${CodeBlock} language="text" value=${'curl -s http://127.0.0.1:8317/v1/chat/completions -H "Authorization: Bearer $SWITCHYARD_KEY"'} /></div>
+    <div class="cb2"><${CodeBlock} title="Body" value="{}" /></div>
+    <div class="titled"><${LineChart}
+      x=${['a', 'b']}
+      series=${[
+        { key: 'a', label: 'gpt-4o…', title: 'openai/gpt-4o-2024-08-06-with-a-long-suffix', values: [1, 2] },
+        { key: 'b', label: 'claude', values: [2, 1] },
+      ]}
+      label="Requests by model" /></div>
+  `);
+  const name = (selector) => document.querySelector(`${selector} .health`).getAttribute('aria-label');
+  assert.equal(name('.h1'), 'openai: 0% of 1 recent upstream attempt succeeded', 'one attempt is one attempt');
+  assert.equal(name('.h2'), 'openai: 100% of 1 recent upstream attempt succeeded', 'a plural string noun still reads singular for one');
+  assert.equal(name('.h3'), '100% of 1 recent request succeeded');
+  assert.equal(name('.h4'), '50% of 2 recent upstream attempts succeeded');
+
+  assert.equal(text(document.querySelector('.lm1 .loadmore')), 'The only request is shown');
+  assert.equal(text(document.querySelector('.lm2 .loadmore')), 'The only matching request is shown');
+  assert.equal(text(document.querySelector('.lm3 .loadmore')), 'All 12 requests shown');
+  assert.equal(text(document.querySelector('.lm4 button')), 'Load older requests', 'a noun pair: the button counts many');
+  assert.equal(text(document.querySelector('.lm5 .loadmore')), 'No more rows');
+
+  // Without a title the tools still sit in a bar of their own, above the code.
+  for (const selector of ['.cb1', '.cb2']) {
+    const block = document.querySelector(`${selector} .code`);
+    const bar = block.querySelector('.code-bar');
+    assert.ok(bar && bar.querySelector('.code-tools'), `${selector}: the tools are in the bar`);
+    assert.equal(block.children[0], bar, 'the bar comes first');
+    assert.equal(block.querySelector('pre .code-tools'), null, 'nothing of the tools is inside the code');
+  }
+  assert.ok(document.querySelector('.cb1 .code-bar').hasAttribute('data-untitled'));
+  assert.equal(document.querySelector('.cb1 .code-title'), null);
+  assert.equal(document.querySelector('.cb1 pre').getAttribute('aria-label'), 'Code');
+
+  // series.title: the full name of a shortened label, on the legend entry and the table heading.
+  const chart = await until(() => document.querySelector('.titled .chart-legend') && document.querySelector('.titled'), 'the chart');
+  const legend = chart.querySelectorAll('.chart-legend li');
+  assert.equal(legend[0].getAttribute('title'), 'openai/gpt-4o-2024-08-06-with-a-long-suffix');
+  assert.equal(text(legend[0]), 'gpt-4o…');
+  assert.equal(legend[1].getAttribute('title'), 'claude', 'without a title, the label');
+  chart.querySelectorAll('button').find((button) => button.getAttribute('aria-label') === 'Show as table').click();
+  const heads = await until(() => chart.querySelector('.chart-table-wrap') && chart.querySelectorAll('.chart-table-wrap th'), 'the table view');
+  assert.equal(heads[1].getAttribute('title'), 'openai/gpt-4o-2024-08-06-with-a-long-suffix');
+  assert.equal(text(heads[1].querySelector('.chart-table-head')), 'gpt-4o…', 'the heading is cut by CSS: it needs its own element');
+  await view.unmount();
+}
+
 // ---- Live: `lagged` and reconnects are announced as gaps ------------------
 {
   assert.ok(TOPICS.includes('lagged'), 'lagged is a documented topic');
@@ -1392,18 +1796,92 @@ function mount(vnode) {
   }
 }
 
+// ---- Live: a page hears that the connection went down -----------------------
+{
+  class FakeSocket {
+    constructor(address) {
+      this.url = address;
+      this.readyState = 0;
+      FakeSocket.all.push(this);
+    }
+    send() {}
+    close() {
+      this.readyState = 3;
+    }
+    accept() {
+      this.readyState = 1;
+      this.onopen?.();
+    }
+    drop() {
+      this.readyState = 3;
+      this.onclose?.();
+    }
+  }
+  FakeSocket.all = [];
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{"ticket":"t-2"}', { status: 200 });
+  const realSocket = globalThis.WebSocket;
+  Object.defineProperty(globalThis, 'WebSocket', { value: FakeSocket, configurable: true, writable: true });
+  try {
+    const events = [];
+    function Probe({ paused }) {
+      useLiveGap((gap) => events.push(`gap:${gap.reason}`), { enabled: !paused, onDown: (down) => events.push(`down:${down.reason}:${liveState.get().status}`) });
+      return null;
+    }
+    const view = mount(html`<${Probe} />`);
+    const direct = [];
+    const offDown = live.onDown((down) => direct.push(down));
+    await sleep(120);
+    live.start();
+    const first = await until(() => FakeSocket.all[0], 'the live socket');
+    // A first connection that fails before it opened is no "down": nobody relied on it.
+    first.drop();
+    const second = await until(() => FakeSocket.all[1], 'a retry', 3000);
+    assert.deepEqual(events, [], 'a socket that never opened does not go down');
+    second.accept();
+    await until(() => liveState.get().status === 'open');
+    assert.deepEqual(events, [], 'nor is the first open connection of the session a gap');
+
+    second.drop();
+    assert.deepEqual(events, ['down:down:reconnecting'], 'the open connection lost: onDown, once, with the state already reconnecting');
+    assert.deepEqual(direct, [{ reason: 'down' }], 'live.onDown hears it too');
+    const third = await until(() => FakeSocket.all[2], 'the reconnect', 3000);
+    third.drop();
+    const fourth = await until(() => FakeSocket.all[3], 'another retry', 5000);
+    assert.equal(events.length, 1, 'failed retries are the same outage: no second down');
+    fourth.accept();
+    assert.deepEqual(events, ['down:down:reconnecting', 'gap:reconnect'], 'and the reconnect gap closes the pair');
+
+    // Signing out closes the socket: that is not the connection going down.
+    offDown();
+    live.stop();
+    assert.equal(events.length, 2, 'stop() announces nothing');
+    assert.equal(direct.length, 1, 'an unsubscribed listener hears nothing more');
+    await view.unmount();
+  } finally {
+    live.stop();
+    globalThis.fetch = realFetch;
+    Object.defineProperty(globalThis, 'WebSocket', { value: realSocket, configurable: true, writable: true });
+    auth.set({ status: 'anonymous', reason: null });
+  }
+}
+
 // ---- Session: a resumed tab keeps its secret; signing out reaches every tab --
 {
   const TOKEN = 'sy.admin.token';
   watchOtherTabs(); // at load in a browser; this module was loaded before the window
   const realFetch = globalThis.fetch;
   const sent = [];
-  let delay = 0;
+  let pendingLogin = null;
+  let loginWaiting = false;
   // The live client asks for tickets on its own once signed in: only /status counts.
   const lastStatus = () => sent.filter((s) => s.url.endsWith('/status')).at(-1)?.auth;
   globalThis.fetch = async (url, init) => {
     sent.push({ url: String(url), auth: new Headers(init.headers).get('authorization') });
-    if (delay) await sleep(delay);
+    if (pendingLogin && String(url).endsWith('/login')) {
+      loginWaiting = true;
+      await pendingLogin;
+    }
     return new Response('{}', { status: 200 });
   };
   // Another tab of the same browser.
@@ -1466,15 +1944,18 @@ function mount(vnode) {
     // A sign-out heard while the stored secret is being checked wins.
     localStorage.setItem(TOKEN, 'remembered-secret');
     auth.set({ status: 'unknown', reason: null, elsewhere: false });
-    delay = 60;
+    let releaseLogin;
+    pendingLogin = new Promise((resolve) => { releaseLogin = resolve; });
     const resumed = api.resume();
-    await sleep(10);
+    await until(() => loginWaiting, 'the resume login check to wait for its answer');
     other.postMessage({ type: 'signed-out' });
+    await until(() => auth.get().status === 'anonymous' && auth.get().elsewhere, 'the sign-out to arrive before the pending check');
+    releaseLogin();
     assert.equal(await resumed, false);
     assert.equal(auth.get().status, 'anonymous', 'the check that landed afterwards does not sign the tab back in');
     assert.equal(sessionStorage.getItem(TOKEN), null);
   } finally {
-    delay = 0;
+    pendingLogin = null;
     other.close();
     globalThis.fetch = realFetch;
     api.logout({ allTabs: false });
@@ -1854,6 +2335,49 @@ function mount(vnode) {
     await plain.unmount();
   } finally {
     globalThis.fetch = realFetch;
+  }
+}
+
+// ---- Shell: the focus on a change of page --------------------------------
+{
+  const { Shell } = await import('../js/shell/shell.js');
+  const appRouter = await import('../js/lib/router.js');
+  const { ROUTES } = await import('../js/routes.js');
+  // Two small pages of the test's own: the shell is under test, not a page.
+  const pages = [
+    { path: '/_one', title: 'One', load: async () => ({ default: () => html`<div class="one"><input id="one-search" /></div>` }) },
+    { path: '/_two', title: 'Two', load: async () => ({ default: () => html`<div class="two"><button id="two-first">Two</button></div>` }) },
+  ];
+  ROUTES.push(...pages);
+  const realFetch = globalThis.fetch;
+  globalThis.fetch = async () => new Response('{"version":"0.0.0"}', { status: 200 });
+  const mainRegion = () => document.querySelector('main#main');
+  const skip = () => document.querySelector('.skip-link');
+  try {
+    appRouter.routeStore.replace(appRouter.parseHash('#/_one'));
+    const view = mount(html`<${Shell} />`);
+    await until(() => document.querySelector('#one-search'), 'page one');
+    // The link that was followed (here: the nav) keeps nothing; the page's
+    // main region takes the focus.
+    document.querySelector('#one-search').focus();
+    appRouter.routeStore.replace(appRouter.parseHash('#/_two'));
+    await until(() => document.querySelector('#two-first'), 'page two');
+    await until(() => document.activeElement === mainRegion(), 'a new page to give <main> the focus');
+    // Right after the change, a focus that lands on "Skip to content"
+    // without a Tab (the browser handing it to the top of the document) is
+    // passed on to <main>: the link must not end up focused and shown.
+    skip().focus();
+    await until(() => document.activeElement === mainRegion(), 'the skip link to pass a focus it was not tabbed to on to <main>');
+    // A Tab still reaches it.
+    dispatch(document.body, 'keydown', { key: 'Tab' });
+    skip().focus();
+    await sleep(20);
+    assert.ok(document.activeElement === skip(), 'Tab reaches the skip link as usual');
+    await view.unmount();
+  } finally {
+    ROUTES.splice(ROUTES.indexOf(pages[0]), 2);
+    globalThis.fetch = realFetch;
+    appRouter.routeStore.replace(appRouter.parseHash('#/nowhere'));
   }
 }
 

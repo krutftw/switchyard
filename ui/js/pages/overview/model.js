@@ -368,8 +368,22 @@ export function nextCooldownEnd(summaries) {
  * itself, which the rows do not, and one strip must not show two different
  * numbers. While the provider list is still loading the answer is null (a
  * skeleton).
+ *
+ * Returns { tone, label, detail, refused }. `refused` is true while the
+ * gateway refuses the configuration file on disk (`status.config_rejected`):
+ * it keeps serving the last valid configuration, so a healthy gateway is not
+ * just "Serving" then but a caution, and the strip says the file was refused
+ * and links to the raw file. A worse verdict (degraded, not serving) keeps
+ * its own words and tone, with the same note.
  */
 export function gatewayVerdict(summaries, status, providersFailed = false) {
+  const verdict = credentialVerdict(summaries, status, providersFailed);
+  if (!verdict || !status?.config_rejected) return verdict ? { ...verdict, refused: false } : null;
+  if (verdict.tone === 'clear') return { ...verdict, tone: 'caution', label: 'Serving the last valid configuration', refused: true };
+  return { ...verdict, refused: true };
+}
+
+function credentialVerdict(summaries, status, providersFailed) {
   if (!summaries) {
     const counts = status?.counts;
     if (!counts || !providersFailed) return null;
@@ -638,6 +652,8 @@ export function applyFeed(rows, events, cap = 15) {
 
 /** The page where a warning from /status is fixed. */
 export function warningTarget(text) {
+  // The file on disk was refused (config_rejected): it is fixed in the raw file.
+  if (/^configuration file:/.test(text)) return { path: '/settings', query: { tab: 'raw' }, label: 'Open the raw file' };
   const provider = /^provider `([^`]+)`/.exec(text);
   if (provider) return { path: '/providers', query: { open: provider[1] }, label: 'Open providers' };
   if (/^alias\b/.test(text)) return { path: '/models', query: { tab: 'aliases' }, label: 'Open aliases' };
@@ -714,12 +730,13 @@ export function clientBase(listen, pageLocation, tls) {
   return { base: wildcard ? origin : `${listenTls ? 'https' : 'http'}://${listen}`, direct: true };
 }
 
-/** A request a new operator can paste into a terminal. The key is a variable, never the key. */
+/** A request for bash/zsh. The key is a variable, never the key. */
 export function curlExample({ base, model, authRequired }) {
   const body = JSON.stringify({ model: model ?? 'MODEL', messages: [{ role: 'user', content: 'Say hello' }] });
-  const lines = [`curl ${base}/v1/chat/completions \\`];
+  const quoted = (value) => `'${String(value).replace(/'/g, "'\\''")}'`;
+  const lines = [`curl ${quoted(`${base}/v1/chat/completions`)} \\`];
   if (authRequired) lines.push('  -H "Authorization: Bearer $SWITCHYARD_KEY" \\');
   lines.push('  -H "Content-Type: application/json" \\');
-  lines.push(`  -d '${body.replace(/'/g, "'\\''")}'`);
+  lines.push(`  -d ${quoted(body)}`);
   return lines.join('\n');
 }

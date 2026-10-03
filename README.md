@@ -16,13 +16,18 @@ built-in dashboard.
                               └────────────────────┘
 ```
 
+![Switchyard dashboard showing mock-provider traffic](docs/images/dashboard-overview.jpg)
+
+The dashboard above uses the built-in mock provider; its figures are test traffic.
+
 ## What it does
 
 - **Four client protocols**: OpenAI Chat Completions, OpenAI Responses,
   Anthropic Messages and Gemini `generateContent` — streaming and
   non-streaming, tools, images, reasoning, structured output, token counting.
 - **Any client, any provider**: a request in one protocol can be served by a
-  provider that speaks another. Same-protocol requests are forwarded untouched.
+  provider that speaks another. Same-protocol requests preserve provider fields,
+  with model normalization and any configured reasoning or payload changes.
 - **WebSockets**: the OpenAI Responses API over WebSocket (`GET /v1/responses`)
   for any model, a relay for the OpenAI Realtime API (`/v1/realtime`), and a
   live event feed for the dashboard.
@@ -54,10 +59,12 @@ Download a binary from the [releases page](https://github.com/krutftw/switchyard
 switchyard
 ```
 
-On first start it writes `switchyard.toml`, prints an admin secret and a client
+On first start it writes `switchyard.toml` with a fresh admin secret and client
 API key, and enables a built-in mock provider so you can try everything without
-any upstream key. Open <http://127.0.0.1:8317/admin/> and sign in with the
-admin secret.
+any upstream key. An interactive terminal shows the credentials once; redirected
+logs omit them. Read `admin.secret` and the client key in the private config
+file when running as a service. Open <http://127.0.0.1:8317/admin/> and sign in
+with the admin secret.
 
 Add a real provider in the dashboard, or in `switchyard.toml`:
 
@@ -114,12 +121,16 @@ curl "http://127.0.0.1:8317/v1beta/models/gpt-5:generateContent" \
 | `POST /v1beta/models/{model}:generateContent`, `:streamGenerateContent`, `:countTokens` | Gemini |
 | `GET  /v1/models`, `/v1beta/models` | model lists in each vendor's shape |
 | `GET  /v1/realtime` | WebSocket relay to an OpenAI Realtime upstream |
+| `POST /v1/ws-ticket` | authenticated, single-use browser WebSocket ticket |
 | `POST /v1/embeddings`, `/v1/images/generations`, `/v1/moderations`, `/v1/audio/speech` | forwarded to an OpenAI-compatible provider |
 | `GET  /healthz` | liveness |
 | `/admin/`, `/admin/api/…` | dashboard and admin API |
 
 Clients authenticate with a key from `[[auth.keys]]`, sent as
 `Authorization: Bearer`, `x-api-key`, `x-goog-api-key` or `?key=`.
+Prefer headers. Browser WebSocket clients can mint a 30-second ticket with
+`POST /v1/ws-ticket` using a key in a header, then connect with `?ticket=` so
+the long-lived key never appears in a URL.
 
 ## Configuration
 
@@ -150,6 +161,11 @@ set = { "reasoning.summary" = "auto" }
 Secrets may be literal or `env:NAME`. The file is reloaded when it changes; an
 invalid edit is rejected and the running config kept.
 
+See [the security and deployment model](docs/SECURITY-MODEL.md) before sharing
+access. Model allow-lists do not isolate files or resources within a shared
+upstream account, and the dashboard's Remember option stores its admin secret
+in the trusted browser profile.
+
 ## Command line
 
 ```
@@ -165,22 +181,34 @@ Environment: `SWITCHYARD_CONFIG`, `SWITCHYARD_ADMIN_SECRET`,
 
 ## Docker
 
+The initial release provides a Windows x64 archive. Linux/macOS binaries and
+published container images are pending; build a container locally from this
+checkout with `docker build -t switchyard:local .` before using this example:
+
 ```bash
-docker run -d --name switchyard -p 8317:8317 \
+export SWITCHYARD_ADMIN_SECRET="$(openssl rand -hex 32)"
+docker run -d --name switchyard -p 127.0.0.1:8317:8317 \
   -v switchyard-data:/data \
-  -e SWITCHYARD_ADMIN_SECRET=change-me \
-  ghcr.io/krutftw/switchyard:latest
+  -e SWITCHYARD_ADMIN_SECRET -e SWITCHYARD_ADMIN_ALLOW_REMOTE=true \
+  switchyard:local
 ```
 
-The config is created at `/data/switchyard.toml` on first start.
+This bash example generates a fresh admin secret in `SWITCHYARD_ADMIN_SECRET`;
+use that value to sign in and keep it in a password manager. The config is
+created at `/data/switchyard.toml` on first start. Admin access across the
+container boundary is explicitly enabled, while the published port is bound
+to the host's loopback interface. For access from other machines, use TLS and
+restrict who can reach the gateway. Images leave remote admin access disabled
+unless you enable it.
 
 ## How translation works
 
 Each protocol has a codec that maps it to and from one canonical request and
 stream model, so supporting four protocols takes four codecs rather than
 twelve pairwise translators. When the client and the provider speak the same
-protocol the body is forwarded as-is (only the model name, and reasoning
-settings when you use a suffix, are touched). Details that do not survive a
+protocol its fields are preserved, with JSON normalization, model routing and
+any configured reasoning or payload changes. Restricted client keys cannot use
+upstream selectors that could bypass their model allow-list. Details that do not survive a
 protocol boundary — provider-specific blocks, signed reasoning from another
 vendor — are dropped rather than sent somewhere they would be rejected.
 See [docs/DESIGN.md](docs/DESIGN.md).

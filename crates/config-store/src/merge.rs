@@ -109,7 +109,46 @@ pub struct Rendered {
 /// or an integer beyond 64 bits inside a payload rule, for example). The
 /// error message names the problem and contains no configuration values.
 pub fn render_update(text: &str, new: &Config) -> Result<Rendered, String> {
+    render_update_unsetting(text, new, &[])
+}
+
+/// [`render_update`] that also takes keys out of the file: each entry of
+/// `unset` is the dotted path of a setting or table (`routing.cooldown`,
+/// `server.port`) that `new` holds at its default and that should be left
+/// out of the file so the default applies — and a later change of the
+/// default with it — rather than be written as an explicit value.
+///
+/// A key is removed like any other key the merge removes: with the comment
+/// on its line and the comment lines directly above it, while paragraphs set
+/// apart by a blank line stay. A path the file does not have, or one whose
+/// removal would not give `new` back (the value is not the default there),
+/// is written as [`render_update`] would write it.
+pub fn render_update_unsetting(
+    text: &str,
+    new: &Config,
+    unset: &[String],
+) -> Result<Rendered, String> {
     let new_tree = tree_of(new)?;
+    if !unset.is_empty() {
+        let mut pruned = new_tree.clone();
+        for path in with_emptied_tables(text, unset) {
+            remove_path(&mut pruned, &path);
+        }
+        if let Ok(Some(merged)) = merge(text, &pruned)
+            && tree_of_text(&merged).as_ref() == Some(&new_tree)
+        {
+            // Unsetting what the file does not say leaves it as it was.
+            let strategy = if merged == text {
+                Strategy::Unchanged
+            } else {
+                Strategy::Merged
+            };
+            return Ok(Rendered {
+                text: merged,
+                strategy,
+            });
+        }
+    }
     match merge(text, &new_tree) {
         Ok(None) => {
             return Ok(Rendered {
@@ -163,6 +202,74 @@ fn tree_of(config: &Config) -> Result<Map<String, Json>, String> {
         Ok(Json::Object(map)) => Ok(map),
         Ok(_) => Err("the configuration did not serialise to a table".to_string()),
         Err(e) => Err(format!("the configuration cannot be serialised: {e}")),
+    }
+}
+
+/// `unset` plus every table of the file that would be left empty without
+/// them: unsetting the only key of `[server]` takes the `[server]` header
+/// too, instead of leaving it behind with nothing under it.
+fn with_emptied_tables(text: &str, unset: &[String]) -> Vec<String> {
+    let mut all = unset.to_vec();
+    let Ok(doc) = strip_bom(text).parse::<DocumentMut>() else {
+        return all;
+    };
+    loop {
+        let mut emptied = Vec::new();
+        for path in &all {
+            let Some((parent, _)) = path.rsplit_once('.') else {
+                continue;
+            };
+            if all.iter().chain(&emptied).any(|known| known == parent) {
+                continue;
+            }
+            let Some(keys) = keys_at(doc.as_item(), parent) else {
+                continue;
+            };
+            let gone = |key: &String| {
+                let path = format!("{parent}.{key}");
+                all.contains(&path)
+            };
+            if !keys.is_empty() && keys.iter().all(gone) {
+                emptied.push(parent.to_string());
+            }
+        }
+        if emptied.is_empty() {
+            return all;
+        }
+        all.extend(emptied);
+    }
+}
+
+/// The keys of the table at a dotted path of a document, written as a
+/// `[table]`, inline or with dotted keys; `None` when there is no table.
+fn keys_at(root: &Item, path: &str) -> Option<Vec<String>> {
+    let mut item = root;
+    for segment in path.split('.') {
+        item = item.get(segment)?;
+    }
+    match item {
+        Item::Table(table) => Some(table.iter().map(|(key, _)| key.to_string()).collect()),
+        Item::Value(Value::InlineTable(table)) => {
+            Some(table.iter().map(|(key, _)| key.to_string()).collect())
+        }
+        _ => None,
+    }
+}
+
+/// Removes the key at a dotted path (`routing.cooldown.auth_secs`) from a
+/// value tree; a path that leads nowhere changes nothing.
+fn remove_path(tree: &mut Map<String, Json>, path: &str) {
+    let mut table = tree;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        if segments.peek().is_none() {
+            table.shift_remove(segment);
+            return;
+        }
+        match table.get_mut(segment) {
+            Some(Json::Object(inner)) => table = inner,
+            _ => return,
+        }
     }
 }
 
@@ -498,7 +605,14 @@ impl Merger {
                     }
                     _ => new_value(new_value_json, path),
                 };
-                built.map(|value| insert_inline(root, at, value))
+                built.map(|value| {
+                    // No difference to write after all (what differed was a
+                    // key to leave out): no `{}` either.
+                    let empty = matches!(&value, Value::InlineTable(inner) if inner.is_empty());
+                    if !(empty && matches!(old_value, Some(Json::Object(_)))) {
+                        insert_inline(root, at, value);
+                    }
+                })
             };
             at.pop();
             path.pop();

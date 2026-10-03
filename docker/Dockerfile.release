@@ -13,7 +13,6 @@ USER switchyard
 WORKDIR /data
 VOLUME /data
 EXPOSE 8317
-# Inside a container every client is "remote"; the admin secret is still required.
-ENV SWITCHYARD_ADMIN_ALLOW_REMOTE=true
+# Enable admin access across the container boundary explicitly at run time.
 ENTRYPOINT ["/usr/local/bin/switchyard"]
 CMD ["serve", "--config", "/data/switchyard.toml", "--host", "0.0.0.0"]

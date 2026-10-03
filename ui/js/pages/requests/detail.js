@@ -27,9 +27,10 @@ import {
 import { DASH, formatBytes, formatCurrency, formatDuration, formatNumber, formatRelativeTime, formatTimestamp, plural, sentence } from '../../lib/format.js';
 import { useNow, useResource } from '../../lib/hooks.js';
 import { useLive } from '../../lib/live.js';
-import { href, useQueryParam } from '../../lib/router.js';
+import { canReplayInPlayground } from '../../lib/replay.js';
+import { href } from '../../lib/router.js';
 import { Elapsed, ProtocolRoute, statusTone } from './cells.js';
-import { buildCurl, errorKindWords, headerLines, isEventStream, playgroundAccepts, playgroundReplayable, statusWords } from './record.js';
+import { NO_PROVIDER, buildCurl, errorKindWords, headerLines, isEventStream, statusWords } from './record.js';
 
 /**
  * A safety net, not a wait. The gateway can hand out the bodies of a request
@@ -161,7 +162,7 @@ function Summary({ record }) {
     {
       label: 'Provider',
       hidden: record.in_flight,
-      value: record.provider ? html`<a class="mono" href=${href('/providers', { open: record.provider })}>${record.provider}</a>` : html`<span class="faint">Not routed</span>`,
+      value: record.provider ? html`<a class="mono" href=${href('/providers', { open: record.provider })}>${record.provider}</a>` : html`<span class="faint">${NO_PROVIDER}</span>`,
     },
     {
       label: 'Credential',
@@ -181,7 +182,7 @@ function Summary({ record }) {
 function Attempts({ record }) {
   const attempts = record.attempts ?? [];
   if (attempts.length === 0) {
-    return html`<p class="muted req-quiet">No upstream was called: the request ended before a provider was chosen.</p>`;
+    return html`<p class="muted req-quiet">No upstream was called: the request failed before routing, or every credential of the model was cooling down.</p>`;
   }
   return html`
     <${Timeline}
@@ -307,7 +308,7 @@ function NotCaptured({ record, requestLog }) {
   } else if (requestLog) {
     text = `The bodies were not stored when this request ran, or they have since been removed. Capture is set ${where}.`;
   }
-  const needs = playgroundAccepts(record) ? 'Copy as curl and Open in playground need' : 'Copy as curl needs';
+  const needs = canReplayInPlayground(record) ? 'Copy curl (bash/zsh) and Open in playground need' : 'Copy curl (bash/zsh) needs';
   return html`
     <${EmptyState}
       compact
@@ -349,9 +350,10 @@ function Bodies(props) {
   return html`<div ref=${box}><${BodiesView} ...${props} busy=${busy} onRetry=${retry} /></div>`;
 }
 
-function BodiesView({ record, bodies, missing, detail, busy, logging, onRetry }) {
-  const [tab, setTab] = useQueryParam('tab', BODY_TABS[0].id);
+function BodiesView({ record, bodies, missing, detail, busy, logging, onRetry, tab, onTab }) {
   const active = BODY_TABS.some((t) => t.id === tab) ? tab : BODY_TABS[0].id;
+  // The first tab is the default: it leaves ?tab= out of the address.
+  const pick = (id) => onTab(id === BODY_TABS[0].id ? null : id);
 
   if (record.in_flight) {
     return html`<p class="muted req-quiet">Bodies are stored when the request finishes.</p>`;
@@ -380,7 +382,7 @@ function BodiesView({ record, bodies, missing, detail, busy, logging, onRetry })
   const current = BODY_TABS.find((t) => t.id === active);
   return html`
     <div class="stack" style="--gap:var(--space-3)">
-      <${Tabs} label="Captured bodies" tabs=${BODY_TABS} value=${active} onChange=${setTab} />
+      <${Tabs} label="Captured bodies" tabs=${BODY_TABS} value=${active} onChange=${pick} />
       <div role="tabpanel" aria-label=${current.label}>
         ${active === 'headers'
           ? html`<${Headers} bodies=${bodies} />`
@@ -394,7 +396,7 @@ function BodiesView({ record, bodies, missing, detail, busy, logging, onRetry })
 // Drawer
 // ---------------------------------------------------------------------------
 
-function Content({ id, record, bodies, missing, detail, logging, onRetry }) {
+function Content({ id, record, bodies, missing, detail, logging, onRetry, tab, onTab }) {
   if (!record) {
     if (detail.error?.status === 404) {
       return html`
@@ -431,7 +433,7 @@ function Content({ id, record, bodies, missing, detail, logging, onRetry }) {
         <//>
       `}
       <${Section} title="Captured bodies">
-        <${Bodies} record=${record} bodies=${bodies} missing=${missing} detail=${detail} logging=${logging} onRetry=${onRetry} />
+        <${Bodies} record=${record} bodies=${bodies} missing=${missing} detail=${detail} logging=${logging} onRetry=${onRetry} tab=${tab} onTab=${onTab} />
       <//>
     </div>
   `;
@@ -440,10 +442,13 @@ function Content({ id, record, bodies, missing, detail, logging, onRetry }) {
 /**
  * id       request id from the URL; '' closes the drawer
  * seed     the list's record for that id, when it has one (shown at once)
+ * tab      the body tab from the URL (?tab=); anything else shows the first
+ * onTab    (tab | null) => void: null for the first tab. The page makes each
+ *          pick a step in the history, so Back returns to the previous tab
  * onClose  () => void
  * onNewer, onOlder  step to the neighbouring row, or null at the ends
  */
-export default function RequestDrawer({ id, seed, onClose, onNewer, onOlder }) {
+export default function RequestDrawer({ id, seed, tab, onTab, onClose, onNewer, onOlder }) {
   // The drawer keeps its content while it slides out, after the id is gone.
   const last = useRef({ id: '', seed: null });
   if (id) last.current = { id, seed: seed ?? (last.current.id === id ? last.current.seed : null) };
@@ -511,7 +516,7 @@ export default function RequestDrawer({ id, seed, onClose, onNewer, onOlder }) {
   const curl = useMemo(() => (record && bodies ? buildCurl(record, bodies) : null), [record, bodies]);
   // Only what the playground will load: it refuses embeddings, token counts
   // and other non-generation endpoints.
-  const replayable = playgroundReplayable(record, bodies);
+  const replayable = canReplayInPlayground(record, bodies);
 
   return html`
     <${Drawer}
@@ -533,15 +538,15 @@ export default function RequestDrawer({ id, seed, onClose, onNewer, onOlder }) {
             variant="secondary"
             size="md"
             value=${curl}
-            onCopied=${() => toast.success('Copied as curl', { description: 'The client key is not included. Set SWITCHYARD_KEY to a client key before you run it.' })}
+            onCopied=${() => toast.success('Copied curl for bash/zsh', { description: 'The client key is not included. In bash or zsh, set SWITCHYARD_KEY to a client key before you run it.' })}
           >
-            Copy as curl
+            Copy curl (bash/zsh)
           <//>
         `}
         ${replayable && html`<${Button} href=${href('/playground', { from: shownId })} iconRight="arrow-right">Open in playground<//>`}
       `}
     >
-      ${shownId && html`<${Content} id=${shownId} record=${record} bodies=${bodies} missing=${missing} detail=${detail} logging=${logging} onRetry=${retryNow} />`}
+      ${shownId && html`<${Content} id=${shownId} record=${record} bodies=${bodies} missing=${missing} detail=${detail} logging=${logging} onRetry=${retryNow} tab=${tab} onTab=${onTab} />`}
     <//>
   `;
 }

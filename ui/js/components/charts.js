@@ -25,7 +25,7 @@
 
 import { html, useMemo, useState } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
-import { DASH, formatCompact, formatDate, formatDateTime, formatDuration, formatPercent, formatTime, toDate } from '../lib/format.js';
+import { DASH, formatCompact, formatDate, formatDateTime, formatDuration, formatNumber, formatPercent, formatTime, toDate } from '../lib/format.js';
 import { useSize } from '../lib/hooks.js';
 import { IconButton } from './button.js';
 
@@ -172,13 +172,23 @@ function useChartHover(count, indexAt) {
 // Frame: legend, table toggle, table twin
 // ---------------------------------------------------------------------------
 
+/**
+ * The full name of a series, for a `title`: its own `title` when the page
+ * gave one (the label may be a shortened name), else a label that is text.
+ */
+export function seriesTitle(series) {
+  if (typeof series?.title === 'string' && series.title) return series.title;
+  const name = series?.label ?? series?.key;
+  return typeof name === 'string' || typeof name === 'number' ? String(name) : undefined;
+}
+
 function Legend({ series, shape }) {
   return html`
     <ul class="chart-legend">
       ${series.map((s, i) => {
         const name = s.label ?? s.key;
         // A long name is cut with an ellipsis; the full one is in the title.
-        return html`<li key=${s.key ?? i} title=${typeof name === 'string' ? name : undefined}>
+        return html`<li key=${s.key ?? i} title=${seriesTitle(s)}>
           <span class="chart-key" data-shape=${shape === 'rect' ? 'rect' : undefined} style=${`--key:${seriesColor(s, i)}`}></span>
           <span class="chart-legend-label">${name}</span>
         </li>`;
@@ -194,7 +204,9 @@ function ChartTable({ x, series, xLabel, xText, valueFormat }) {
         <thead>
           <tr>
             <th scope="col">${xLabel}</th>
-            ${series.map((s, i) => html`<th scope="col" key=${s.key ?? i} data-align="right">${s.label ?? s.key}</th>`)}
+            ${series.map(
+              (s, i) => html`<th scope="col" key=${s.key ?? i} data-align="right" title=${seriesTitle(s)}><span class="chart-table-head">${s.label ?? s.key}</span></th>`,
+            )}
           </tr>
         </thead>
         <tbody>
@@ -357,7 +369,11 @@ function Axes({ axes, width, yFormat, x, band }) {
 
 /**
  * x            epoch-ms timestamps (a time axis) or category labels
- * series       [{ key, label, values, color? }]; values line up with x; null breaks the line
+ * series       [{ key, label, values, color?, title? }]; values line up with x;
+ *              null breaks the line. `title` is the full name when `label`
+ *              is a shortened one: the `title` (native tooltip) of the
+ *              legend entry and of the table view's column heading, where
+ *              a long label is cut with an ellipsis
  * height       plot height in px including the x axis (default 220)
  * area         wash under each line
  * stacked      add the series up (implies area); use for parts of a whole
@@ -865,6 +881,17 @@ export function Meter({ value, max = 1, tone, text, label, class: className }) {
 // ---------------------------------------------------------------------------
 
 /**
+ * The noun for `n` things: a pair [one, many] picks by count; a plain word is
+ * taken as the plural, and its singular is the word without a final "s".
+ * Exported for tests.
+ */
+export function countNoun(noun, n) {
+  if (Array.isArray(noun)) return n === 1 ? noun[0] : (noun[1] ?? `${noun[0]}s`);
+  const word = String(noun);
+  return n === 1 && word.endsWith('s') && !word.endsWith('ss') ? word.slice(0, -1) : word;
+}
+
+/**
  * Recent traffic in fixed slots, oldest on the left: each block is green when
  * (nearly) everything succeeded, amber when some failed, red when most did,
  * and unlit when the slot had no traffic. The summary is also given as text
@@ -873,15 +900,19 @@ export function Meter({ value, max = 1, tone, text, label, class: className }) {
  * buckets  [{ ok, failed, label? }]; `label` is the slot's time range
  * slots    fixed number of blocks (default 20); missing older slots are unlit
  * label    what this is the health of ("Credential key-1")
- * noun     what the buckets count, in the plural, for the accessible summary
- *          (default "requests"; "upstream attempts" on a provider board)
+ * noun     what the buckets count, for the accessible summary: a pair
+ *          [one, many] (['upstream attempt', 'upstream attempts']), or one
+ *          plural word that ends in "s" ("requests", the default), whose
+ *          singular is that word without the "s". Pass the pair when that
+ *          rule would be wrong.
  */
 export function HealthStrip({ buckets = [], slots = 20, label, noun = 'requests', class: className }) {
   const recent = buckets.slice(-slots);
   const padded = [...Array.from({ length: Math.max(0, slots - recent.length) }, () => null), ...recent];
   const ok = recent.reduce((sum, b) => sum + (b.ok || 0), 0);
   const failed = recent.reduce((sum, b) => sum + (b.failed || 0), 0);
-  const summary = ok + failed === 0 ? 'no recent traffic' : `${formatPercent(ok / (ok + failed))} of ${ok + failed} recent ${noun} succeeded`;
+  const total = ok + failed;
+  const summary = total === 0 ? 'no recent traffic' : `${formatPercent(ok / total)} of ${formatNumber(total)} recent ${countNoun(noun, total)} succeeded`;
   return html`
     <span class=${cx('health', className)} role="img" aria-label=${`${label ? `${label}: ` : ''}${summary}`}>
       ${padded.map((bucket, i) => {

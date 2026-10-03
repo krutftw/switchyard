@@ -9,13 +9,13 @@ import { promptTokens, ratio } from './data.js';
 // such a cell is prefixed with an apostrophe, which spreadsheets show as text.
 const FORMULA_START = /^[=+\-@\t\r]/;
 
-/** One CSV cell (RFC 4180 quoting). Numbers are written as they are. */
+/** Text cells are always quoted, including delimiter-like text. Numbers stay numeric. */
 export function csvCell(value) {
   if (value == null) return '';
   if (typeof value === 'number') return Number.isFinite(value) ? String(value) : '';
   let text = String(value);
   if (FORMULA_START.test(text)) text = `'${text}`;
-  return /[",\r\n]/.test(text) ? `"${text.replace(/"/g, '""')}"` : text;
+  return `"${text.replace(/"/g, '""')}"`;
 }
 
 /** Rows (arrays of cells, the header first) to CSV text with CRLF line ends. */

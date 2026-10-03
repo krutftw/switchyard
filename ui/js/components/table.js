@@ -163,7 +163,8 @@ class TableRow extends Component {
  * onRowClick (row) => void; rows become focusable and respond to Enter
  * selectedKey  key of the row shown in a drawer, highlighted
  * freshKeys    Set of keys that arrived live just now; they flash once
- * loading   first load: skeleton rows
+ * loading   first load: skeleton rows. With `error` set, a load in flight
+ *           is the retry: the error state stays, its button spinning
  * error     ApiError: shown in place of rows when there are none to show
  * errorTitle  heading of that error state ("Could not load the providers");
  *           default "Could not load this"
@@ -270,8 +271,12 @@ export function Table({
   }, [pageScrolled]);
 
   const hasRows = sorted.length > 0;
-  const showSkeleton = loading && !hasRows;
-  const showError = error && !hasRows && !showSkeleton;
+  // A retry keeps the error state on screen, its button spinning, until it
+  // has an answer: swapped for skeletons, the "Try again" that has the
+  // focus would leave the document and drop the keyboard on <body>. When
+  // the rows come, ErrorState hands the focus to the first of them.
+  const showError = !!error && !hasRows;
+  const showSkeleton = loading && !hasRows && !showError;
   const showEmpty = !hasRows && !showSkeleton && !showError;
 
   return html`
@@ -370,7 +375,7 @@ export function Table({
             <tr role="row">
               <td role="cell" class="table-state-cell" data-label="" colspan=${columns.length} style="padding:0">
                 ${showError
-                  ? html`<${ErrorState} error=${error} title=${errorTitle} onRetry=${onRetry} compact />`
+                  ? html`<${ErrorState} error=${error} title=${errorTitle} onRetry=${onRetry} retrying=${loading} compact />`
                   : html`<${EmptyState} compact title=${empty?.title ?? 'Nothing to show'} description=${empty?.description} action=${empty?.action} icon=${empty?.icon} />`}
               </td>
             </tr>

@@ -236,10 +236,14 @@ export function focusAfterRemoval(rows, index, addButtonId) {
   focusSoon(next ? `${next.uid}-remove` : addButtonId, addButtonId);
 }
 
-/** "Advanced" and other show-more buttons: a button that owns a region. */
+/**
+ * "Advanced" and other show-more buttons: a button that owns a region.
+ * `controls` is the region's id; the region is rendered only while open, so
+ * the button points at it only then (no reference to a missing element).
+ */
 export function Disclosure({ open, onToggle, controls, children, count }) {
   return html`
-    <button type="button" class="prov-disclosure" aria-expanded=${open ? 'true' : 'false'} aria-controls=${controls} onClick=${() => onToggle(!open)}>
+    <button type="button" class="prov-disclosure" aria-expanded=${open ? 'true' : 'false'} aria-controls=${open ? controls : undefined} onClick=${() => onToggle(!open)}>
       <${Icon} name=${open ? 'chevron-down' : 'chevron-right'} size=${14} />
       <span>${children}</span>
       ${count > 0 && html`<span class="prov-disclosure-count">${count}</span>`}

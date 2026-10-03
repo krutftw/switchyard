@@ -628,22 +628,6 @@ function focusOn(el) {
 }
 
 /**
- * Where focus goes when the control that opened a layer is gone (a row menu
- * whose row was just deleted) or can no longer take it (disabled, hidden):
- * the nearest thing around the opener that still exists and can hold focus
- * (its row, its panel, the drawer it was in, the page's <main>). Not <body>:
- * a keyboard user would start again from the top of the document.
- * `trail` is the opener's ancestors, nearest first.
- */
-function focusNear(trail) {
-  for (const node of trail) {
-    if (node === document.body) break;
-    if (document.contains(node) && isFocusable(node) && focusOn(node)) return true;
-  }
-  return false;
-}
-
-/**
  * The last place to put the focus rather than <body>: the page's main
  * region (the shell's <main tabindex="-1">), as it was when the layer
  * closed. False when it cannot take it (the sign-in page has none that is
@@ -651,6 +635,62 @@ function focusNear(trail) {
  */
 function focusMain(main) {
   return isFocusable(main) && focusOn(main);
+}
+
+/** An element, a ref or a function returning an element, as an element. */
+function resolveTarget(target) {
+  if (typeof target === 'function') return target();
+  if (target && typeof target === 'object' && 'current' in target) return target.current;
+  return target ?? null;
+}
+
+/**
+ * The record of a layer that has closed and is still fading out (still in
+ * the document, about to leave it) around `el`, or null. Focus put on
+ * anything inside such a layer would fall to <body> when it goes.
+ */
+function closingAround(el) {
+  for (let node = el; node && node.nodeType === 1; node = node.parentNode) {
+    const record = handedBack.get(node);
+    if (record && Date.now() - record.at < LAYER_FADE_MS) return record;
+  }
+  return null;
+}
+
+/**
+ * Hand the focus on the way the layer described by `record` would when its
+ * opener cannot take it: `returnFocus`, else where the layer the opener was
+ * in sent the focus when it closed (a menu item that opened a dialog, a
+ * button in a drawer that closed with the dialog), else the nearest thing
+ * around the opener that can hold focus (its row, its panel, the drawer it
+ * was in). Never into a layer that is itself closing: its record is followed
+ * instead. False when nothing took it; the caller then tries <main>.
+ *
+ * record  { previous, trail, fallback, at }: the opener, its ancestors
+ *         nearest first (noted while it was attached), the layer's
+ *         returnFocus, and when the layer closed
+ */
+function handOn(record, seen = new Set()) {
+  if (!record || seen.has(record)) return false;
+  seen.add(record);
+  const take = (el) => {
+    if (!el || !document.contains(el)) return false;
+    const closing = closingAround(el);
+    if (closing) return handOn(closing, seen);
+    return focusOn(el);
+  };
+  const { previous, trail } = record;
+  if (previous && document.contains(previous) && !closingAround(previous) && focusOn(previous)) return true;
+  if (take(resolveTarget(record.fallback))) return true;
+  for (const node of [previous, ...trail]) {
+    const earlier = node ? handedBack.get(node) : null;
+    if (earlier && handOn(earlier, seen)) return true;
+  }
+  for (const node of trail) {
+    if (node === document.body) break;
+    if (document.contains(node) && isFocusable(node) && !closingAround(node) && focusOn(node)) return true;
+  }
+  return false;
 }
 
 /** How long after a layer closes its opener is watched for being removed. */
@@ -770,35 +810,32 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
         const at = document.activeElement;
         return !at || at === document.body || !document.contains(at) || (root != null && root.contains(at));
       };
-      const fallback = returnRef.current;
       const main = document.querySelector('main');
-      const toFallback = () => focusOn(typeof fallback === 'function' ? fallback() : fallback && 'current' in fallback ? fallback.current : fallback);
+      // What a later layer needs to know to follow the focus through this
+      // one (see handOn): kept even when nothing is handed back now.
+      const opened = previous && previous !== document.body;
+      const record = { previous: opened ? previous : null, trail: opened ? trail : [], fallback: returnRef.current, at: Date.now() };
+      if (root) handedBack.set(root, record);
+      // `returnFocus`, where an earlier layer sent the focus, the nearest
+      // thing around the opener, the page's main region: never <body>, and
+      // never into a layer that is closing as well (a drawer that a
+      // confirmed delete closes with its dialog).
+      const elsewhere = () => {
+        if (!handOn(record)) focusMain(main);
+      };
 
       // Nothing had the focus when the layer opened (Ctrl+K on a page just
       // loaded, a drawer opened from a link): there is no opener to go back
       // to, but <body> is no place either. `returnFocus`, else the page's
       // main region; after the same short wait for a page that places the
       // focus itself.
-      if (!previous || previous === document.body) {
-        if (root) handedBack.set(root, { previous: null, trail: [], at: Date.now() });
+      if (!opened) {
         setTimeout(() => {
-          if (adrift() && !toFallback()) focusMain(main);
+          if (adrift()) elsewhere();
         }, FOCUS_SETTLE_MS);
         return;
       }
-      if (root) handedBack.set(root, { previous, trail, at: Date.now() });
       if (!adrift()) return;
-
-      const elsewhere = () => {
-        if (toFallback()) return;
-        // The opener may have been inside a layer that has closed since (the
-        // menu item that opened this dialog): go where that layer sent focus.
-        for (const node of [previous, ...trail]) {
-          const earlier = handedBack.get(node);
-          if (earlier && (focusOn(earlier.previous) || focusNear(earlier.trail))) return;
-        }
-        if (!focusNear(trail)) focusMain(main);
-      };
       // The opener is gone, and whatever removed it may be about to say
       // where the keyboard goes (those pages focus on a timer or a frame).
       // Wait a moment and step in only if the focus is still adrift: a
@@ -813,12 +850,7 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
       // drawer that closes together with this dialog) is still in the
       // document while that layer fades out, and would take the focus with
       // it when it goes: it counts as gone.
-      let dying = false;
-      for (let node = previous; node && !dying; node = node.parentNode) {
-        const closed = handedBack.get(node);
-        dying = closed != null && Date.now() - closed.at < LAYER_FADE_MS;
-      }
-      if (dying || !focusOn(previous)) {
+      if (closingAround(previous) || !focusOn(previous)) {
         elsewhereUnlessPlaced();
         return;
       }
@@ -842,9 +874,11 @@ export function useModalLayer(ref, active, { onClose, lock = true, dismissable =
 }
 
 /**
- * Root element of a layer that has closed -> where it sent the focus. An
- * entry is dropped when the same element becomes a layer again (a menu
- * reopened while it fades out).
+ * Root element of a layer that has closed -> the record of where its focus
+ * came from ({ previous, trail, fallback, at }, see handOn). A layer whose
+ * opener sat in another layer follows these to find a place that is still
+ * there. An entry is dropped when the same element becomes a layer again (a
+ * menu reopened while it fades out).
  */
 const handedBack = new WeakMap();
 
@@ -857,6 +891,124 @@ const LAYER_FADE_MS = 400;
  * which is when the pages that do it act; short enough not to be felt.
  */
 const FOCUS_SETTLE_MS = 80;
+
+// ---------------------------------------------------------------------------
+// A control that removes itself
+// ---------------------------------------------------------------------------
+
+/** In the tab order, and drawn: what Tab could reach. */
+function tabbable(el) {
+  return isFocusable(el) && el.getAttribute('tabindex') !== '-1' && (el.offsetWidth > 0 || el.offsetHeight > 0);
+}
+
+/**
+ * The first thing Tab could reach from the point in `parent` just before
+ * `start` (inclusive) onwards, in document order, without leaving `scope`.
+ */
+function tabbableFrom(parent, start, scope) {
+  let node = start;
+  let cur = parent;
+  for (;;) {
+    for (; node; node = node.nextSibling) {
+      if (node.nodeType !== 1) continue;
+      if (tabbable(node)) return node;
+      const inner = focusableWithin(node)[0];
+      if (inner) return inner;
+    }
+    if (cur === scope || cur === document.body || !cur.parentNode) return null;
+    node = cur.nextSibling;
+    cur = cur.parentNode;
+  }
+}
+
+/** The node before `node` among its parent's children, or null. */
+function previousOf(node) {
+  if ('previousSibling' in node) return node.previousSibling;
+  const siblings = Array.prototype.slice.call(node.parentNode.childNodes);
+  return siblings[siblings.indexOf(node) - 1] ?? null;
+}
+
+/**
+ * Where `el` stands: for each ancestor up to <body>, the node on the way
+ * and the node before it. Noted at each commit, not when `el` goes: by the
+ * time its clean-up runs, Preact has already put what replaces it in front
+ * of it, and that would pass for what stood before.
+ */
+function placeOf(el) {
+  const levels = [];
+  for (let node = el; node && node.parentNode && node !== document.body; node = node.parentNode) {
+    levels.push({ node, parent: node.parentNode, prev: previousOf(node) });
+  }
+  return levels;
+}
+
+/**
+ * Put the focus on what took the place of something that held it and has
+ * left the document (see useFocusHandOff). `levels` is placeOf() of what
+ * left; `to` an optional element (or function returning one) to try first.
+ * Does nothing unless the focus is still on <body> (or on something that is
+ * no longer in the document).
+ */
+export function handFocusOn(levels, to) {
+  const at = document.activeElement;
+  if (at && at !== document.body && document.contains(at)) return;
+  if (focusOn(resolveTarget(to))) return;
+  // The nearest ancestor that is still there, and the gap the element left in it.
+  const level = levels.find((l) => !document.contains(l.node) && document.contains(l.parent));
+  const main = document.querySelector('main');
+  if (level) {
+    const scope = level.parent.closest('[role="dialog"]') ?? level.parent.closest('main') ?? main;
+    const start = level.prev && level.prev.parentNode === level.parent ? level.prev.nextSibling : level.parent.firstChild;
+    // What now stands in the gap, else what follows it.
+    const next = tabbableFrom(level.parent, start, scope ?? document.body);
+    if (next && focusOn(next)) return;
+    if (scope && isFocusable(scope) && focusOn(scope)) return;
+  }
+  focusMain(main);
+}
+
+/**
+ * For a component whose own control takes it off the page: a "Try again"
+ * whose retry replaces the error state, a notice dismissed by its button,
+ * "Load more" when the list has no more. When the element behind `ref`
+ * leaves the document while it (or something in it) has the focus, the
+ * browser drops the focus on <body>; this puts it on what took the
+ * element's place instead:
+ *
+ *   to()      when given and able to take it (the end-of-list line)
+ *   else      the first control in what now stands where the element stood,
+ *             else the next one after it (within the dialog or <main> it
+ *             was in), else that dialog or <main> itself
+ *
+ * It waits FOCUS_SETTLE_MS first and steps in only if the focus is still
+ * lost: a page that places the focus itself (on the first new row, say)
+ * keeps its choice, as with layers.
+ *
+ *   const root = useRef(null);
+ *   useFocusHandOff(root);
+ *   return html`<div ref=${root}>…<button onClick=${retry}>Try again</button></div>`;
+ */
+export function useFocusHandOff(ref, { to } = {}) {
+  const toRef = useRef(to);
+  toRef.current = to;
+  const place = useRef(null);
+  useLayoutEffect(() => {
+    const el = ref.current;
+    place.current = el && el.parentNode ? placeOf(el) : null;
+  });
+  // A clean-up runs while the element is still in the document: Preact
+  // calls it before it takes the nodes out.
+  useLayoutEffect(
+    () => () => {
+      const el = ref.current;
+      if (!el || typeof el.contains !== 'function' || !el.contains(document.activeElement)) return;
+      const levels = place.current ?? placeOf(el);
+      const target = toRef.current;
+      setTimeout(() => handFocusOn(levels, target), FOCUS_SETTLE_MS);
+    },
+    [],
+  );
+}
 
 /** Call `handler` when a pointer goes down outside every given ref. */
 export function useOutsidePointer(refs, handler, enabled = true) {

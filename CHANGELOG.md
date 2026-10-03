@@ -11,8 +11,8 @@ First release.
   counting and model listings in each vendor's shape. Legacy `/v1/completions`
   is served through chat.
 - Any client protocol can be served by a provider that speaks another one.
-  Requests in the provider's own protocol are forwarded untouched apart from
-  the model name.
+  Requests in the provider's own protocol preserve provider fields, with JSON
+  normalization, model routing and configured reasoning or payload changes.
 - Providers: OpenAI, Anthropic, Gemini, Vertex AI (service account or API
   key), any OpenAI-compatible server, and a built-in mock provider for trying
   things out.
@@ -38,6 +38,8 @@ First release.
   their new input.
 - A relay for the OpenAI Realtime API (`GET /v1/realtime`).
 - A live event feed for the dashboard.
+- Single-use browser connection tickets, with current key permissions checked
+  during long-lived client sessions.
 
 ### Dashboard
 
@@ -55,6 +57,23 @@ First release.
   table. Optional capture of request and response bodies.
 - `switchyard init`, `check` and `import-cliproxy` (converts the API-key
   sections of a CLIProxyAPI configuration).
+
+### Release hardening
+
+- Enforced current key policy and resolved-model permissions; anonymous browser
+  requests check their Origin and Host independently of CORS configuration.
+- Bounded schema conversion, tool bookkeeping, discovery responses and JSON
+  display work; expanded secret redaction and private Unix file permissions.
+- Completed dashboard forms, focus handling, exact usage/request drill-down,
+  WebSocket tickets, configuration error mapping and credential preservation.
+- Scoped release job permissions and resolved release tags to an immutable
+  commit. Documented shared-account, trusted-browser and Windows ACL limits in
+  [the security model](docs/SECURITY-MODEL.md).
+
+### Artifact availability
+
+- Windows x64 archive, built and verified locally. Linux/macOS archives and
+  container publication remain pending while GitHub Actions is unavailable.
 
 ### Not included
 

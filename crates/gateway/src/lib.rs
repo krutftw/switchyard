@@ -7,7 +7,8 @@
 //! crates:
 //!
 //! * [`Gateway::authenticate`] turns the credentials on a request into a
-//!   [`ClientIdentity`];
+//!   [`ClientIdentity`]; [`Gateway::issue_ws_ticket`] mints the single-use
+//!   tickets a browser opens a WebSocket with instead of a key;
 //! * [`Gateway::generate`] serves a generation request and answers with a
 //!   [`Reply`]: a complete response, or a stream whose first event is ready;
 //! * [`Gateway::count_tokens`], [`Gateway::raw`],
@@ -37,7 +38,9 @@
 //!    credential, and — when the refusal is about the organisation or the
 //!    model, not about a detail level the client chose — not asked again
 //!    until the configuration changes.
-//! 5. Whatever happens, exactly one request record is published.
+//! 5. Whatever happens, exactly one request record is published; a failed
+//!    request also logs one `request failed` line, at WARN when the gateway
+//!    or an upstream failed and at DEBUG when the client did.
 //!
 //! # What clients cannot do to each other
 //!
@@ -61,6 +64,9 @@
 //!   plain default (that model) is remembered.
 //! * The request types' `Debug` output never prints the client's key (or
 //!   any header value that could carry one) or a body.
+//! * A WebSocket ticket works once, for 30 seconds, as the key that bought
+//!   it; each key's outstanding tickets are capped separately, so minting
+//!   many never drops another client's.
 //!
 //! No lock is held across an `.await`, upstream bodies are never buffered
 //! beyond `server.body_limit_mb`, and gauges and records are released by
@@ -87,6 +93,7 @@ mod session;
 mod stream;
 mod summary;
 mod target;
+mod ticket;
 mod types;
 mod ws;
 
@@ -95,6 +102,7 @@ pub use gateway::Gateway;
 pub use types::{
     ClientRequest, DiscoveryState, DiscoveryStatus, FullReply, GatewayOptions,
     PresentedCredentials, ProviderTest, RawRequest, Reply, StartError, StreamReply, WsOpenRequest,
+    WsTicket,
 };
 pub use ws::{UpstreamWsSession, WsEnd, WsOutcome};
 

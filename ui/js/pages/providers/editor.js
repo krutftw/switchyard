@@ -37,6 +37,7 @@ import {
   KINDS,
   blankCredential,
   blankHeader,
+  canSwap,
   configFromDraft,
   draftFromConfig,
   emptyDraft,
@@ -44,11 +45,13 @@ import {
   freeName,
   hasSettings,
   headerKeepsStored,
+  isAmbiguousMaskIssue,
   isCredentialHeader,
   isOpenAiKind,
   isReference,
   kindInfo,
   localIssues,
+  maskShortfall,
   referenceName,
   sectionOfPath,
   servesNothing,
@@ -86,6 +89,8 @@ function makeSession(target, takenNames) {
     originalName: target.mode === 'edit' ? target.provider.name : null,
     originalKind: target.mode === 'edit' ? target.provider.kind : null,
     draft,
+    // The credential rows as the form opened: how many stored keys share a mask.
+    initialCredentials: draft.credentials,
     // What the form would send if nothing were touched: the measure of "dirty".
     baseline: JSON.stringify(configFromDraft(draft).config),
     // The stored entry as it was when the form opened, to notice outside edits.
@@ -121,10 +126,11 @@ function rowLabel(text, row) {
  * credential can do without) "no key".
  *
  * envVar      the variable suggested for a reference
+ * warning     a caveat about the stored key (it masks like another one)
  * showName    put the credential's label after the field's (the row's main field)
  * canBeEmpty  the credential may be kept without a key
  */
-function KeyField({ row, envVar, error, onChange, showName = false, optional = false, canBeEmpty = false }) {
+function KeyField({ row, envVar, error, warning, onChange, showName = false, optional = false, canBeEmpty = false }) {
   const title = (text) => (showName ? rowLabel(text, row) : text);
   const label = title('API key');
   const storedIsReference = isReference(row.stored);
@@ -149,7 +155,7 @@ function KeyField({ row, envVar, error, onChange, showName = false, optional = f
   }
   if (!row.editing) {
     return face(html`
-      <${Field} label=${label} error=${error} optional=${optional}>
+      <${Field} label=${label} error=${error} warning=${warning} optional=${optional}>
         <${StoredSecret}
           value=${row.stored}
           reference=${row.reference}
@@ -191,6 +197,7 @@ function KeyField({ row, envVar, error, onChange, showName = false, optional = f
         onChange=${(v) => onChange({ entered: v })}
         placeholder=${row.stored ? 'Type or paste the new key' : canBeEmpty ? 'Paste the key, or leave empty for none' : 'Paste the key'}
         error=${error}
+        warning=${row.entered.trim() ? undefined : warning}
         hint=${isReference(row.entered) ? `Stored as a reference to the variable ${referenceName(row.entered) || '(unnamed)'}, not as a key.` : row.stored ? `Left empty, the stored ${storedWord} is kept.` : undefined}
       />
       ${keep}
@@ -198,11 +205,27 @@ function KeyField({ row, envVar, error, onChange, showName = false, optional = f
   `);
 }
 
-function CredentialRow({ row, index, count, kind, envVar, providerPriority, issues, path, forceOpen, onChange, onMove, onRemove }) {
+/**
+ * What a row says about a key the gateway could not tell from others that
+ * mask alike (its issue on `api_keys[j]` or `credentials[j].api_key`). The
+ * gateway's own words name no key and no way out; these do.
+ */
+function ambiguousKeyText(mask) {
+  return `Refused: ${mask ? `other stored keys show as ${mask} too` : 'other stored keys mask alike'} and one of them was removed or replaced, so the mask does not say which key this row is. Type the full value of each key of this mask you keep, or cancel and give the keys labels before removing one.`;
+}
+
+function CredentialRow({ row, index, count, kind, envVar, providerPriority, issues, path, forceOpen, upBlocked, downBlocked, shortfall, onChange, onMove, onRemove }) {
   const info = kindInfo(kind);
   const vertex = kind === 'vertex';
   const at = (field) => (path ? issues.at(field ? `${path}.${field}` : path) : undefined);
-  const keyError = [at(''), at('api_key')].filter(Boolean).join(' ') || undefined;
+  // Once the full key has been typed, the refusal of the mask no longer applies to the row.
+  const typed = row.editing && row.entered.trim() !== '';
+  const keyIssue = (message) => (!isAmbiguousMaskIssue(message) ? message : typed ? '' : ambiguousKeyText(row.stored));
+  const keyError = [at(''), at('api_key')].filter(Boolean).map(keyIssue).filter(Boolean).join(' ') || undefined;
+  // Before saving: the same refusal, foreseen.
+  const keyWarning = shortfall
+    ? `${shortfall.left === 1 ? 'This is the only row' : `${shortfall.left} rows are`} left for ${shortfall.stored} stored keys that show as ${shortfall.mask}: the gateway cannot tell which ${shortfall.stored - shortfall.left === 1 ? 'one was' : 'ones were'} removed and will refuse to save. Type the full value of each key of this mask you keep.`
+    : undefined;
   const open = row.open || forceOpen;
   const regionId = `${row.uid}-settings`;
   const named = row.label.trim() || (row.noKey ? '' : row.stored) || (vertex && row.service_account_file.trim()) || `credential ${index + 1}`;
@@ -212,8 +235,8 @@ function CredentialRow({ row, index, count, kind, envVar, providerPriority, issu
       <div class="prov-item-main prov-cred-grid">
         <div class="prov-order">
           <span class="prov-order-n num" aria-hidden="true">${index + 1}</span>
-          <${IconButton} id=${`${row.uid}-up`} icon="arrow-up" size="sm" label=${`Move ${named} up`} disabled=${index === 0} onClick=${() => onMove(-1)} />
-          <${IconButton} id=${`${row.uid}-down`} icon="arrow-down" size="sm" label=${`Move ${named} down`} disabled=${index === count - 1} onClick=${() => onMove(1)} />
+          <${IconButton} id=${`${row.uid}-up`} icon="arrow-up" size="sm" label=${`Move ${named} up`} disabled=${index === 0 || upBlocked} onClick=${() => onMove(-1)} />
+          <${IconButton} id=${`${row.uid}-down`} icon="arrow-down" size="sm" label=${`Move ${named} down`} disabled=${index === count - 1 || downBlocked} onClick=${() => onMove(1)} />
         </div>
         <div class="prov-item-field">
           ${vertex
@@ -226,7 +249,7 @@ function CredentialRow({ row, index, count, kind, envVar, providerPriority, issu
                 hint="Path to the JSON key file, relative to the folder of the configuration file."
                 error=${[at(''), at('service_account_file')].filter(Boolean).join(' ') || undefined}
               />`
-            : html`<${KeyField} row=${row} envVar=${envVar} error=${keyError} onChange=${onChange} showName canBeEmpty=${info.keyless} />`}
+            : html`<${KeyField} row=${row} envVar=${envVar} error=${keyError} warning=${keyWarning} onChange=${onChange} showName canBeEmpty=${info.keyless} />`}
         </div>
         <div class="prov-item-tools">
           ${row.disabled && html`<${Badge} outline>disabled<//>`}
@@ -269,7 +292,7 @@ function CredentialRow({ row, index, count, kind, envVar, providerPriority, issu
             hint="Outbound proxy for this credential only."
             error=${at('proxy')}
           />
-          ${vertex && html`<${KeyField} row=${row} envVar=${envVar} error=${at('api_key')} onChange=${onChange} optional canBeEmpty />`}
+          ${vertex && html`<${KeyField} row=${row} envVar=${envVar} error=${(at('api_key') && keyIssue(at('api_key'))) || undefined} warning=${keyWarning} onChange=${onChange} optional canBeEmpty />`}
           ${!vertex &&
           row.service_account_file &&
           html`<${Input} mono label="Service account file" optional value=${row.service_account_file} onChange=${(v) => onChange({ service_account_file: v })} hint="Only Vertex AI providers use it." error=${at('service_account_file')} />`}
@@ -280,12 +303,28 @@ function CredentialRow({ row, index, count, kind, envVar, providerPriority, issu
   `;
 }
 
-function CredentialsSection({ draft, update, issues, paths, hasIssueUnder }) {
+/** "1", "1 and 2", "1, 2 and 3". */
+const listNumbers = (numbers) => (numbers.length < 2 ? String(numbers[0] ?? '') : `${numbers.slice(0, -1).join(', ')} and ${numbers.at(-1)}`);
+
+function CredentialsSection({ draft, update, issues, paths, hasIssueUnder, initialRows = [] }) {
   const info = kindInfo(draft.kind);
   const vertex = draft.kind === 'vertex';
   const rows = draft.credentials;
   const setRows = (fn) => update((d) => ({ credentials: fn(d.credentials) }));
   const listIssue = [issues.at('api_keys'), issues.at('credentials')].filter(Boolean).join(' ');
+
+  // Keys that mask alike are told apart by the gateway only by their order
+  // (or a label they were stored with): such neighbours cannot trade places,
+  // and removing one of them cannot be saved while the rest come back masked.
+  const blocked = rows.map((row, index) => index > 0 && !canSwap(rows[index - 1], row, rows));
+  const shortfall = maskShortfall(initialRows, rows);
+  const stuck = new Set();
+  blocked.forEach((isBlocked, index) => {
+    if (!isBlocked) return;
+    stuck.add(index);
+    stuck.add(index + 1);
+  });
+  const stuckNumbers = [...stuck].sort((a, b) => a - b);
 
   const move = (uid, delta) => {
     setRows((list) => {
@@ -357,7 +396,10 @@ function CredentialsSection({ draft, update, issues, paths, hasIssueUnder }) {
                 providerPriority=${draft.priority}
                 issues=${issues}
                 path=${paths[row.uid]}
-                forceOpen=${!!paths[row.uid] && ['label', 'weight', 'priority', 'proxy', 'disabled'].some((f) => hasIssueUnder(`${paths[row.uid]}.${f}`))}
+                forceOpen=${!!paths[row.uid] && ['label', 'weight', 'priority', 'proxy', 'disabled', ...(vertex ? ['api_key'] : [])].some((f) => hasIssueUnder(`${paths[row.uid]}.${f}`))}
+                upBlocked=${blocked[index]}
+                downBlocked=${!!blocked[index + 1]}
+                shortfall=${shortfall.get(row.uid)}
                 onChange=${(patch) => setRows((list) => list.map((r) => (r.uid === row.uid ? { ...r, ...patch } : r)))}
                 onMove=${(delta) => move(row.uid, delta)}
                 onRemove=${() => remove(row.uid)}
@@ -380,6 +422,8 @@ function CredentialsSection({ draft, update, issues, paths, hasIssueUnder }) {
         Keys are written to the configuration file and shown masked from then on. A reference such as <span class="mono">env:${envVar}</span> names an environment variable instead of holding the key.
       </p>`}
       ${rows.length > 1 && html`<p class="prov-note">The order is the order credentials are tried in under the fill-first strategy, and the first usable one runs connection tests.</p>`}
+      ${stuckNumbers.length > 0 &&
+      html`<p class="prov-note" id="prov-mask-order">${vertex ? 'Service accounts' : 'Keys'} ${listNumbers(stuckNumbers)} are shown with the same mask, and the gateway knows them apart only by their order, so neighbours among them cannot trade places here. To reorder them, type their full values, or give each a label, save, and move them then.</p>`}
     <//>
   `;
 }
@@ -546,6 +590,7 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
         originalKind: provider.kind,
         baseline: JSON.stringify(configFromDraft(draftFromConfig(provider.config)).config),
         snapshot: JSON.stringify(provider.config),
+        initialCredentials: draftFromConfig(provider.config).credentials,
         draft: session.nameTouched ? session.draft : { ...session.draft, name: provider.name },
       };
       setSession(session);
@@ -849,7 +894,7 @@ export default function ProviderEditor({ target, takenNames, onClose, onSaved, o
           <${Switch} label="Enabled" checked=${draft.enabled} onChange=${(v) => update({ enabled: v })} error=${issues.at('enabled')} hint="A disabled provider stays in the configuration and is skipped by the router." />
         <//>
 
-        <${CredentialsSection} draft=${draft} update=${update} issues=${issues} paths=${paths} hasIssueUnder=${hasIssueUnder} />
+        <${CredentialsSection} draft=${draft} update=${update} issues=${issues} paths=${paths} hasIssueUnder=${hasIssueUnder} initialRows=${session.initialCredentials} />
 
         <${Section} id="prov-sec-routing" title="Routing" description="How requests reach this provider, and how it is spoken to.">
           <${FormRow}>

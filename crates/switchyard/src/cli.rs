@@ -21,7 +21,9 @@ Environment variables:
                                  overrides logging.level
 
 Run `switchyard` with no command to start the gateway. On the first run it
-writes a starter configuration and prints the admin secret and a client key.";
+writes a starter configuration. An interactive terminal shows the admin secret\n\
+and a client key once; redirected logs omit them. Read the private configuration\n\
+file when starting as a service.";
 
 /// The `switchyard` command line.
 #[derive(Debug, Parser, PartialEq, Eq)]

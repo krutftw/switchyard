@@ -10,7 +10,7 @@ import { API_BASE } from '../../lib/api.js';
 import { DASH, formatCurrency, formatDuration, formatNumber } from '../../lib/format.js';
 
 /** The query parameters that filter the list; the same names the API takes. */
-export const FILTER_KEYS = ['status', 'model', 'provider', 'key', 'q'];
+export const FILTER_KEYS = ['status', 'model', 'client_model', 'since', 'provider', 'key', 'q'];
 
 /**
  * The names the gateway files a request under when it has none of its own:
@@ -43,10 +43,23 @@ function matchesStatus(record, status) {
  * gateway applies to GET /requests. Used for records that arrive live.
  *
  * `partial` is for requests still in flight: they have no status and no
- * provider yet, so a filter on either leaves them out.
+ * provider or resolved client-facing model yet, so a filter on any of
+ * those leaves them out.
  */
 export default function matchesFilters(record, filters, partial = false) {
-  const { status, model, provider, key, q } = filters;
+  const { status, model, client_model, since, provider, key, q } = filters;
+  if (since) {
+    // A malformed value is refused by the API. Do not let live frames make
+    // that failed query look like a valid, unfiltered list in the meantime.
+    if (!/^[+-]?\d+$/.test(String(since)) || !Number.isSafeInteger(record.started_at)) return false;
+    const start = BigInt(since);
+    if (start < -9223372036854775808n || start > 9223372036854775807n || BigInt(record.started_at) < start) return false;
+  }
+  if (client_model) {
+    if (partial) return false;
+    const filed = record.client_model || record.requested_model || NO_MODEL_FILTER;
+    if (!same(filed, client_model.toLowerCase())) return false;
+  }
   if (status) {
     if (partial || !matchesStatus(record, status)) return false;
   }
@@ -224,8 +237,16 @@ export function routeTip(record) {
   return lines.join('\n');
 }
 
+/**
+ * Shown in place of a provider name, and the name of the `provider=unknown`
+ * filter: no provider served the request. It failed before routing (refused,
+ * unknown model, the client key's own limit), or every credential of the
+ * model was cooling down.
+ */
+export const NO_PROVIDER = 'No provider';
+
 export function providerTip(record) {
-  if (!record.provider) return 'The request ended before a provider was chosen.';
+  if (!record.provider) return 'No provider served this request: it failed before routing, or every credential of the model was cooling down.';
   const lines = [`Provider ${record.provider}`];
   if (record.credential_label) lines.push(`Credential ${record.credential_label}`);
   const attempts = record.attempts?.length ?? 0;
@@ -324,29 +345,8 @@ export function buildCurl(record, bodies) {
   return lines.join(' \\\n  ');
 }
 
-// ---------------------------------------------------------------------------
-// Open in playground
-// ---------------------------------------------------------------------------
-
-// What the playground accepts in ?from=. Keep these in step with its replay
-// checks: PROTOCOL_IDS (playground/protocols.js) and REPLAYABLE (playground.js).
-const PLAYGROUND_PROTOCOLS = ['openai-chat', 'openai-responses', 'anthropic', 'gemini'];
-const PLAYGROUND_ENDPOINTS = /\/v1\/chat\/completions$|\/v1\/responses(?: \(WebSocket\))?$|\/v1\/messages$|:(?:stream)?[gG]enerateContent$|\/playground$/;
-
-/**
- * True for a generation request in one of the playground's four protocols,
- * the kind it can send again. Embeddings, token counts and the like are
- * recorded under a protocol too, and the playground refuses them.
- */
-export function playgroundAccepts(record) {
-  if (!record || !PLAYGROUND_PROTOCOLS.includes(record.client_protocol)) return false;
-  return typeof record.endpoint !== 'string' || PLAYGROUND_ENDPOINTS.test(record.endpoint);
-}
-
-/** True when "Open in playground" loads this request: it accepts it, and its client body was captured. */
-export function playgroundReplayable(record, bodies) {
-  return typeof bodies?.client_request === 'string' && bodies.client_request !== '' && playgroundAccepts(record);
-}
+// (Whether "Open in playground" is offered is canReplayInPlayground in
+// lib/replay.js: the same check the playground makes on ?from=.)
 
 /** True for a captured body that is a server-sent event stream, not JSON. */
 export function isEventStream(text) {

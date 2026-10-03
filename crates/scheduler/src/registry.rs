@@ -515,6 +515,14 @@ impl Registry {
         self.alias_maps.exact.contains_key(model_name)
     }
 
+    /// Whether a provider serves a model of this name, ignoring case: the
+    /// model an alias of that name hides (see [`ModelEntry::shadows_model`]).
+    ///
+    /// [`ModelEntry::shadows_model`]: crate::ModelEntry::shadows_model
+    pub fn serves_model_named(&self, name: &str) -> bool {
+        self.table.maps.lower.contains_key(&name.to_lowercase())
+    }
+
     /// How many client-facing names a request can be routed by: every model
     /// that no alias replaces and every alias with at least one routable
     /// target. Names hidden from listings count; ignored aliases do not.

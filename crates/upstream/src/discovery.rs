@@ -30,6 +30,10 @@ use switchyard_core::{ModelInfo, UpstreamError};
 
 /// Pages fetched before giving up on a listing that never ends.
 const MAX_PAGES: usize = 50;
+/// Bounds decoded listing data across all pages of one discovery operation.
+const MAX_DISCOVERY_BYTES: usize = 16 * 1024 * 1024;
+/// A single page is expected to contain at most 1,000 short model records.
+const MAX_DISCOVERY_PAGE_BYTES: usize = 4 * 1024 * 1024;
 
 /// Time limits of a discovery call when the caller states none.
 const DISCOVERY_TIMEOUTS: Timeouts = Timeouts {
@@ -215,13 +219,15 @@ pub fn parse_vertex_models(body: &Value) -> ModelPage {
 
 /// Parses one listing page in the dialect of `kind`.
 pub fn parse_models(kind: ProviderKind, body: &Value) -> ModelPage {
-    match kind {
+    let mut page = match kind {
         ProviderKind::Openai | ProviderKind::OpenaiCompat => parse_openai_models(body),
         ProviderKind::Anthropic => parse_anthropic_models(body),
         ProviderKind::Gemini => parse_gemini_models(body),
         ProviderKind::Vertex => parse_vertex_models(body),
         ProviderKind::Mock => ModelPage::default(),
-    }
+    };
+    page.models.retain(|model| model.id.len() <= 1024);
+    page
 }
 
 impl UpstreamClient {
@@ -246,6 +252,7 @@ impl UpstreamClient {
         let mut seen_ids: HashSet<String> = HashSet::new();
         let mut seen_cursors: HashSet<String> = HashSet::new();
         let mut cursor: Option<(&'static str, String)> = None;
+        let mut remaining_bytes = MAX_DISCOVERY_BYTES;
 
         for _ in 0..MAX_PAGES {
             let mut built = build_request(target, &Operation::ListModels, b"", &no_headers)?;
@@ -254,10 +261,14 @@ impl UpstreamClient {
                 cursor.as_ref().map(|(name, value)| (*name, value.as_str())),
             )?;
             let response = self
-                .send_built(target, built, Bytes::new(), false, timeouts)
+                .send_built_unbuffered(target, built, Bytes::new(), timeouts)
                 .await?;
             let status = response.status;
-            let bytes = response.body.collect().await?;
+            let bytes = response
+                .body
+                .collect_limited(remaining_bytes.min(MAX_DISCOVERY_PAGE_BYTES))
+                .await?;
+            remaining_bytes -= bytes.len();
             let json: Value = serde_json::from_slice(&bytes).map_err(|_| {
                 let mut error = UpstreamError::transport(format!(
                     "read: provider `{}` answered its model listing (HTTP {status}) with something that is not JSON",

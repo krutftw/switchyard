@@ -15,9 +15,9 @@ pub use buckets::OTHER;
 pub use persist::{LoadReport, USAGE_DIR, usage_dir};
 pub use store::{DEFAULT_RECENT_CAPACITY, UsageStore, UsageStoreInfo, UsageStoreOptions};
 pub use types::{
-    BucketSize, DEFAULT_PAGE_SIZE, GroupBy, GroupPoint, Latency, MAX_PAGE_SIZE, NamedTotals, Range,
-    RequestPage, RequestQuery, StatsTick, StatusFilter, TimePoint, Timeseries, Totals, UsageQuery,
-    UsageSummary,
+    BadCursor, BucketSize, DEFAULT_PAGE_SIZE, GroupBy, GroupPoint, Latency, MAX_PAGE_SIZE,
+    NamedTotals, Range, RequestPage, RequestQuery, StatsTick, StatusFilter, TimePoint, Timeseries,
+    Totals, UsageQuery, UsageSummary,
 };
 
 pub(crate) use types::lenient;

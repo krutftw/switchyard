@@ -18,7 +18,10 @@
 // and a connection that falls behind is sent a `lagged` frame ({ missed })
 // in place of the events the gateway dropped for it. Either way a page that
 // builds its view from frames has to load it again: that is what
-// useLiveGap (or live.onGap) is for.
+// useLiveGap (or live.onGap) is for. A page that must also act the moment
+// the connection is lost (stop treating what it shows as live, start
+// polling) passes `onDown` to useLiveGap (or uses live.onDown) instead of
+// watching liveState.status for transitions.
 
 import { useEffect, useRef } from '../../vendor/preact-htm.js';
 import { api, API_BASE, auth, ApiError } from './api.js';
@@ -62,6 +65,7 @@ export const liveState = createStore({
 
 const listeners = new Map(); // pattern -> Set<fn>
 const gapListeners = new Set();
+const downListeners = new Set();
 let socket = null;
 let wanted = false;
 /** This session has had an open connection before: the next one is a reconnect. */
@@ -102,6 +106,17 @@ function announceGap(gap) {
       fn(gap);
     } catch (error) {
       console.error('live gap listener failed', error);
+    }
+  }
+}
+
+/** Tell the down listeners that the open connection was lost. */
+function announceDown(down) {
+  for (const fn of [...downListeners]) {
+    try {
+      fn(down);
+    } catch (error) {
+      console.error('live down listener failed', error);
     }
   }
 }
@@ -185,9 +200,11 @@ async function connect() {
   }
   socket = ws;
   sentTopics = '';
+  let opened = false;
 
   ws.onopen = () => {
     if (mine !== generation) return;
+    opened = true;
     // The attempt counter is cleared on the first frame, not here: a gateway
     // that accepts the socket and drops it at once must still back off.
     setStatus('open', { retryAt: null });
@@ -213,8 +230,14 @@ async function connect() {
   };
   ws.onclose = () => {
     if (socket === ws) socket = null;
+    // A connection closed by stop() (signing out) belongs to an older
+    // generation: that is not the connection going down.
     if (mine !== generation) return;
     scheduleRetry();
+    // Only an open connection can go down: a socket that never opened is
+    // one more failed attempt of an outage already announced (or of the
+    // first connection, which nobody was relying on yet).
+    if (opened) announceDown({ reason: 'down' });
   };
   // "error" is always followed by "close"; the retry is scheduled there.
   ws.onerror = () => {};
@@ -287,7 +310,20 @@ function onGap(fn) {
   return () => gapListeners.delete(fn);
 }
 
-export const live = { start, stop, on, onGap, reconnectNow };
+/**
+ * Listen for the connection going down. `fn({ reason: 'down' })` is called
+ * once when a connection that was open is lost, before the client starts
+ * retrying (liveState.status already reads "reconnecting"). It is not called
+ * for a sign-out, nor again for each failed retry. Once a connection is open
+ * again, the gap listeners hear `reason: "reconnect"`: the two come in pairs.
+ * Returns an unsubscribe function.
+ */
+function onDown(fn) {
+  downListeners.add(fn);
+  return () => downListeners.delete(fn);
+}
+
+export const live = { start, stop, on, onGap, onDown, reconnectNow };
 
 if (typeof window !== 'undefined') {
   window.addEventListener('online', reconnectNow);
@@ -324,13 +360,26 @@ export function useLive(topic, handler, { enabled = true } = {}) {
  *   useLive('request.finished', prepend);
  *   useLiveGap(requests.refresh);
  *
- * The handler may change between renders. `enabled: false` pauses it.
+ * `onDown({ reason: 'down' })` is called when the open connection is lost,
+ * before anything is missed: the moment to stop calling the view live, or
+ * to start polling until the gap handler says the connection is back.
+ *
+ *   useLiveGap(feed.resync, { onDown: feed.down });
+ *
+ * Both handlers may change between renders. `enabled: false` pauses both.
  */
-export function useLiveGap(handler, { enabled = true } = {}) {
+export function useLiveGap(handler, { enabled = true, onDown: downHandler } = {}) {
   const ref = useRef(handler);
   ref.current = handler;
+  const downRef = useRef(downHandler);
+  downRef.current = downHandler;
   useEffect(() => {
     if (!enabled) return undefined;
-    return onGap((gap) => ref.current(gap));
+    const offGap = onGap((gap) => ref.current?.(gap));
+    const offDown = onDown((down) => downRef.current?.(down));
+    return () => {
+      offGap();
+      offDown();
+    };
   }, [enabled]);
 }

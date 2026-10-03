@@ -39,8 +39,19 @@ Contents: [Conventions](#conventions) · [Access](#access) ·
 * **Lists are bare arrays** (`GET /providers` answers `[ … ]`, not
   `{"providers": [ … ]}`).
 * **Unknown fields in request bodies are errors** (`400`), so a typo is not
-  silently ignored. Unknown *query* parameters are ignored, and query values
-  that do not parse fall back to their default.
+  silently ignored. Unknown *query* parameters are ignored when given once.
+  On every API route, a repeated parameter (including an unknown one),
+  malformed percent encoding or invalid UTF-8 is answered `400`. A known
+  parameter with a value that cannot be read is also `400`, naming the
+  parameter in `message` and as the `path` of the one issue
+  (`{"path": "since", "message": "must be a whole number of unix milliseconds"}`).
+  Names are decoded before checking for repeats (`x=1&%78=2` repeats `x`).
+  Omitted parameters use the defaults below; an empty number, cursor or
+  enum value is invalid. Empty text filters mean no filter. Valid numeric
+  values retain the documented clamps. Availability and remote-access
+  checks run first. REST queries are checked after secret authentication;
+  WebSocket queries are checked before redeeming their ticket, so a
+  malformed query does not consume it.
 * **Responses are never to be cached**: every API response carries
   `cache-control: no-store` (the playground's event stream: `no-cache`) and
   `x-content-type-options: nosniff`.
@@ -101,8 +112,8 @@ a key on the broken line is not repeated.
 
 | Status | Meaning |
 |---|---|
-| `400` | The request is malformed: not JSON, a missing or unknown field, a wrong type, a field that may not be changed here. `issues` names the field when one can be named. |
-| `401` | No secret, a wrong secret, or (on `/ws`) a missing, used or expired ticket. Carries `WWW-Authenticate: Bearer`. |
+| `400` | The request is malformed: not JSON, a missing or unknown field, a wrong type, a field that may not be changed here; or a query parameter given twice or with a value the route refuses (see [Conventions](#conventions)). `issues` names the field — or the query parameter — when one can be named. |
+| `401` | No secret, a wrong secret, or (on `/ws`) a missing, used, expired or revoked ticket. Carries `WWW-Authenticate: Bearer`. |
 | `403` | The peer is remote and remote access is off. |
 | `404` | No such route, provider, credential, key or request — or the admin interface is off (see [Access](#access)). |
 | `405` | The route exists but not with this method. |
@@ -208,10 +219,10 @@ HTTP/1.1 409 Conflict
 
 {
   "error": {
-    "message": "the configuration file on disk is not valid, so the change was not saved (the file was left as it is); fix or restore the file, or replace it as a whole on the raw tab (PUT /config/raw). What is wrong with the file: line 53, column 8: string values must be quoted, expected literal string",
+    "message": "the configuration file on disk is not valid, so the change was not saved (the file was left as it is); fix or restore the file, or replace it as a whole on the raw tab (PUT /config/raw). What is wrong with the file: line 50, column 8: string values must be quoted, expected literal string",
     "issues": [
       {
-        "path": "line 53, column 8",
+        "path": "line 50, column 8",
         "message": "string values must be quoted, expected literal string"
       }
     ]
@@ -253,7 +264,11 @@ In this order, for every route under `/admin/api`:
    gets `429` with `Retry-After`, the right secret included. A successful
    request resets the count. A request without any secret is `401` but is
    not counted. The table is in memory (a restart clears it), holds at most
-   10 000 addresses and forgets an address two hours after its last failure.
+   10 000 addresses and forgets an unlocked address two hours after its last
+   failure. Only unlocked entries can be evicted to make room. When all
+   10 000 entries are actively locked, requests from unknown addresses also
+   get `429`, with `Retry-After` until the earliest lockout expires; active
+   lockouts are never discarded to admit new addresses.
    The address is that of the TCP peer. What a reverse proxy on this
    machine relays (see 2) is counted apart from what connects to the
    gateway directly on loopback: wrong secrets sent through the proxy never
@@ -262,7 +277,8 @@ In this order, for every route under `/admin/api`:
    the proxy reports in its header is not used, since a client can send
    that header too — so remote sign-in through a proxy can be locked for
    everybody by one client's wrong guesses; signing in directly on the
-   machine keeps working. The same holds for any other arrangement in which
+   machine keeps working unless the capacity throttle above applies. The
+   same holds for any other arrangement in which
    many clients arrive from one address (NAT, a container's port mapping).
 4. **The secret.** `Authorization: Bearer <secret>` (the bare secret without
    `Bearer` is accepted too), or `x-admin-secret: <secret>`. The comparison
@@ -376,8 +392,8 @@ HTTP/1.1 200 OK
 
 {
   "version": "0.1.0",
-  "started_at": 1790985974746,
-  "uptime_ms": 225,
+  "started_at": 1791004027826,
+  "uptime_ms": 144,
   "config_path": "/etc/switchyard/switchyard.toml",
   "data_dir": "/etc/switchyard/data",
   "listen": "127.0.0.1:8317",
@@ -394,8 +410,8 @@ HTTP/1.1 200 OK
     "client_keys": 1
   },
   "live": {
-    "started_at": 1790985974746,
-    "uptime_ms": 225,
+    "started_at": 1791004027826,
+    "uptime_ms": 144,
     "in_flight": 0,
     "active_streams": 0,
     "ws_connections": 0,
@@ -408,8 +424,8 @@ HTTP/1.1 200 OK
       "output_tokens": 68,
       "reasoning_tokens": 44,
       "cost": 0.00010499999999999999,
-      "duration_ms_sum": 46,
-      "ttfb_ms_sum": 46,
+      "duration_ms_sum": 64,
+      "ttfb_ms_sum": 63,
       "ttfb_count": 2
     }
   },
@@ -433,7 +449,7 @@ HTTP/1.1 200 OK
 | `config_rejected` | `null` while the file on disk is in effect. When the gateway refused the file — a hand edit that does not validate, picked up by the file watcher or by `POST /reload` — `{"at", "message", "issues"}`: when (Unix ms), a sentence that says so and quotes the first issues, and every issue of the file (by its place in the file). It stays set for as long as the file holds that content, also across page loads, and goes back to `null` once the file is valid again (fixed, restored, or replaced with `PUT /config/raw`). Meanwhile the previous configuration stays in effect and every edit that would change the file is refused with `409` (see [Configuration edits](#configuration-edits)). |
 | `warnings` | Problems that need the operator's attention, as plain sentences: first, while `config_rejected` is set, its `message` (it starts with `configuration file:`); then problems that do not make the configuration invalid — credentials whose secret cannot be resolved or whose service-account file cannot be used, alias targets that match no model, shadowed names. |
 | `counts.providers`, `counts.client_keys` | Entries in the configuration (disabled providers included). |
-| `counts.credentials`, `counts.credentials_ready` | Upstream credentials in service, and those of them with status `ready`. The credentials of a provider with `enabled = false` are in neither number. |
+| `counts.credentials`, `counts.credentials_ready` | Upstream credentials in service, and those of them with status `ready`. A credential with status `disabled` is in neither number, whatever switched it off (`disabled_by`): its provider (`enabled = false`), its own entry, or a switch at runtime. A credential that is `unusable` or `cooling` is in service, and counted in the first. |
 | `counts.models` | Client-facing names a request can be routed by: the entries of [`GET /models`](#get-models) that are not `ignored`. Names hidden from client listings count (they are routable); an alias without a routable target does not. |
 | `live` | Gauges: requests in flight, open streams, open client WebSockets (the client API's, not dashboard connections), and `totals` since start (see [Totals](#totals)). |
 | `admin.allow_remote` | Whether remote peers are admitted (configuration or environment). |
@@ -452,8 +468,8 @@ HTTP/1.1 200 OK
 
 {
   "version": "0.1.0",
-  "started_at": 1790985974746,
-  "uptime_ms": 323,
+  "started_at": 1791004027826,
+  "uptime_ms": 193,
   "config_path": "/etc/switchyard/switchyard.toml",
   "data_dir": "/etc/switchyard/data",
   "listen": "127.0.0.1:8317",
@@ -463,17 +479,17 @@ HTTP/1.1 200 OK
   ],
   "command_line_overrides": [],
   "config_rejected": {
-    "at": 1790985975069,
-    "message": "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 53, column 8: string values must be quoted, expected literal string",
+    "at": 1791004028017,
+    "message": "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 50, column 8: string values must be quoted, expected literal string",
     "issues": [
       {
-        "path": "line 53, column 8",
+        "path": "line 50, column 8",
         "message": "string values must be quoted, expected literal string"
       }
     ]
   },
   "warnings": [
-    "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 53, column 8: string values must be quoted, expected literal string"
+    "configuration file: the file on disk was refused and is not in effect; the gateway keeps running on the last valid configuration until the file is fixed: line 50, column 8: string values must be quoted, expected literal string"
   ],
   "counts": {
     "providers": 2,
@@ -483,8 +499,8 @@ HTTP/1.1 200 OK
     "client_keys": 1
   },
   "live": {
-    "started_at": 1790985974746,
-    "uptime_ms": 323,
+    "started_at": 1791004027826,
+    "uptime_ms": 193,
     "in_flight": 0,
     "active_streams": 0,
     "ws_connections": 0,
@@ -497,8 +513,8 @@ HTTP/1.1 200 OK
       "output_tokens": 68,
       "reasoning_tokens": 44,
       "cost": 0.00010499999999999999,
-      "duration_ms_sum": 46,
-      "ttfb_ms_sum": 46,
+      "duration_ms_sum": 64,
+      "ttfb_ms_sum": 63,
       "ttfb_count": 2
     }
   },
@@ -514,7 +530,10 @@ HTTP/1.1 200 OK
 
 Sells a ticket for `GET /ws`: 32 random bytes, URL-safe, valid once and for
 `expires_in` seconds. The body is ignored. At most 1024 tickets are
-outstanding; beyond that the one closest to expiry is dropped.
+outstanding; beyond that the one closest to expiry is dropped. A ticket is
+bound to the effective admin secret that issued it: after that secret
+changes, an unused ticket from the old secret is refused. Existing live
+sessions also close when they observe the changed secret.
 
 ```http
 POST /admin/api/ws-ticket
@@ -526,7 +545,7 @@ POST /admin/api/ws-ticket
 HTTP/1.1 200 OK
 
 {
-  "ticket": "XET_RBfI68agmPsFm_mWZV6bgpnEWm9X_HWznbh91-g",
+  "ticket": "gTIJDmjLVhqHPpxAJiRjVC3APvlguE2mBGQFGKkkceM",
   "expires_in": 30
 }
 ```
@@ -684,7 +703,7 @@ HTTP/1.1 200 OK
 {
   "text": "# Switchyard configuration.\n\n[admin]\nsecret = \"s3cr3t-admin-secret-change-me-0001\"\n\n[upstream]\nproxy = \"direct\"\n\n[logging]\nrequest_log = \"all\"\n\n[[auth.keys]]\nkey = \"sy-Zk3vTq8LmW2xYb7NcR5dHs9JfP4gAe6Uo1iKtQwE\"\nname = \"laptop\"\n\n# The built-in fake models.\n[[providers]]\nname = \"mock\"\nkind = \"mock\"\n\n[[providers]]\nname = \"vendor\"\nkind = \"openai-compat\"\nbase_url = \"http://127.0.0.1:9/v1\"\ndiscover = false\napi_keys = [\"sk-live-4f9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c\"]\n\n[[providers.credentials]]\napi_key = \"sk-live-0a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d\"\nlabel = \"team\"\nweight = 2\n\n[[providers.models]]\nid = \"vendor-large\"\nalias = \"large\"\n\n[[pricing]]\nmodel = \"mock-*\"\ninput = 0.5\noutput = 1.5\n",
   "path": "/etc/switchyard/switchyard.toml",
-  "modified_at": 1790985974739
+  "modified_at": 1791004027820
 }
 ```
 
@@ -820,16 +839,26 @@ The text replaces **everything**, and nothing asks twice: a client that
 offers a raw editor should show what will change before sending. One kind of
 text is refused with `422`, because it would lock out the dashboard that sent
 it: a text that switches the admin interface off — `admin.enabled = false`,
-or no usable `admin.secret` while none comes from `SWITCHYARD_ADMIN_SECRET`.
-An empty text is such a text (every setting at its default, no secret). The
-issue names `admin.enabled` or `admin.secret`; `PATCH /settings` refuses the
-same changes. To switch the admin interface off, edit the file itself.
+or no usable `admin.secret` while none comes from `SWITCHYARD_ADMIN_SECRET`:
+none at all, or a reference to a variable that is not set (or empty) for the
+gateway, which the issue names. An empty text is such a text (every setting
+at its default, no secret). The issue names `admin.enabled` or
+`admin.secret`; `PATCH /settings` refuses the same changes with the same
+issues, and `POST /config/validate` reports them. These are checked once the
+text is otherwise valid: a text with other issues is refused with those. To
+switch the admin interface off, edit the file itself.
 
 ### `POST /config/validate`
 
 Request: `{"text": "<a whole file>"}`. Always `200`; the verdict is in the
 body. Nothing is written or applied. Issue messages never quote values from
 the text (a key pasted into the wrong place is not echoed).
+
+The verdict is the one [`PUT /config/raw`](#put-configraw) would give, issue
+for issue and word for word: the text's issues, or — for a text that is
+otherwise valid — what saving it would lock out (`admin.enabled = false`, no
+usable admin secret; see above). `ok: true` therefore means Save would
+succeed.
 
 ```http
 POST /admin/api/config/validate
@@ -843,8 +872,13 @@ POST /admin/api/config/validate
 HTTP/1.1 200 OK
 
 {
-  "ok": true,
-  "issues": []
+  "ok": false,
+  "issues": [
+    {
+      "path": "admin.secret",
+      "message": "is missing: saving this would leave the admin interface without a secret and lock the dashboard out; keep an admin secret, or edit the configuration file itself to switch the admin interface off"
+    }
+  ]
 }
 ```
 
@@ -878,17 +912,49 @@ HTTP/1.1 200 OK
 }
 ```
 
+A valid text whose admin secret names a variable the gateway does not have:
+
+```http
+POST /admin/api/config/validate
+
+{
+  "text": "[admin]\nsecret = \"env:DASHBOARD_SECRET\"\n"
+}
+```
+
+```http
+HTTP/1.1 200 OK
+
+{
+  "ok": false,
+  "issues": [
+    {
+      "path": "admin.secret",
+      "message": "names the environment variable `DASHBOARD_SECRET`, which is not set (or empty) for the gateway: saving this would leave the admin interface without a secret and lock the dashboard out; set the variable and restart first, or keep an admin secret, or edit the configuration file itself to switch the admin interface off"
+    }
+  ]
+}
+```
+
 ### `PATCH /settings`
 
 A JSON merge patch (RFC 7396) over the scalar sections of the configuration:
 `server`, `admin`, `routing` (with `routing.cooldown`), `streaming`,
 `upstream`, `logging`, `usage`, and of `auth` only `auth.required`. Objects
-merge key by key; `null` resets a field to its default. Response: the same
-shape as `GET /config` (`providers` is cut to its first entry here).
+merge key by key; `null` resets a field — or a whole table such as
+`routing.cooldown` — to its default by **taking it out of the file**, so the
+default applies, and a later release's default would too; nothing is written
+in its place. The key goes with the comment on its line and the comment
+lines directly above it (a paragraph set apart by a blank line stays, as for
+any key an edit removes), and a table left with no keys loses its header.
+A default spelled out in the file (`port = 8317`) is taken out too, although
+the configuration does not change. Response: the same shape as `GET /config`
+(`providers` is cut to its first entry here).
 
 `admin.secret` and a password inside `upstream.proxy` follow the
 [mask rule](#secrets): send the mask or `""` to keep them. `admin.secret`
-therefore cannot be emptied here; a new value replaces the secret at once
+therefore cannot be emptied here — `null` keeps it too, the one field where
+`null` does not mean the default; a new value replaces the secret at once
 (the next request must use it).
 
 ```http
@@ -1003,6 +1069,111 @@ HTTP/1.1 200 OK
 }
 ```
 
+`null` puts the transient cooldown back to its default (60) and takes it
+out of the file, where the patch above had written `transient_secs = 30`:
+
+```http
+PATCH /admin/api/settings
+
+{
+  "routing": {
+    "cooldown": {
+      "transient_secs": null
+    }
+  }
+}
+```
+
+```http
+HTTP/1.1 200 OK
+
+{
+  "config": {
+    "server": {
+      "host": "127.0.0.1",
+      "port": 9000,
+      "body_limit_mb": 64,
+      "cors": true,
+      "data_dir": "data"
+    },
+    "admin": {
+      "enabled": true,
+      "secret": "s3cr3t…0001",
+      "allow_remote": false,
+      "ui": true
+    },
+    "auth": {
+      "required": true,
+      "keys": [
+        {
+          "key": "sy-Zk3…tQwE",
+          "name": "laptop"
+        }
+      ]
+    },
+    "routing": {
+      "strategy": "round-robin",
+      "session_affinity": true,
+      "session_affinity_ttl_secs": 3600,
+      "force_model_prefix": false,
+      "max_attempts": 3,
+      "max_wait_secs": 0,
+      "cooldown": {
+        "enabled": true,
+        "rate_limit_base_secs": 1,
+        "rate_limit_max_secs": 1800,
+        "transient_secs": 60,
+        "auth_secs": 1800,
+        "quota_secs": 3600,
+        "model_not_found_secs": 43200
+      }
+    },
+    "streaming": {
+      "keepalive_secs": 15,
+      "bootstrap_retries": 2,
+      "idle_timeout_secs": 300
+    },
+    "upstream": {
+      "proxy": "direct",
+      "connect_timeout_secs": 30,
+      "request_timeout_secs": 600,
+      "passthrough_headers": true
+    },
+    "logging": {
+      "level": "debug",
+      "file": false,
+      "max_total_size_mb": 200,
+      "request_log": "all",
+      "request_log_max_body_kb": 256
+    },
+    "usage": {
+      "enabled": true,
+      "persist": true,
+      "retention_days": 30
+    },
+    "providers": [
+      {
+        "name": "mock",
+        "kind": "mock"
+      }
+    ],
+    "pricing": [
+      {
+        "model": "mock-*",
+        "input": 0.5,
+        "output": 1.5
+      }
+    ]
+  },
+  "path": "/etc/switchyard/switchyard.toml",
+  "restart_required": [
+    "server.port"
+  ],
+  "command_line_overrides": [],
+  "config_rejected": null
+}
+```
+
 Errors:
 
 * `400` — the patch is not an object, touches another section (`providers`,
@@ -1015,7 +1186,13 @@ Errors:
   `server.data_dir` must not be empty (a gateway could not start with
   either); `routing.cooldown.rate_limit_max_secs` must not be below
   `rate_limit_base_secs`; `admin.secret` must not be a reference without a
-  variable name (`env:`).
+  variable name (`env:`, `${}`), must not start or end with a space and must
+  not contain control characters such as tabs or line breaks (an HTTP header
+  cannot carry it). And, as for [`PUT /config/raw`](#put-configraw), a patch
+  that would lock the dashboard out — `admin.enabled = false`, or an
+  `admin.secret` naming a variable that is not set while
+  `SWITCHYARD_ADMIN_SECRET` is not either. Each secret problem reads the same
+  here, from the raw editor and from `POST /config/validate`.
 * `409` — the file on disk is not valid (see
   [Configuration edits](#configuration-edits)).
 
@@ -1129,7 +1306,7 @@ HTTP/1.1 200 OK
         "enabled": true,
         "rate_limit_base_secs": 1,
         "rate_limit_max_secs": 1800,
-        "transient_secs": 30,
+        "transient_secs": 60,
         "auth_secs": 1800,
         "quota_secs": 3600,
         "model_not_found_secs": 43200
@@ -1328,11 +1505,11 @@ secrets masked, except that two keys are replaced and five are added:
 | `name` … `location` | The entry as configured (`kind`: `openai`, `anthropic`, `gemini`, `vertex`, `openai-compat`, `mock`; `wire_api`: `auto`, `chat`, `responses`; `legacy_max_tokens`, `stream_usage`: `true`, `false` or `null` for the kind's default). |
 | `credentials` | **Replaced:** one entry per runtime credential, configuration merged with runtime state (below). The configured `credentials` list is in `config.credentials`. |
 | `models` | **Replaced:** the client-facing names this provider serves right now, sorted — **strings**. The configured model list, a list of **objects**, is in `config.models` (see below). |
-| `model_count` | Upstream models the provider serves, after `exclude`. `models` can be longer: with a `prefix`, each model is listed as `prefix/name` and under its bare name. |
+| `model_count` | Upstream models the provider serves, after `exclude`. `models` can be longer: with a `prefix`, each model is listed as `prefix/name` and under its bare name. A disabled provider serves nothing: `0`, like its `models` (`[]`). |
 | `effective_base_url` | `base_url`, or the kind's default when that is empty. |
 | `protocols` | Wire protocols the provider can be spoken to in, most preferred first: `openai-chat`, `openai-responses`, `anthropic`, `gemini`. |
 | `discovery` | Where the discovery of the provider's model list stands (below). |
-| `config` | The entry itself, in exactly the shape `POST /providers` and `PUT /providers/{name}` accept: edit this object and send it back. |
+| `config` | The entry itself, in exactly the shape `POST /providers` and `PUT /providers/{name}` accept: edit this object and send it back. A `credentials[]` entry without a key carries `"api_key": null` (see [`PUT /providers/{name}`](#put-providersname)), so the object round-trips exactly: sent back as it is — also with its entries reordered or relabelled — a keyless credential stays keyless. |
 
 **`config.models` — the shape requests take.** In an entry sent to
 `POST /providers` or `PUT /providers/{name}`, `models` is a list of objects
@@ -1421,7 +1598,7 @@ HTTP/1.1 200 OK
       "model_cooldowns": [
         {
           "model": "mock-error-500",
-          "until": 1790986034943,
+          "until": 1791004087956,
           "reason": "server"
         }
       ],
@@ -1429,13 +1606,13 @@ HTTP/1.1 200 OK
       "successes": 2,
       "failures": 1,
       "consecutive_failures": 1,
-      "latency_ms": 23,
-      "last_used_at": 1790985974943,
+      "latency_ms": 30,
+      "last_used_at": 1791004027956,
       "last_error": {
         "status": 500,
         "class": "server",
         "message": "Mock upstream failure.",
-        "at": 1790985974943,
+        "at": 1791004027956,
         "model": "mock-error-500"
       },
       "usable": true,
@@ -1538,7 +1715,7 @@ HTTP/1.1 200 OK
         "model_cooldowns": [
           {
             "model": "mock-error-500",
-            "until": 1790986034943,
+            "until": 1791004087956,
             "reason": "server"
           }
         ],
@@ -1546,13 +1723,13 @@ HTTP/1.1 200 OK
         "successes": 2,
         "failures": 1,
         "consecutive_failures": 1,
-        "latency_ms": 23,
-        "last_used_at": 1790985974943,
+        "latency_ms": 30,
+        "last_used_at": 1791004027956,
         "last_error": {
           "status": 500,
           "class": "server",
           "message": "Mock upstream failure.",
-          "at": 1790985974943,
+          "at": 1791004027956,
           "model": "mock-error-500"
         },
         "usable": true,
@@ -1975,8 +2152,8 @@ to its default.
   null, "proxy": "…"}]` leaves one credential and no key anywhere. (Where
   the provider's kind requires a key, such a credential is refused with
   `422` at `credentials[j]`.) `POST /providers` accepts `null` too. The
-  view shows a keyless credential with `masked_key: ""`; `config` leaves
-  its `api_key` out.
+  view shows a keyless credential with `masked_key: ""`, and `config`
+  with `"api_key": null` — so what was shown can be sent back as it is.
 * **Rename:** a `name` in the body that differs from the path renames the
   provider (`409` if that name is taken, with the issue on `name`). Its secrets are kept as long as
   `kind` and `base_url` stay the same; payload rules that name the provider
@@ -2243,7 +2420,7 @@ HTTP/1.1 200 OK
 {
   "ok": true,
   "status": 200,
-  "latency_ms": 27,
+  "latency_ms": 21,
   "model": "mock-echo",
   "credential": "mock"
 }
@@ -2263,7 +2440,7 @@ HTTP/1.1 200 OK
 {
   "ok": false,
   "status": 401,
-  "latency_ms": 33,
+  "latency_ms": 30,
   "model": "mock-error-401",
   "credential": "mock",
   "error": "Mock credential rejected."
@@ -2693,6 +2870,7 @@ every model name and alias, including names hidden from client listings.
 | `info` | Model metadata; `id` equals `name`. Fields without a value are omitted (`display_name`, `description`, `owned_by`, `created`, `context_window`, `max_output_tokens`, `thinking`). `known: false` means the gateway has no metadata for the model and passes requests through unfitted. |
 | `hidden` | Hidden from listings by an alias with `hide_targets`; still routable. |
 | `ignored` | `true` for an alias without any routable target: no request can be served under the name (its `routes` is `[]`, and `GET /status` warns about it). `false` for everything else. `counts.models` of `GET /status` is the number of entries that are not ignored. |
+| `shadows_model` | `true` for an alias whose name equals, ignoring case, a model a provider serves — a model the alias therefore hides — also when the alias targets that very model (to pin a reasoning depth on it, say). Spelled exactly alike, the alias takes the name over: requests for it reach the alias, and the model has no entry of its own in this table or in client listings. Spelled differently (`Fast`, `fast`), both keep their entries and each exact spelling reaches its own; any other spelling (`FAST`) reaches the alias. `false` for every other entry, models and ignored aliases (which hide nothing) included. Use this rather than the "hides the model of the same name" sentence in `warnings` of `GET /status`, which is only given for an alias spelled exactly like the model that does not target it. |
 | `alias_targets` | Present only for aliases: the targets as configured. |
 | `routes` | The providers behind the name, one entry per provider and upstream model — for an alias, per configured target, in target order (the same provider and model reached through two targets is listed under each). An alias with no routable target has `routes: []`. |
 
@@ -2726,6 +2904,7 @@ HTTP/1.1 200 OK
     },
     "hidden": false,
     "ignored": false,
+    "shadows_model": false,
     "alias_targets": [
       "mock-echo"
     ],
@@ -2749,6 +2928,7 @@ HTTP/1.1 200 OK
     },
     "hidden": false,
     "ignored": false,
+    "shadows_model": false,
     "routes": [
       {
         "provider": "vendor",
@@ -2772,6 +2952,7 @@ HTTP/1.1 200 OK
     },
     "hidden": false,
     "ignored": false,
+    "shadows_model": false,
     "routes": [
       {
         "provider": "mock",
@@ -2989,8 +3170,19 @@ set), `filter` (remove). A rule:
 | `models` | Wildcard patterns matched against the upstream model id and the client-requested name. Required, at least one. |
 | `protocol` | Only when the upstream request uses this protocol; `null` for any. |
 | `provider` | Only for this provider; `""` for any. |
-| `set` | `default` / `override` rules: dotted path → JSON value (`messages.0.role`; `\.` for a literal dot). Required there. |
-| `remove` | `filter` rules: dotted paths to delete. Required there. |
+| `set` | `default` / `override` rules: path → JSON value. Required there. Its fields are listed in the order of the file. |
+| `remove` | `filter` rules: paths to delete. Required there. |
+
+A **path** names a field of the upstream request body: object keys
+separated by `.` (`generationConfig.thinkingConfig.thinkingBudget`); a part
+made of digits indexes an array when the value there is one
+(`messages.0.role`) and is a key otherwise; `\.` is a dot inside a key
+(`metadata.trace\.id`) and `\\` a backslash. There are no wildcards: `*` is
+a key like any other. A path that can never address a field is refused
+(`422`): an empty one, one with an empty part (`a..b`, a dot at the start
+or end), and one with spaces or control characters (around it or inside a
+part). Only the paths of the field a rule's list reads are checked — `set`
+of `default` / `override` rules, `remove` of `filter` rules.
 
 Rules apply to the built-in `mock` provider too, so a rule can be tried out
 before a real provider exists: the mock speaks whatever protocol the client
@@ -3001,7 +3193,10 @@ the request the mock answered, rules applied.
 `PUT` replaces all three lists with the body, an object
 `{default?, override?, filter?}` whose rules may leave out `protocol`,
 `provider`, and whichever of `set` / `remove` does not apply; a list that is
-left out is emptied. It returns the new rules in the full shape.
+left out is emptied. It returns the new rules in the full shape. A rule the
+`PUT` leaves unchanged keeps its text in the file, and the order of its
+`set` fields with it, even when the body lists them in another order; a
+field added to a rule goes at its end.
 
 ```http
 PUT /admin/api/payload
@@ -3139,14 +3334,18 @@ HTTP/1.1 200 OK
 ```
 
 `400` when the body is not that object (unknown key, unknown `protocol`);
-`422` when a rule has no model pattern, lacks its `set` / `remove`, or sets
-a value the configuration file cannot hold — `null` anywhere in a `set`
-value, or an integer from 9223372036854775808 to 18446744073709551615 (a
-whole number beyond that is a floating-point number and is stored as one,
-see [Configuration edits](#configuration-edits)). To make the upstream body
-lose a field, use a `filter` rule; a rule cannot set a field to `null`.
-Both statuses name fields from the same root, the body:
-`default[0].protocol`, `override[0].set.response_format`.
+`422` when a rule has no model pattern, lacks its `set` / `remove`, has a
+path that can never address a field (see above), or sets a value the
+configuration file cannot hold — `null` anywhere in a `set` value, or an
+integer from 9223372036854775808 to 18446744073709551615 (a whole number
+beyond that is a floating-point number and is stored as one, see
+[Configuration edits](#configuration-edits)). To make the upstream body lose
+a field, use a `filter` rule; a rule cannot set a field to `null`. Both
+statuses name fields from the same root, the body: `default[0].protocol`,
+`override[0].set.response_format`, `filter[0].remove[1]`. An issue about a
+path of `set` is named `…set.` followed by the path exactly as sent, dots
+and all (`default[0].set.reasoning..effort`; `default[0].set.` for an empty
+one).
 
 ```http
 PUT /admin/api/payload
@@ -3175,6 +3374,54 @@ HTTP/1.1 422 Unprocessable Entity
       {
         "path": "override[0].set.response_format",
         "message": "is null, which a TOML file cannot hold; leave the field out instead"
+      }
+    ]
+  }
+}
+```
+
+```http
+PUT /admin/api/payload
+
+{
+  "default": [
+    {
+      "models": [
+        "mock-*"
+      ],
+      "set": {
+        "reasoning..effort": "low"
+      }
+    }
+  ],
+  "filter": [
+    {
+      "models": [
+        "*"
+      ],
+      "remove": [
+        "metadata.trace_id",
+        "user "
+      ]
+    }
+  ]
+}
+```
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+
+{
+  "error": {
+    "message": "the configuration is not valid: default[0].set.reasoning..effort: has an empty part (two dots in a row, or a dot at the start or end); write a dot inside a field name as `\\.`; filter[0].remove[1]: must not start or end with a space",
+    "issues": [
+      {
+        "path": "default[0].set.reasoning..effort",
+        "message": "has an empty part (two dots in a row, or a dot at the start or end); write a dot inside a field name as `\\.`"
+      },
+      {
+        "path": "filter[0].remove[1]",
+        "message": "must not start or end with a space"
       }
     ]
   }
@@ -3258,8 +3505,42 @@ HTTP/1.1 200 OK
 ```
 
 `400` when the body is not such an array; `422` for an empty `model`
-(`[i].model`) or a price that is negative or not a finite number —
-`cache_read` and `cache_write` included (`[i]`).
+(`[i].model`) or a price that is negative or not a finite number, named by
+its own field (`[i].input`, `[i].output`, `[i].cache_read`,
+`[i].cache_write`).
+
+```http
+PUT /admin/api/pricing
+
+[
+  {
+    "model": "mock-*",
+    "input": 0.5,
+    "output": 1.5
+  },
+  {
+    "model": "vendor-large",
+    "input": 3,
+    "output": -15
+  }
+]
+```
+
+```http
+HTTP/1.1 422 Unprocessable Entity
+
+{
+  "error": {
+    "message": "the configuration is not valid: [1].output: must be a number of 0 or more (USD per million tokens)",
+    "issues": [
+      {
+        "path": "[1].output",
+        "message": "must be a number of 0 or more (USD per million tokens)"
+      }
+    ]
+  }
+}
+```
 
 ---------------------------------------------------------------------------
 
@@ -3295,13 +3576,13 @@ HTTP/1.1 200 OK
       "errors": 1,
       "tokens": 74,
       "cost": 0.00010499999999999999,
-      "last_used_at": 1790985974943
+      "last_used_at": 1791004027955
     }
   },
   {
-    "id": "key_cefa9e6910a6",
+    "id": "key_570ef9a5569d",
     "name": "ci",
-    "masked": "sy-8r3…Zq2V",
+    "masked": "sy-ABn…AVTH",
     "is_reference": false,
     "resolved": true,
     "enabled": true,
@@ -3328,9 +3609,9 @@ HTTP/1.1 200 OK
 | `is_reference` | The key is `env:NAME` / `${NAME}`. |
 | `resolved` | `false` for a reference whose variable is not set: the key cannot be used until it is. |
 | `enabled` | Disabled keys are refused by the client API (`401`) — while `auth.required` is on. With `auth.required = false` a disabled key, like an unknown one, is served as an anonymous client. |
-| `models` | Wildcard patterns of models the key may use; `[]` means all. Shown as `POST` and `PATCH` store them: trimmed, without empty entries, each pattern once — also when the file was written by hand. |
+| `models` | Wildcard patterns of models the key may use; `[]` means all. Patterns match model names ignoring case. Shown as `POST` and `PATCH` store them: trimmed, without empty entries, each pattern once — compared ignoring case, the first spelling kept (`["GPT-*", "gpt-*"]` is stored as `["GPT-*"]`) — also when the file was written by hand. |
 | `rate_limit_rpm` | Requests per minute, `null` for unlimited. Never `0`. |
-| `usage` | What this key did over the last 30 days (the `30d` range of `/usage/summary`, cut to `usage.retention_days`): `requests`, `errors`, `tokens` (prompt + output), `cost` (USD), and `last_used_at`, the start (unix ms) of its most recent request on record, else `null`. |
+| `usage` | What this key did over the last 30 days (the `30d` range of `/usage/summary`, cut to `usage.retention_days`): `requests`, `errors`, `tokens` (prompt + output), `cost` (USD), and `last_used_at`, the start (unix ms) of its most recent request **within that same window**, else `null` — `null` means "no request in the last 30 days" (or since the cut), not "never used". |
 
 `usage` belongs to the key, not to its name: it is counted from the request
 records by their `client.key_id`. Renaming a key keeps its numbers, and a
@@ -3368,8 +3649,8 @@ POST /admin/api/keys
 HTTP/1.1 201 Created
 
 {
-  "id": "key_cefa9e6910a6",
-  "key": "sy-8r3u6iSxrhXpJZO3okGhsRDkVWiAO7Ikbpk6Zq2V",
+  "id": "key_570ef9a5569d",
+  "key": "sy-ABnPoFQkP3RwtkPb8YQ1ywTQm7KPawgSWYGEAVTH",
   "is_reference": false
 }
 ```
@@ -3448,7 +3729,7 @@ unknown field or wrong type; `422` `rate_limit_rpm` of `0` (issue on
 `rate_limit_rpm`).
 
 ```http
-PATCH /admin/api/keys/key_cefa9e6910a6
+PATCH /admin/api/keys/key_570ef9a5569d
 
 {
   "name": "ci-runner",
@@ -3461,9 +3742,9 @@ PATCH /admin/api/keys/key_cefa9e6910a6
 HTTP/1.1 200 OK
 
 {
-  "id": "key_cefa9e6910a6",
+  "id": "key_570ef9a5569d",
   "name": "ci-runner",
-  "masked": "sy-8r3…Zq2V",
+  "masked": "sy-ABn…AVTH",
   "is_reference": false,
   "resolved": true,
   "enabled": false,
@@ -3488,7 +3769,7 @@ reference text (`"env:NAME"`, `is_reference: true`), not the variable's
 value. The body is ignored. `404` unknown id.
 
 ```http
-POST /admin/api/keys/key_cefa9e6910a6/reveal
+POST /admin/api/keys/key_570ef9a5569d/reveal
 
 {}
 ```
@@ -3497,7 +3778,7 @@ POST /admin/api/keys/key_cefa9e6910a6/reveal
 HTTP/1.1 200 OK
 
 {
-  "key": "sy-8r3u6iSxrhXpJZO3okGhsRDkVWiAO7Ikbpk6Zq2V",
+  "key": "sy-ABnPoFQkP3RwtkPb8YQ1ywTQm7KPawgSWYGEAVTH",
   "is_reference": false
 }
 ```
@@ -3507,7 +3788,7 @@ HTTP/1.1 200 OK
 The key stops working at once. `404` unknown id.
 
 ```http
-DELETE /admin/api/keys/key_cefa9e6910a6
+DELETE /admin/api/keys/key_570ef9a5569d
 ```
 
 ```http
@@ -3537,12 +3818,13 @@ byte.
 `cost` in totals — here, in `by_*` rows, in time-series points and groups —
 is a plain sum and is `0` both for usage that no price matched and for usage
 priced at zero: the two cannot be told apart in aggregates. A single
-[request record](#get-requestslimitbeforemodelproviderkeystatusq) can:
+[request record](#get-requestslimitbeforesincemodelclient_modelproviderkeystatusq) can:
 its `cost` is `null` when no price matched.
 
 ### `GET /usage/summary?range=`
 
-`range`: `1h`, `24h` (default), `7d`, `30d`.
+`range`: `1h`, `24h` (default), `7d`, `30d`. An invalid value is `400`,
+with the issue on `range`.
 
 ```http
 GET /admin/api/usage/summary?range=24h
@@ -3553,8 +3835,8 @@ HTTP/1.1 200 OK
 
 {
   "range": "24h",
-  "from": 1790899620000,
-  "to": 1790985975535,
+  "from": 1790917680000,
+  "to": 1791004028358,
   "totals": {
     "requests": 7,
     "errors": 2,
@@ -3564,18 +3846,18 @@ HTTP/1.1 200 OK
     "output_tokens": 74,
     "reasoning_tokens": 44,
     "cost": 0.000117,
-    "duration_ms_sum": 137,
-    "ttfb_ms_sum": 108,
+    "duration_ms_sum": 157,
+    "ttfb_ms_sum": 127,
     "ttfb_count": 5
   },
   "latency": {
     "window_ms": 86400000,
-    "p50": 24,
-    "p90": 31,
-    "p95": 31,
-    "p99": 31,
-    "ttfb_p50": 24,
-    "ttfb_p95": 31,
+    "p50": 30,
+    "p90": 34,
+    "p95": 34,
+    "p99": 34,
+    "ttfb_p50": 31,
+    "ttfb_p95": 34,
     "samples": 7,
     "ttfb_samples": 5
   },
@@ -3593,8 +3875,8 @@ HTTP/1.1 200 OK
       "output_tokens": 9,
       "reasoning_tokens": 0,
       "cost": 0.000017999999999999997,
-      "duration_ms_sum": 115,
-      "ttfb_ms_sum": 86,
+      "duration_ms_sum": 124,
+      "ttfb_ms_sum": 95,
       "ttfb_count": 4
     },
     {
@@ -3607,7 +3889,7 @@ HTTP/1.1 200 OK
       "output_tokens": 0,
       "reasoning_tokens": 0,
       "cost": 0.0,
-      "duration_ms_sum": 0,
+      "duration_ms_sum": 1,
       "ttfb_ms_sum": 0,
       "ttfb_count": 0
     },
@@ -3621,8 +3903,8 @@ HTTP/1.1 200 OK
       "output_tokens": 65,
       "reasoning_tokens": 44,
       "cost": 0.000099,
-      "duration_ms_sum": 22,
-      "ttfb_ms_sum": 22,
+      "duration_ms_sum": 32,
+      "ttfb_ms_sum": 32,
       "ttfb_count": 1
     },
     {
@@ -3651,8 +3933,8 @@ HTTP/1.1 200 OK
       "output_tokens": 74,
       "reasoning_tokens": 44,
       "cost": 0.000117,
-      "duration_ms_sum": 137,
-      "ttfb_ms_sum": 108,
+      "duration_ms_sum": 157,
+      "ttfb_ms_sum": 127,
       "ttfb_count": 5
     },
     {
@@ -3681,8 +3963,8 @@ HTTP/1.1 200 OK
       "output_tokens": 6,
       "reasoning_tokens": 0,
       "cost": 0.000012,
-      "duration_ms_sum": 91,
-      "ttfb_ms_sum": 62,
+      "duration_ms_sum": 93,
+      "ttfb_ms_sum": 64,
       "ttfb_count": 3
     },
     {
@@ -3695,8 +3977,8 @@ HTTP/1.1 200 OK
       "output_tokens": 68,
       "reasoning_tokens": 44,
       "cost": 0.00010499999999999999,
-      "duration_ms_sum": 46,
-      "ttfb_ms_sum": 46,
+      "duration_ms_sum": 64,
+      "ttfb_ms_sum": 63,
       "ttfb_count": 2
     }
   ]
@@ -3721,10 +4003,11 @@ latency window is cut in whole clock hours (the current hour and the 23
 before it) while the totals of `24h` cover the last 1440 minutes, so
 `samples` is the smaller number by the requests of the oldest partial hour.
 
-Names that stand for "none" in the breakdowns: `unknown` (a request that
-failed before it had a model or provider — also a request refused because
-every credential of its model was resting has no provider), `anonymous` (no
-client key), `dashboard` (the playground).
+Names that stand for "none" in the breakdowns: `unknown` — as a model, a
+request refused before a model could be read; as a provider, the requests
+no provider served: they failed before routing, or every credential of the
+model was cooling down — `anonymous` (no client key), `dashboard` (the
+playground).
 
 ### `GET /usage/timeseries?range=&bucket=&group_by=`
 
@@ -3774,8 +4057,8 @@ HTTP/1.1 200 OK
   "bucket": "minute",
   "bucket_ms": 60000,
   "group_by": "model",
-  "from": 1790982420000,
-  "to": 1790985975536,
+  "from": 1791000480000,
+  "to": 1791004028359,
   "series": [
     "mock-echo",
     "mock-error-500",
@@ -3784,7 +4067,7 @@ HTTP/1.1 200 OK
   ],
   "points": [
     {
-      "t": 1790985900000,
+      "t": 1791003960000,
       "requests": 0,
       "errors": 0,
       "input_tokens": 0,
@@ -3799,7 +4082,7 @@ HTTP/1.1 200 OK
       "groups": {}
     },
     {
-      "t": 1790985960000,
+      "t": 1791004020000,
       "requests": 7,
       "errors": 2,
       "input_tokens": 12,
@@ -3808,8 +4091,8 @@ HTTP/1.1 200 OK
       "output_tokens": 74,
       "reasoning_tokens": 44,
       "cost": 0.000117,
-      "duration_ms_sum": 137,
-      "ttfb_ms_sum": 108,
+      "duration_ms_sum": 157,
+      "ttfb_ms_sum": 127,
       "ttfb_count": 5,
       "groups": {
         "mock-echo": {
@@ -3842,7 +4125,7 @@ HTTP/1.1 200 OK
 }
 ```
 
-### `GET /requests?limit=&before=&model=&provider=&key=&status=&q=`
+### `GET /requests?limit=&before=&since=&model=&client_model=&provider=&key=&status=&q=`
 
 The most recent requests, newest first (by start time), from the in-memory
 list.
@@ -3870,17 +4153,21 @@ list.
 
 | Parameter | Meaning |
 |---|---|
-| `limit` | Page size, default 50, at most 500. |
-| `before` | Cursor: the `next_before` of the previous page. (A bare request id or unix-ms timestamp works too.) |
+| `limit` | Page size, default 50, clamped to 1–500 (`0` returns one item). Not a nonnegative whole number within the supported integer range: `400`, issue on `limit`. |
+| `before` | Cursor: the `next_before` of the previous page. (A request id or a unix-ms timestamp works too: the requests that started before it.) Anything else is refused with `400` and the issue on `before` — not answered with an empty page. |
+| `since` | Unix ms: only requests that started at or after it (`started_at >= since`). A filter like the others, so `total` counts only those. Not a whole number: `400`, issue on `since`. |
 | `model` | Exact model name — requested, client-facing or upstream — ignoring case. `unknown` selects the requests that have no model (refused before one could be read), the row the summaries list them under. |
-| `provider` | Exact provider name, ignoring case; `unknown` for requests that failed before routing. |
+| `client_model` | Exact client-facing model name, ignoring case, compared with the name alone that `by_model` of [`/usage/summary`](#get-usagesummaryrange) and `group_by=model` of `/usage/timeseries` count a request under: the resolved model (`client_model` of the record), else the name the client asked for. So a row of those breakdowns opens exactly its requests — which `model` does not promise, as it also matches the upstream name (an alias's requests under its target's row). `unknown` selects the requests without a model. |
+| `provider` | Exact provider name, ignoring case; `unknown` for the requests no provider served: they failed before routing, or every credential of the model was cooling down. |
 | `key` | Client key name or id, ignoring case; `anonymous` for requests without a key. |
-| `status` | `ok`, `error`, an HTTP status (`429`) or a class (`5xx`). |
+| `status` | `ok`, `error`, an HTTP status from `100` to `599` (`429`) or a class from `1xx` to `5xx`. Anything else: `400`, issue on `status`. |
 | `q` | Substring, ignoring case, searched in id, model names, provider, credential label, key name, endpoint, and in the error's `kind` and `message` (`q=rate_limit`, `q=client_disconnect`). |
 
+The filters combine (a request is listed when it passes all of them).
 `total` counts the requests in memory that match the filters, ignoring
 paging (so at most `capacity`). `next_before` is `null` on the last page.
-`capacity` is how many records the list can hold.
+`capacity` is how many records the list can hold. A parameter given twice
+is refused with `400`, the issue on its name.
 
 ```http
 GET /admin/api/requests?limit=2&status=ok
@@ -3892,9 +4179,9 @@ HTTP/1.1 200 OK
 {
   "items": [
     {
-      "id": "01a0ff15-36cc-73f3-a3dc-2998421b02b3",
-      "started_at": 1790985975500,
-      "finished_at": 1790985975529,
+      "id": "01a10028-ada1-77d3-bb63-b01260746ef1",
+      "started_at": 1791004028322,
+      "finished_at": 1791004028351,
       "duration_ms": 29,
       "ttfb_ms": 0,
       "client": {
@@ -3943,11 +4230,11 @@ HTTP/1.1 200 OK
       "has_bodies": true
     },
     {
-      "id": "01a0ff15-36ab-7028-a3b5-3bd3d8b966ca",
-      "started_at": 1790985975467,
-      "finished_at": 1790985975498,
-      "duration_ms": 31,
-      "ttfb_ms": 31,
+      "id": "01a10028-ad82-75e6-b429-e72d90a3b077",
+      "started_at": 1791004028290,
+      "finished_at": 1791004028320,
+      "duration_ms": 30,
+      "ttfb_ms": 30,
       "client": {
         "key_id": null,
         "key_name": "dashboard",
@@ -3988,16 +4275,107 @@ HTTP/1.1 200 OK
           "status": 200,
           "ok": true,
           "error": null,
-          "duration_ms": 30
+          "duration_ms": 29
         }
       ],
       "has_bodies": true
     }
   ],
-  "next_before": "1790985975467:01a0ff15-36ab-7028-a3b5-3bd3d8b966ca",
+  "next_before": "1791004028290:01a10028-ad82-75e6-b429-e72d90a3b077",
   "has_more": true,
   "total": 5,
   "capacity": 2000
+}
+```
+
+The requests of one summary row since a moment — and a `since` that is not
+a number:
+
+```http
+GET /admin/api/requests?client_model=mock-echo&since=1790917628402&limit=1
+```
+
+```http
+HTTP/1.1 200 OK
+
+{
+  "items": [
+    {
+      "id": "01a10028-ada1-77d3-bb63-b01260746ef1",
+      "started_at": 1791004028322,
+      "finished_at": 1791004028351,
+      "duration_ms": 29,
+      "ttfb_ms": 0,
+      "client": {
+        "key_id": null,
+        "key_name": "dashboard",
+        "ip": "127.0.0.1",
+        "user_agent": null
+      },
+      "client_protocol": "anthropic",
+      "endpoint": "POST /admin/api/playground",
+      "transport": "sse",
+      "stream": true,
+      "requested_model": "mock-echo",
+      "client_model": "mock-echo",
+      "upstream_model": "mock-echo",
+      "provider": "mock",
+      "credential_id": "mock:8da14ba21598",
+      "credential_label": "mock",
+      "upstream_protocol": "anthropic",
+      "mode": "mock",
+      "status": 200,
+      "ok": true,
+      "error": null,
+      "usage": {
+        "input_tokens": 2,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "output_tokens": 2,
+        "reasoning_tokens": 0
+      },
+      "cost": 4e-6,
+      "reasoning": null,
+      "attempts": [
+        {
+          "provider": "mock",
+          "credential_id": "mock:8da14ba21598",
+          "credential_label": "mock",
+          "upstream_model": "mock-echo",
+          "upstream_protocol": "anthropic",
+          "status": 200,
+          "ok": true,
+          "error": null,
+          "duration_ms": 0
+        }
+      ],
+      "has_bodies": true
+    }
+  ],
+  "next_before": "1791004028322:01a10028-ada1-77d3-bb63-b01260746ef1",
+  "has_more": true,
+  "total": 4,
+  "capacity": 2000
+}
+```
+
+```http
+GET /admin/api/requests?since=yesterday
+```
+
+```http
+HTTP/1.1 400 Bad Request
+
+{
+  "error": {
+    "message": "invalid query parameter `since`: must be a whole number of unix milliseconds",
+    "issues": [
+      {
+        "path": "since",
+        "message": "must be a whole number of unix milliseconds"
+      }
+    ]
+  }
 }
 ```
 
@@ -4012,15 +4390,15 @@ A request record:
 | `requested_model` | The model name **as the client wrote it**, reasoning suffix included (`"mock-echo(high)"`); `""` when the request was refused before a model could be read. This is the field to rebuild the request from (a Gemini URL, say). |
 | `client_model` | The client-facing model the name resolved to, **without the reasoning suffix** (`"mock-echo"`); `null` before routing: when the model is unknown or the request was refused earlier. |
 | `upstream_model` | The id sent upstream (the last attempt); `null` when nothing was sent. |
-| `provider`, `credential_id`, `credential_label`, `upstream_protocol` | Who served it (the last attempt). `null` when the request failed before routing. |
+| `provider`, `credential_id`, `credential_label`, `upstream_protocol` | Who served it (the last attempt). `null` for the requests no provider served: they failed before routing, or every credential of the model was cooling down. The breakdowns and the `provider` filter call these `unknown`. |
 | `mode` | `passthrough`, `translated`, `mock`, `raw`, or `null`. |
 | `status`, `ok` | The HTTP status sent to the client (`499`: the client went away; `101`: a WebSocket session relayed to the upstream, recorded when it ends). |
-| `error` | `null`, or `{kind, message, upstream_status}`. Every `kind` there is: `invalid_request` (400), `permission` (403: the key may not use the model), `not_found` (404: unknown model), `too_large` (413: an answer or a request beyond what the gateway or the upstream takes), `rate_limit` (429: the key's own limit, an upstream limit, or every credential resting), `upstream` (502), `unavailable` (503), `timeout` (504), `internal` (500), `client_disconnect` (499: the client went away before the answer was complete; also a relayed WebSocket session whose client side failed, status `101`), `aborted` (status `101`: a relayed WebSocket session that ended without being closed in order — the task relaying it was dropped) — and `authentication`, which exists but is not recorded, since requests refused for their key leave no record. |
+| `error` | `null`, or `{kind, message, upstream_status}`. Every `kind` there is: `invalid_request` (400), `permission` (403: the key may not use the model), `not_found` (404: unknown model), `too_large` (413: an answer or a request beyond what the gateway or the upstream takes), `rate_limit` (429: the key's own limit, an upstream limit, or every credential resting), `upstream` (502; also a relayed WebSocket session whose upstream side failed — status `101`, with `upstream_status: null`), `unavailable` (503), `timeout` (504), `internal` (500), `client_disconnect` (499: the client went away before the answer was complete; also a relayed WebSocket session whose client side failed, status `101`), `aborted` (status `101`: a relayed WebSocket session that ended without being closed in order — the task relaying it was dropped) — and `authentication`, which exists but is not recorded, since requests refused for their key leave no record. |
 | `usage` | Token counts (see [Totals](#totals)). |
 | `cost` | Estimated USD, `null` without a matching price or for failures. |
 | `reasoning` | The reasoning depth that was applied, as a label, or `null`. |
 | `attempts` | Every upstream call, in order: `provider`, `credential_id`, `credential_label`, `upstream_model`, `upstream_protocol`, `status` (`0`: no response), `ok`, `error`, `duration_ms`. |
-| `has_bodies` | Whether bodies were captured (`logging.request_log`). |
+| `has_bodies` | Whether bodies were captured (`logging.request_log`). Always `false` for a relayed WebSocket session (status `101`): its frames are not captured. |
 
 ### `GET /requests/{id}`
 
@@ -4048,7 +4426,7 @@ The bodies of a record with `has_bodies: true` can be read as soon as its
 `request.finished` live frame has arrived.
 
 ```http
-GET /admin/api/requests/01a0ff15-349f-752e-a46b-7282d95e6728
+GET /admin/api/requests/01a10028-ac33-756e-9d2e-f81ec74a387d
 ```
 
 ```http
@@ -4056,10 +4434,10 @@ HTTP/1.1 200 OK
 
 {
   "record": {
-    "id": "01a0ff15-349f-752e-a46b-7282d95e6728",
-    "started_at": 1790985974943,
-    "finished_at": 1790985974943,
-    "duration_ms": 0,
+    "id": "01a10028-ac33-756e-9d2e-f81ec74a387d",
+    "started_at": 1791004027955,
+    "finished_at": 1791004027956,
+    "duration_ms": 1,
     "ttfb_ms": null,
     "client": {
       "key_id": "key_df58088f8694",
@@ -4145,16 +4523,16 @@ HTTP/1.1 200 OK
 The application log's in-memory tail (the last 2000 lines), oldest first.
 The filters combine: a line is returned when it passes all of them.
 
-| Parameter | Meaning | When it is missing, unusable or out of range |
+| Parameter | Meaning | Defaults and validation |
 |---|---|---|
-| `limit` | Lines per page. | Missing or not a whole number: 200. `0` returns one line; more than the buffer holds returns the whole buffer (2000). |
-| `level` | Least severe level to include: `trace`, `debug`, `info`, `warn`, `error`. | Missing or not a level name: every level. |
+| `limit` | Lines per page. | Missing: 200. `0` returns one line; more than the buffer holds returns the whole buffer (2000). Not a nonnegative whole number within the supported integer range: `400`, issue on `limit`. |
+| `level` | Least severe level to include: `trace`, `debug`, `info`, `warn`, `error`. | Missing: every level. Not a level name: `400`, issue on `level`. |
 | `q` | Substring, ignoring case, searched in message, target and fields. | Missing or empty: no text filter. |
 | `target` | The module a line comes from, ignoring case: `switchyard_gateway::pipeline` is exactly that target; `switchyard_gateway::` (ending in `::`) that module and everything below it; `switchyard_*` (ending in `*`) every target that starts so. | Missing or empty: every target. |
-| `before` | Cursor: only lines with a smaller `seq` (the `next_before` of the previous page). | Missing or not a whole number: the newest lines. `0` and `1` return no line (`seq` starts at 1). |
+| `before` | Cursor: only lines with a smaller `seq` (the `next_before` of the previous page). | Missing: the newest lines. Not a whole number from `0` to `18446744073709551615`: `400`, issue on `before`. `0` and `1` return no line (`seq` starts at 1). |
 
-A query never fails: a parameter that cannot be used falls back as the
-table says.
+A malformed value or any parameter given twice is refused (`400`, the
+issue on its name); values are not echoed in the error.
 
 A page holds the *newest* matching lines; `next_before` leads to older ones
 and is `null` when there are none. `seq` increases by one per line and is
@@ -4178,7 +4556,7 @@ HTTP/1.1 200 OK
   "lines": [
     {
       "seq": 1,
-      "at": 1790985974970,
+      "at": 1791004027969,
       "level": "info",
       "target": "switchyard_gateway::gateway",
       "message": "configuration applied",
@@ -4188,7 +4566,7 @@ HTTP/1.1 200 OK
     },
     {
       "seq": 2,
-      "at": 1790985974970,
+      "at": 1791004027969,
       "level": "warn",
       "target": "switchyard_gateway::failover",
       "message": "upstream attempt failed",
@@ -4198,7 +4576,7 @@ HTTP/1.1 200 OK
     },
     {
       "seq": 3,
-      "at": 1790985974970,
+      "at": 1791004027969,
       "level": "info",
       "target": "switchyard_gateway::pipeline",
       "message": "request finished",
@@ -4210,7 +4588,7 @@ HTTP/1.1 200 OK
   "next_before": null,
   "has_more": false,
   "last_seq": 3,
-  "started_at": 1790985974746
+  "started_at": 1791004027826
 }
 ```
 
@@ -4249,7 +4627,11 @@ Response — **the protocol's own**, not the admin envelope:
   resting): the protocol's error body with its status. A streaming request
   that fails before its first event gets such a JSON error, not a stream;
   a failure after the first event arrives inside the stream, in the
-  protocol's in-stream error shape.
+  protocol's in-stream error shape. A wait the gateway asks for (every
+  credential resting, a rate limit) is the **`retry-after` response
+  header** of that answer — streamed requests included — and is not
+  repeated in the body. (The client API's Responses WebSocket, which has no
+  headers per turn, puts it in its error frame's `error.headers` instead.)
 
 So a `2xx` is JSON or SSE depending on `Content-Type`, and a non-`2xx` body
 is the protocol's error — *except* for the admin API's own refusals, which
@@ -4257,6 +4639,15 @@ keep the admin shape: `400` for a bad envelope (unknown `protocol`, `body`
 not an object, `model` missing for `gemini`, unknown field), `413`, and the
 [access](#access) errors. `ui/js/lib/api.js` reads `error.message` from
 either shape.
+
+**A `body` that is not JSON.** The dashboard writes the body into the
+envelope as text, so a typing mistake in it makes the whole envelope
+invalid. Such an error is reported at its place **in the body**, not in the
+envelope: `400` with the issue on `body` — `{"path": "body", "message": "is
+not valid JSON: line 1, column 37: expected value"}` — where line and
+column count from the start of the body's value (columns in characters). A
+syntax error before the body is the envelope's own and reads `the request
+body is not valid JSON: line L, column C: …` without an issue.
 
 ```http
 POST /admin/api/playground
@@ -4281,7 +4672,7 @@ HTTP/1.1 200 OK
 {
   "id": "chatcmpl-mock-4ca8dcc6e4868724",
   "object": "chat.completion",
-  "created": 1790985975,
+  "created": 1791004028,
   "model": "mock-echo",
   "choices": [
     {
@@ -4473,12 +4864,14 @@ Browsers cannot set headers on a WebSocket, so this one route is
 authenticated by a ticket from `POST /ws-ticket` instead of the secret.
 The loopback rule applies as everywhere. Before the upgrade:
 
-* `401` — the ticket is missing, unknown, expired or already used (each
+* `401` — the ticket is missing, unknown, expired, already used, or was
+  issued under a different admin secret (each
   connection needs a fresh one);
 * `403` — remote peer while remote access is off;
 * `404` — admin interface off;
-* `400` — a good ticket on a request that is not a WebSocket upgrade (the
-  ticket is used up anyway);
+* `400` — a repeated parameter or malformed query encoding (the ticket is
+  not consumed); or a good ticket on a request that is not a WebSocket
+  upgrade (the ticket is used up anyway);
 * `503` — the gateway is shutting down.
 
 Every message, both ways, is a JSON text frame.
@@ -4490,7 +4883,7 @@ Every message, both ways, is a JSON text frame.
 | `hello` | Once, first. | `version`, `topics` (every type that can be subscribed to), `server_time`, `started_at` (when the process started, as in `GET /status`: a client that reconnects and finds another value is talking to a restarted gateway, whose log `seq` and totals since start begin again). |
 | `stats` | Right after `hello`, then once a second. | See below. |
 | `request.started` | A client request began. | The first part of a request record: `id`, `started_at`, `client`, `client_protocol`, `endpoint`, `transport`, `stream`, `requested_model`. |
-| `request.finished` | It ended. One per `request.started`, same `id`. | The full [request record](#get-requestslimitbeforemodelproviderkeystatusq). |
+| `request.finished` | It ended. One per `request.started`, same `id`. | The full [request record](#get-requestslimitbeforesincemodelclient_modelproviderkeystatusq). |
 | `log` | An application log line. | `seq`, `at`, `level`, `target`, `message`, `fields` — as in `GET /logs`. |
 | `credential` | A **failed** upstream attempt was held against a credential, or a provider test ran (passed, or failed in a way that counts). Nothing else: see below. | `provider` and `credential`: the runtime part of a [credential entry](#the-provider-view) (no `source`, `index`, `proxy`, `service_account_file`; absent values are omitted rather than `null`). |
 | `config.reloaded` | A configuration was applied (`ok: true`) or refused (`ok: false`, e.g. a broken edit of the file or a failed reload). Also sent with `ok: true` when a file that was refused is valid again. The frames come in the order things happened, so the latest one says how the file stands: `ok: false` is never the last word for a file that has been put right, nor `ok: true` for one that was refused afterwards. | `at`, `ok`, `message`. Reload whatever depends on the configuration. |
@@ -4514,7 +4907,10 @@ the socket with code `1001` when it shuts down, and with `1008` when the
 admin interface is switched off, the secret changes, or remote access is
 withdrawn from a remote peer — within a second of the change. A slow
 client never slows the gateway: events it does not take in time are dropped
-for it and reported as `lagged`.
+for it and reported as `lagged`. A client that takes **no frame at all for
+10 seconds** (its socket stops accepting data) is not sent `lagged`: the
+connection is closed, without a close frame. Reconnect with a new ticket
+and refetch, as after `lagged`.
 
 **`credential` frames do not follow a credential's whole life.** One is
 sent when a failed attempt is reported (a cooldown may have started) and
@@ -4560,8 +4956,8 @@ again. A client that keeps state from events has to refetch it:
       "config.reloaded",
       "stats"
     ],
-    "server_time": 1790985975620,
-    "started_at": 1790985974746
+    "server_time": 1791004028469,
+    "started_at": 1791004027826
   }
 }
 ```
@@ -4575,21 +4971,28 @@ connections); `rpm` and `tpm` are requests and tokens finished in the last
 that hour and the two percentiles, then `0`, mean "no data"**; `totals` are
 the [totals](#totals) since start.
 
+**Across a restart** the two kinds of number behave differently. The
+percentiles (and `latency_samples`) are computed from the request records,
+which are read back from the usage files at start (with `usage.persist`
+on): they **survive a restart** and still describe the last hour. `totals`
+(and `uptime_ms`) count since *this* process started and **begin again at
+zero** — as `started_at` of `hello` says.
+
 ```json
 {
   "type": "stats",
   "data": {
-    "at": 1790985975622,
+    "at": 1791004028475,
     "in_flight": 0,
     "active_streams": 0,
     "ws_connections": 0,
     "rpm": 9,
     "tpm": 92,
     "error_rate_1m": 0.3333333333333333,
-    "p50_ms": 24,
-    "p95_ms": 31,
+    "p50_ms": 29,
+    "p95_ms": 34,
     "latency_samples": 9,
-    "uptime_ms": 876,
+    "uptime_ms": 649,
     "totals": {
       "requests": 9,
       "errors": 3,
@@ -4599,8 +5002,8 @@ the [totals](#totals) since start.
       "output_tokens": 77,
       "reasoning_tokens": 44,
       "cost": 0.000123,
-      "duration_ms_sum": 166,
-      "ttfb_ms_sum": 137,
+      "duration_ms_sum": 183,
+      "ttfb_ms_sum": 153,
       "ttfb_count": 6
     }
   }
@@ -4611,8 +5014,8 @@ the [totals](#totals) since start.
 {
   "type": "request.started",
   "data": {
-    "id": "01a0ff15-3746-70fd-860f-8684962c185e",
-    "started_at": 1790985975622,
+    "id": "01a10028-ae3c-734e-89d0-d48d1bc209a2",
+    "started_at": 1791004028476,
     "client": {
       "key_id": "key_df58088f8694",
       "key_name": "laptop",
@@ -4632,11 +5035,11 @@ the [totals](#totals) since start.
 {
   "type": "request.finished",
   "data": {
-    "id": "01a0ff15-3746-70fd-860f-8684962c185e",
-    "started_at": 1790985975622,
-    "finished_at": 1790985975653,
-    "duration_ms": 31,
-    "ttfb_ms": 31,
+    "id": "01a10028-ae3c-734e-89d0-d48d1bc209a2",
+    "started_at": 1791004028476,
+    "finished_at": 1791004028506,
+    "duration_ms": 30,
+    "ttfb_ms": 30,
     "client": {
       "key_id": "key_df58088f8694",
       "key_name": "laptop",
@@ -4690,7 +5093,7 @@ the [totals](#totals) since start.
   "type": "log",
   "data": {
     "seq": 4,
-    "at": 1790985975654,
+    "at": 1791004028507,
     "level": "info",
     "target": "switchyard_gateway::pipeline",
     "message": "request finished",
@@ -4716,7 +5119,7 @@ the [totals](#totals) since start.
       "model_cooldowns": [
         {
           "model": "mock-error-429",
-          "until": 1790985977653,
+          "until": 1791004030507,
           "reason": "rate_limit"
         }
       ],
@@ -4725,12 +5128,12 @@ the [totals](#totals) since start.
       "failures": 2,
       "consecutive_failures": 1,
       "latency_ms": 24,
-      "last_used_at": 1790985975653,
+      "last_used_at": 1791004028507,
       "last_error": {
         "status": 429,
         "class": "rate_limit",
         "message": "Mock rate limit reached. Please try again in 2s.",
-        "at": 1790985975653,
+        "at": 1791004028507,
         "model": "mock-error-429"
       },
       "weight": 1,
@@ -4744,7 +5147,7 @@ the [totals](#totals) since start.
 {
   "type": "config.reloaded",
   "data": {
-    "at": 1790985975663,
+    "at": 1791004028516,
     "ok": true,
     "message": "configuration applied"
   }

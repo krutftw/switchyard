@@ -234,7 +234,7 @@ function CodeTab({ protocol, curl, snippets }) {
   const snippet = snippets.find((s) => s.id === id);
   return html`
     <div class="play-insp-section">
-      <${CodeBlock} title="curl, public client API" language="text" value=${curl} maxHeight="320px" />
+      <${CodeBlock} title="curl for bash/zsh, public client API" language="text" value=${curl} maxHeight="320px" />
       <p class="faint play-insp-foot">Set <span class="mono">${KEY_VARIABLE}</span> to a client key first. Keys are on the <a href=${href('/keys')}>API keys</a> page.</p>
       <hr />
       <${Select}
@@ -252,7 +252,8 @@ function CodeTab({ protocol, curl, snippets }) {
 }
 
 /**
- * tab, onTab          the selected tab (kept in the URL by the page)
+ * tab, onTab          the selected tab (kept in the URL by the page; each pick,
+ *                     "Show the response" included, is a step in the history)
  * run                 the last request, or null
  * view, onView        'next' | 'sent': which body the Request tab shows
  * next                { text, path }: the body the next send would carry
@@ -287,7 +288,7 @@ export default function Inspector({ tab, onTab, run, view, onView, next, raw, on
           ]}
         />
       </div>
-      <div class="play-insp-body" role="tabpanel" aria-label=${current}>
+      <div class="play-insp-body" role="tabpanel" aria-label=${current[0].toUpperCase() + current.slice(1)}>
         ${current === 'request' &&
         html`<${RequestTab} run=${run} view=${view} onView=${onView} next=${next} raw=${raw} onRawToggle=${onRawToggle} onRawChange=${onRawChange} onRawReset=${onRawReset} loading=${loading} />`}
         ${current === 'events' && html`<${EventsTab} run=${run} onTab=${jump} />`}

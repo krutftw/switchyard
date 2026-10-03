@@ -23,7 +23,7 @@ const blank = () => ({
   rawError: null, // why the raw body was not sent
   modelError: null, // why the model field stopped a send
   failure: null, // ApiError carrying the admin API's issues, for the form fields
-  replay: null, // { id, kind: 'loaded' | 'no-body' | 'protocol' | 'asking', record, cut }
+  replay: null, // { id, kind: 'loaded' | 'no-body' | 'protocol' | 'endpoint' | 'asking', record, cut, edited }
   tick: 0, // bumped when `work.run` changed in place
 });
 
@@ -36,6 +36,7 @@ export const work = {
   lookup: null, // AbortController of the follow-up GET /requests/{id}
   records: new Map(), // request records seen on the live connection, by id
   appliedFrom: null, // the ?from= id that was last loaded into raw mode
+  loaded: null, // { id, seed, cut }: the recorded request whose body raw mode was started from
 };
 
 /** A setter for one field: takes a value, or a function of the current value. */
@@ -66,6 +67,7 @@ function forgetSession() {
   work.lookup = null;
   work.records.clear();
   work.appliedFrom = null;
+  work.loaded = null;
   session.replace(blank());
   forgetSocket();
 }

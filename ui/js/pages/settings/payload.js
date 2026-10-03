@@ -117,8 +117,8 @@ const toBody = (draft) => Object.fromEntries(KINDS.map((kind) => [kind.id, draft
  * { kind: 'override', index: 0, rest: 'set.x' }.
  */
 function parseIssuePath(path) {
-  const match = /^(default|override|filter)\.(\d+)(?:\.(.*))?$/.exec(path);
-  return match ? { kind: match[1], index: Number(match[2]), rest: match[3] ?? '' } : null;
+  const match = /^(default|override|filter)(?:\[(\d+)\]|\.(\d+))(?:\.(.*))?$/.exec(path);
+  return match ? { kind: match[1], index: Number(match[2] ?? match[3]), rest: match[4] ?? '' } : null;
 }
 
 const protocolLabel = (value) => PROTOCOLS.find((p) => p.value === value)?.label ?? value;
@@ -161,11 +161,24 @@ export function jsonProblem(text) {
 
 function pathProblem(path) {
   if (path.trim() === '') return 'Enter a path, for example reasoning.effort.';
-  if (/\s/.test(path.trim())) return 'A path cannot contain spaces.';
+  if (path.trim() !== path) return 'A path cannot start or end with a space.';
+  if (/[\s\u0000-\u001f\u007f-\u009f]/u.test(path)) return 'A path cannot contain spaces or control characters.';
+  // Match the gateway grammar: only a dot or backslash can be escaped.
+  // An unescaped dot separates parts; none of those parts may be empty.
+  let part = '';
+  for (let i = 0; i < path.length; i += 1) {
+    const ch = path[i];
+    if (ch === '\\' && (path[i + 1] === '.' || path[i + 1] === '\\')) part += path[++i];
+    else if (ch === '.') {
+      if (!part) return 'A path cannot have an empty part. Escape a literal dot with a backslash.';
+      part = '';
+    } else part += ch;
+  }
+  if (!part) return 'A path cannot end with a dot. Escape a literal dot with a backslash.';
   return null;
 }
 
-function RuleEditor({ open, target, providers, onApply, onClose }) {
+function RuleEditor({ open, target, providers, serverIssues = [], onApply, onClose }) {
   const kind = KINDS.find((k) => k.id === target.kind);
   const isFilter = kind.id === 'filter';
   const initial = target.rule;
@@ -173,20 +186,30 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
   const [protocol, setProtocol] = useState(initial.protocol ?? '');
   const [provider, setProvider] = useState(initial.provider ?? '');
   const [fields, setFields] = useState(() => {
-    const rows = Object.entries(initial.set).map(([path, value]) => ({ id: rowId(), path, text: JSON.stringify(value) }));
+    const rows = Object.entries(initial.set).map(([path, value]) => ({ id: rowId(), path, sourcePath: path, text: JSON.stringify(value) }));
     return rows.length > 0 ? rows : [{ id: rowId(), path: '', text: '' }];
   });
   const [remove, setRemove] = useState(initial.remove);
   const [touched, setTouched] = useState(false);
   const [problems, setProblems] = useState({});
   const formId = useUid('rule-form');
+  const serverAt = (path) => serverIssues.filter((issue) => issue.path === path).map((issue) => issue.message).join(' ') || undefined;
+  const unchanged = (value, original) => JSON.stringify(value) === JSON.stringify(original);
+  const removeError = unchanged(remove, initial.remove)
+    ? serverIssues.filter((issue) => /^remove(?:\[\d+\]|\.\d+)?$/.test(issue.path)).map((issue) => {
+        const index = /(?:\[|\.)(\d+)\]?$/.exec(issue.path)?.[1];
+        return index == null ? issue.message : `${initial.remove[Number(index)]}: ${issue.message}`;
+      }).join(' ') || undefined
+    : undefined;
 
   const edit = (setter) => (value) => {
     setTouched(true);
+    setProblems({});
     setter(value);
   };
   const setField = (id, patch) => {
     setTouched(true);
+    setProblems((current) => ({ ...current, [`path:${id}`]: undefined, [`value:${id}`]: undefined }));
     setFields((rows) => rows.map((row) => (row.id === id ? { ...row, ...patch } : row)));
   };
 
@@ -200,6 +223,10 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
     const set = {};
     if (isFilter) {
       if (remove.length === 0) found.remove = 'Add at least one path to remove.';
+      else {
+        const bad = remove.map((path) => ({ path, message: pathProblem(path) })).filter((issue) => issue.message);
+        if (bad.length) found.remove = bad.map((issue) => `${issue.path}: ${issue.message}`).join(' ');
+      }
     } else {
       const seen = new Set();
       fields.forEach((row) => {
@@ -244,7 +271,7 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
           onChange=${edit(setModels)}
           placeholder="gpt-*, claude-sonnet-4-5"
           hint="Matched against the provider's model id and the name the client asked for. * matches any run of characters."
-          error=${problems.models}
+          error=${problems.models || (unchanged(models, initial.models) ? serverAt('models') : undefined)}
           data-autofocus=""
         />
         <${Select}
@@ -254,11 +281,12 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
           onChange=${edit(setProtocol)}
           placeholder="Any protocol"
           options=${PROTOCOLS}
+          error=${protocol === (initial.protocol ?? '') ? serverAt('protocol') : undefined}
           hint="Paths are in the layout of the request sent to the provider. Limit the rule to the protocol whose layout the paths follow."
         />
         ${providers === null
-          ? html`<${Input} label="Provider" optional mono value=${provider} onChange=${edit(setProvider)} placeholder="Any provider" hint="The provider list could not be loaded. Enter the provider's name exactly as configured." />`
-          : html`<${Select} label="Provider" optional value=${provider} onChange=${edit(setProvider)} placeholder="Any provider" options=${providerOptions} hint="Apply only to requests this provider serves." />`}
+          ? html`<${Input} label="Provider" optional mono value=${provider} onChange=${edit(setProvider)} error=${provider === (initial.provider ?? '') ? serverAt('provider') : undefined} placeholder="Any provider" hint="The provider list could not be loaded. Enter the provider's name exactly as configured." />`
+          : html`<${Select} label="Provider" optional value=${provider} onChange=${edit(setProvider)} error=${provider === (initial.provider ?? '') ? serverAt('provider') : undefined} placeholder="Any provider" options=${providerOptions} hint="Apply only to requests this provider serves." />`}
 
         ${isFilter
           ? html`<${TagInput}
@@ -268,7 +296,7 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
               placeholder="metadata, store"
               hint=${html`Dotted paths: <span class="mono">metadata.trace_id</span>, <span class="mono">tools.0.strict</span>. Write a literal dot as <span class="mono">\\.</span>`}
               validate=${(tag) => pathProblem(tag)}
-              error=${problems.remove}
+              error=${problems.remove || removeError}
             />`
           : html`
               <${Field} label="Fields to set" hint=${html`Paths are dotted: <span class="mono">reasoning.effort</span>, <span class="mono">messages.0.role</span>; write a literal dot as <span class="mono">\\.</span> Values are JSON: <span class="mono">true</span>, <span class="mono">0.2</span>, <span class="mono">"high"</span>, <span class="mono">{"type": "enabled"}</span>. Not <span class="mono">null</span>: to take a field out, use a filter rule.`}>
@@ -282,7 +310,7 @@ function RuleEditor({ open, target, providers, onApply, onClose }) {
                           placeholder="reasoning.effort"
                           value=${row.path}
                           onChange=${(path) => setField(row.id, { path })}
-                          error=${problems[`path:${row.id}`]}
+                          error=${problems[`path:${row.id}`] || (row.path === row.sourcePath ? serverAt(`set.${row.sourcePath}`) : undefined)}
                         />
                         <${Input}
                           mono
@@ -456,7 +484,7 @@ export function PayloadTab({ onDiskInvalid }) {
   const byRule = useMemo(() => {
     const map = new Map();
     for (const issue of KINDS.flatMap((kind) => issues.under(kind.id))) {
-      const at = parseIssuePath(issue.path);
+      const at = parseIssuePath(issue.rawPath ?? issue.path);
       if (!at) continue;
       const key = `${at.kind}:${at.index}`;
       const text = at.rest ? `${at.rest}: ${issue.message}` : issue.message;
@@ -594,6 +622,9 @@ export function PayloadTab({ onDiskInvalid }) {
         saveLabel="Save rules"
       />
     <//>
-    ${editing && html`<${RuleEditor} key=${editing.nonce} open=${editorOpen} target=${editing} providers=${providerNames} onApply=${applyEdit} onClose=${() => setEditorOpen(false)} />`}
+    ${editing && html`<${RuleEditor} key=${editing.nonce} open=${editorOpen} target=${editing} providers=${providerNames} serverIssues=${issues.all.flatMap((issue) => {
+      const at = parseIssuePath(issue.rawPath ?? issue.path);
+      return at && at.kind === editing.kind && at.index === editing.index ? [{ path: at.rest, message: issue.message }] : [];
+    })} onApply=${applyEdit} onClose=${() => setEditorOpen(false)} />`}
   `;
 }

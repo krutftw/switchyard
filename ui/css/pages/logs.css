@@ -69,7 +69,7 @@
 .logs-view {
   /* time, level, target, text: shared by the lines and their skeleton. */
   --logs-columns: 12ch calc(var(--space-10) + var(--space-2)) 30ch minmax(0, 1fr);
-  --logs-line-h: var(--space-5);
+  --logs-line-h: var(--space-6);
   --logs-mark-h: var(--space-8);
   position: relative;
   display: flex;
@@ -213,7 +213,8 @@
 }
 
 .logs-target {
-  min-width: 0;
+  min-width: var(--space-6);
+  min-height: var(--logs-line-h);
   overflow: hidden;
   border-radius: var(--radius-xs);
   color: var(--text-3);
@@ -290,7 +291,8 @@
   display: inline-flex;
   align-items: center;
   max-width: 100%;
-  height: calc(var(--logs-line-h) - var(--space-0h));
+  min-width: var(--space-6);
+  height: var(--logs-line-h);
   margin-right: var(--space-1h);
   padding: 0 var(--space-1);
   border-radius: var(--radius-xs);
@@ -527,6 +529,34 @@
 
 .logs-foot-count {
   white-space: nowrap;
+}
+
+/* Custom controls occupy their full hit area, so adjacent log rows never
+   share overlapping targets. The list measures these expanded row heights. */
+@media (pointer: coarse) {
+  .logs-view {
+    --logs-line-h: var(--tap-min);
+  }
+
+  .logs-target,
+  .logs-chip {
+    min-width: var(--tap-min);
+  }
+
+  .logs-pill {
+    min-height: var(--tap-min);
+  }
+
+  .logs-row-actions {
+    position: static;
+    justify-content: flex-end;
+    height: auto;
+    padding: 0 var(--space-3) var(--space-1);
+  }
+
+  .logs-detail-actions .btn {
+    min-height: var(--tap-min);
+  }
 }
 
 /* ---- Phones ---------------------------------------------------------------- */

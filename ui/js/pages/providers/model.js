@@ -155,6 +155,86 @@ export function isCredentialHeader(name) {
 }
 
 /**
+ * Whether a secret as the gateway showed it is a mask rather than a value:
+ * bullets only (every secret of up to 11 characters), or a prefix and a
+ * suffix around "…". The gateway's own test (`looks_masked`).
+ */
+export function looksMasked(value) {
+  const v = String(value ?? '').trim();
+  return v !== '' && !isReference(v) && ([...v].every((c) => c === '•') || v.includes('…'));
+}
+
+/**
+ * Keys that mask alike. The gateway gives a masked key back to the stored
+ * key it stands for by its label (a credential that kept the label it was
+ * stored with), else by its place among the keys of that mask: two such
+ * keys keep their stored order whatever order they are sent in, and sending
+ * back fewer of them than are stored (one was removed) is refused with
+ * `422` on each of them, because which one went cannot be known.
+ *
+ * The functions below take the editor's credential rows (blankCredential).
+ */
+
+/** The mask a row still stands for (its key is sent back masked), or ''. */
+function maskOf(row) {
+  const key = keyOf(row);
+  return looksMasked(key) ? key.trim() : '';
+}
+
+/** A row the gateway can recognise by its label: the one it was stored with, and no other key of that mask was stored with it. */
+function knownByLabel(row, rows) {
+  const label = row.label.trim();
+  if (!label || label !== String(row.storedLabel ?? '').trim()) return false;
+  return !rows.some((other) => other !== row && other.stored === row.stored && String(other.storedLabel ?? '').trim() === label);
+}
+
+/** Whether a row's key can only be told from others' by its place: masked, and not known by its label. */
+function placedByMask(row, rows) {
+  return maskOf(row) !== '' && !knownByLabel(row, rows);
+}
+
+/**
+ * Whether two neighbouring rows may trade places. Not when both still
+ * stand for stored keys of one mask that only their order tells apart: the
+ * gateway would keep the keys where they were and move only the settings.
+ */
+export function canSwap(a, b, rows) {
+  if (!a || !b) return false;
+  return !(placedByMask(a, rows) && placedByMask(b, rows) && maskOf(a) === maskOf(b));
+}
+
+/**
+ * Rows whose key the gateway will refuse to resolve: of a mask that several
+ * stored keys share, fewer rows are left than were stored (one was removed
+ * or replaced). `initial` are the rows as the form opened.
+ *
+ * @returns {Map<string, { mask: string, stored: number, left: number }>} by row uid
+ */
+export function maskShortfall(initial, rows) {
+  const out = new Map();
+  const storedCount = new Map();
+  for (const row of initial) {
+    if (!looksMasked(row.stored) || knownByLabel(row, initial)) continue;
+    const mask = row.stored.trim();
+    storedCount.set(mask, (storedCount.get(mask) ?? 0) + 1);
+  }
+  const left = new Map();
+  for (const row of rows) {
+    if (!placedByMask(row, rows)) continue;
+    const mask = maskOf(row);
+    left.set(mask, [...(left.get(mask) ?? []), row]);
+  }
+  for (const [mask, list] of left) {
+    const stored = storedCount.get(mask) ?? 0;
+    if (stored > 1 && list.length < stored) for (const row of list) out.set(row.uid, { mask, stored, left: list.length });
+  }
+  return out;
+}
+
+/** The gateway's issue for a masked key it cannot tell from others (AMBIGUOUS_MASK in config-store). */
+export const isAmbiguousMaskIssue = (message) => /masked like several stored secrets/i.test(String(message ?? ''));
+
+/**
  * The gateway's wildcard match for `exclude`: case-insensitive, `*` is any
  * run of characters (none included), nothing else is special.
  */
@@ -537,6 +617,8 @@ const uid = (prefix) => `${prefix}${++uidCounter}`;
  * entered   what the user typed
  * editing   the input is shown (always, for a new row)
  * reference the row holds an environment reference, shown in clear
+ * storedLabel  the label the credential was stored with: the gateway tells
+ *           keys that mask alike apart by it
  * noKey     the stored key is to be dropped and the credential kept
  *           without one (kinds that can be called without a key)
  * source    "api_keys" | "credentials" | null: where it was configured
@@ -551,6 +633,7 @@ export function blankCredential(extra = {}) {
     reference: false,
     noKey: false,
     label: '',
+    storedLabel: '',
     weight: null,
     priority: null,
     proxy: '',
@@ -677,6 +760,7 @@ export function draftFromConfig(config) {
         fromKey(c.api_key, {
           source: 'credentials',
           label: c.label ?? '',
+          storedLabel: c.label ?? '',
           weight: c.weight ?? null,
           priority: c.priority ?? null,
           proxy: c.proxy ?? '',
@@ -729,7 +813,8 @@ function thinkingOf(row) {
  * Rows keep the order they have on screen: the leading rows that are a bare
  * key go to `api_keys`, and from the first row that needs settings (or was
  * configured under `credentials`) onward everything is a `credentials`
- * entry. A row with neither key nor settings is dropped. Secrets follow the
+ * entry. A new row with neither key nor settings is dropped; an existing
+ * credential without a key remains until its row is removed. Secrets follow the
  * API's mask rule: an untouched row sends back exactly what it was shown.
  * A `credentials` entry always says what its key is: the key, or `null` for
  * "this credential has no key". It is never left out or sent empty, which
@@ -749,7 +834,7 @@ export function configFromDraft(draft, { resetForKind = false } = {}) {
   const openai = isOpenAiKind(draft.kind);
   const keep = (applies, value, fallback) => (applies || !resetForKind ? value : fallback);
 
-  const rows = draft.credentials.filter((row) => keyOf(row) !== '' || hasSettings(row));
+  const rows = draft.credentials.filter((row) => keyOf(row) !== '' || hasSettings(row) || row.source === 'credentials');
   let split = rows.findIndex((row) => hasSettings(row) || row.source === 'credentials');
   if (split === -1) split = rows.length;
   const apiKeys = [];
@@ -818,16 +903,6 @@ export function configFromDraft(draft, { resetForKind = false } = {}) {
     location: keep(draft.kind === 'vertex', draft.location.trim(), ''),
   };
   return { config, paths };
-}
-
-/**
- * A provider's `config` as read from the gateway, ready to be sent back with
- * a change: the view leaves `api_key` out of a credential that has none, and
- * a request has to say so (`null`), or the gateway would look for a stored
- * key to keep.
- */
-export function entryToSend(config, changes = {}) {
-  return { ...config, credentials: (config.credentials ?? []).map((entry) => ({ ...entry, api_key: entry.api_key || null })), ...changes };
 }
 
 /** What the browser can check before sending: [{ path, message }]. */

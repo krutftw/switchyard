@@ -52,12 +52,21 @@ let carried = [];
 /**
  * Tone of a finished request. `ok` decides, not the status alone: a relayed
  * WebSocket session ends with status 101 whether it closed in order or broke
- * off, and a stream that failed after its 200 is not a success.
+ * off, and a stream that failed after its 200 is not a success. So a success
+ * is clear whatever its status (an ok 101 is not red), and a failure is stop
+ * whatever its status (a 2xx or a 101 that failed is not green or blue),
+ * except the statuses that are a warning in themselves: 429 and 3xx.
  */
-function outcomeTone(record) {
+export function outcomeTone(record) {
   if (record.ok) return 'clear';
-  const tone = toneForStatus(record.status);
-  return tone === 'clear' ? 'stop' : tone;
+  return toneForStatus(record.status) === 'caution' ? 'caution' : 'stop';
+}
+
+/** What a finished request came to, in a few words: its tokens, or why it failed. */
+function outcomeText(record, tokens) {
+  if (record.ok) return `${formatTokens(tokens)} tokens`;
+  const kind = record.error?.kind;
+  return ERROR_KIND[kind] ?? (kind ? String(kind).replace(/_/g, ' ') : 'failed');
 }
 
 function Row({ record, now, fresh }) {
@@ -68,8 +77,9 @@ function Row({ record, now, fresh }) {
   const model = record.requested_model || record.client_model || 'no model';
   const lampTitle = pending ? 'In flight' : record.ok ? 'Succeeded' : 'Failed';
   const tone = pending ? 'info' : outcomeTone(record);
-  const kind = record.error?.kind;
-  const first = pending ? (record.endpoint ?? record.client_protocol ?? 'Request') : (record.provider ?? 'not routed');
+  // No provider: the request failed before routing, or every credential of
+  // the model was cooling down (the Requests page's "No provider" filter).
+  const first = pending ? (record.endpoint ?? record.client_protocol ?? 'Request') : (record.provider ?? 'no provider');
 
   return html`
     <li>
@@ -92,7 +102,7 @@ function Row({ record, now, fresh }) {
           <span class="overview-feed-detail">
             ${pending
               ? html`started ${formatRelativeTime(record.started_at, now)}`
-              : html`${record.ok || tokens > 0 ? `${formatTokens(tokens)} tokens` : (ERROR_KIND[kind] ?? (kind ? String(kind).replace(/_/g, ' ') : 'failed'))}
+              : html`${outcomeText(record, tokens)}
                   <span class="overview-feed-sep" aria-hidden="true">·</span>
                   ${formatRelativeTime(record.started_at, now)}`}
           </span>

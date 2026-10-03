@@ -514,6 +514,26 @@ impl ConfigStore {
     where
         F: FnOnce(&mut Config) -> Result<(), String> + Send,
     {
+        self.update_unsetting(|config| edit(config).map(|()| Vec::new()))
+            .await
+    }
+
+    /// [`update`](Self::update) whose `edit` also names settings to take out
+    /// of the file: dotted paths (`server.port`, `routing.cooldown`) of
+    /// settings or tables the edit put back to their default, which should
+    /// be left out of the file so the default applies — and a later change
+    /// of the default too — instead of being written as explicit values
+    /// (see [`merge::render_update_unsetting`]).
+    ///
+    /// Such a key is removed even when the configuration does not change (a
+    /// file that spells out a default), which then rewrites the file and
+    /// announces the configuration like any applied edit. Only when the file
+    /// is broken, missing or empty does an edit that changes nothing still
+    /// write nothing.
+    pub async fn update_unsetting<F>(&self, edit: F) -> Result<Arc<Config>, ConfigStoreError>
+    where
+        F: FnOnce(&mut Config) -> Result<Vec<String>, String> + Send,
+    {
         let guard = self.inner.write_lock.clone().lock_owned().await;
 
         let on_disk = match self.read_file().await {
@@ -554,12 +574,13 @@ impl ConfigStore {
 
         let current = self.current();
         let mut next = (*current).clone();
-        edit(&mut next).map_err(ConfigStoreError::Edit)?;
+        let unset = edit(&mut next).map_err(ConfigStoreError::Edit)?;
         let issues = next.validate();
         if !issues.is_empty() {
             return Err(ConfigStoreError::Invalid(issues));
         }
-        if next == *current {
+        let unchanged = next == *current;
+        if unchanged && (unset.is_empty() || disk_empty || disk_issues.is_some()) {
             return Ok(current);
         }
         if let Some(issues) = disk_issues {
@@ -574,7 +595,12 @@ impl ConfigStore {
         let base_text = base_text
             .or_else(|| self.inner.hashes.lock().applied_text.clone())
             .unwrap_or_else(|| Arc::from(""));
-        let rendered = merge::render_update(&base_text, &next).map_err(ConfigStoreError::Edit)?;
+        let rendered = merge::render_update_unsetting(&base_text, &next, &unset)
+            .map_err(ConfigStoreError::Edit)?;
+        if unchanged && rendered.strategy == Strategy::Unchanged {
+            // The keys to unset were not in the file to begin with.
+            return Ok(current);
+        }
         if disk_empty {
             tracing::warn!(
                 path = %self.inner.path.display(),
@@ -589,6 +615,7 @@ impl ConfigStore {
                  its comments and formatting were not preserved"
             );
         }
+        let next = as_written(next, &rendered.text);
         self.commit(guard, Arc::new(next), rendered.text).await
     }
 
@@ -824,6 +851,20 @@ impl ConfigStore {
 /// emptied document saved from such an editor is exactly those three bytes.
 fn is_blank(text: &str) -> bool {
     strip_bom(text).trim().is_empty()
+}
+
+/// `config` as reading back `text`, the file just rendered for it, gives
+/// it. The two are equal — the merge checks that — but maps compare without
+/// regard to order: a payload rule the edit left unchanged keeps the order
+/// its fields have in the file even when the edit listed them otherwise,
+/// and a field added to a rule goes at its end. Reading the text back makes
+/// the live configuration list them as the file does, so what an edit
+/// answers is what the next reload of the file would give.
+fn as_written(config: Config, text: &str) -> Config {
+    match toml::from_str::<Config>(strip_bom(text)) {
+        Ok(read) if read == config => read,
+        _ => config,
+    }
 }
 
 /// The file content as text.

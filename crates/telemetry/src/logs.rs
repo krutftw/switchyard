@@ -389,21 +389,44 @@ impl LogBuffer {
 
     /// Appends a line, assigning its `seq`, and returns the stored line.
     /// The oldest line is dropped when the buffer is full.
-    pub fn push(&self, mut line: LogLine) -> Arc<LogLine> {
-        let line = {
-            let mut ring = self.inner.ring.lock();
-            line.seq = ring.next_seq;
-            ring.next_seq += 1;
-            let line = Arc::new(line);
-            if ring.lines.len() >= ring.capacity {
-                ring.lines.pop_front();
-            }
-            ring.lines.push_back(Arc::clone(&line));
-            line
-        };
+    pub fn push(&self, line: LogLine) -> Arc<LogLine> {
+        self.push_then(line, |_| {})
+    }
+
+    /// [`push`](LogBuffer::push), and publishes the stored line on `bus` as
+    /// [`Event::Log`] — in `seq` order.
+    ///
+    /// Lines are pushed from every thread that logs. Were the line published
+    /// after the buffer's lock is let go, two threads could publish in the
+    /// opposite order of their sequence numbers, and a live tail that drops
+    /// what it has already seen (by `seq`) would lose the line that arrived
+    /// late. So the line is published while the lock is held: the bus never
+    /// blocks and runs no subscriber code, so the lock is held no longer
+    /// than an atomic hand-over.
+    pub fn push_and_publish(&self, line: LogLine, bus: &EventBus) -> Arc<LogLine> {
+        self.push_then(line, |stored| {
+            bus.publish(Event::Log(Arc::clone(stored)));
+        })
+    }
+
+    /// Stores `line` and hands it to `publish` and the file sink before the
+    /// buffer's lock is released, so that every consumer sees the lines in
+    /// `seq` order.
+    fn push_then(&self, mut line: LogLine, publish: impl FnOnce(&Arc<LogLine>)) -> Arc<LogLine> {
+        let mut ring = self.inner.ring.lock();
+        line.seq = ring.next_seq;
+        ring.next_seq += 1;
+        let line = Arc::new(line);
+        if ring.lines.len() >= ring.capacity {
+            ring.lines.pop_front();
+        }
+        ring.lines.push_back(Arc::clone(&line));
+        publish(&line);
+        // Queuing for the file only takes the sink's own short lock.
         if let Some(sink) = self.file_sink() {
             sink.enqueue(Arc::clone(&line));
         }
+        drop(ring);
         line
     }
 
@@ -711,8 +734,7 @@ where
             message: truncate_chars(&redact_text(&message), MAX_MESSAGE_CHARS),
             fields,
         };
-        let line = self.buffer.push(line);
-        self.bus.publish(Event::Log(line));
+        self.buffer.push_and_publish(line, &self.bus);
     }
 }
 
@@ -921,7 +943,7 @@ impl FileSink {
     }
 
     fn write_batch(&self, state: &mut SinkState, batch: &[Arc<LogLine>]) -> io::Result<()> {
-        fs::create_dir_all(&self.dir)?;
+        crate::private_files::create_dir_all(&self.dir)?;
         let part_limit = self.part_limit();
         let mut start = 0;
         while start < batch.len() {
@@ -966,7 +988,8 @@ impl FileSink {
             state.part += 1;
             path = self.dir.join(log_file_name(day, state.part));
         }
-        let mut file = OpenOptions::new().create(true).append(true).open(&path)?;
+        let mut file =
+            crate::private_files::open(OpenOptions::new().create(true).append(true), &path)?;
         file.write_all(text.as_bytes())?;
         file.flush()
     }
@@ -1491,6 +1514,83 @@ mod tests {
             other => panic!("unexpected event {other:?}"),
         }
         assert!(matches!(rx.try_recv(), Err(TryRecvError::Empty)));
+    }
+
+    /// Regression: the layer published a line after letting go of the
+    /// buffer's lock, so threads logging at once could publish out of `seq`
+    /// order, and the live tail — which skips lines it has already seen by
+    /// `seq` — lost the line that came late.
+    #[test]
+    fn lines_logged_on_many_threads_are_published_in_seq_order() {
+        const THREADS: usize = 8;
+        const LINES: usize = 400;
+        let buffer = LogBuffer::new(THREADS * LINES);
+        // Large enough that no subscriber lags: every line must arrive.
+        let bus = EventBus::new(THREADS * LINES + 16);
+        let mut rx = bus.subscribe();
+        let dispatch = tracing::Dispatch::new(
+            Registry::default().with(capture_layer(buffer.clone(), bus.clone())),
+        );
+        let start = std::sync::Barrier::new(THREADS);
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let dispatch = dispatch.clone();
+                let start = &start;
+                scope.spawn(move || {
+                    tracing::dispatcher::with_default(&dispatch, || {
+                        start.wait();
+                        for n in 0..LINES {
+                            tracing::info!(thread, n, "line");
+                        }
+                    });
+                });
+            }
+        });
+        let mut seqs = Vec::with_capacity(THREADS * LINES);
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                Event::Log(line) => seqs.push(line.seq),
+                other => panic!("unexpected event {other:?}"),
+            }
+        }
+        assert_eq!(seqs.len(), THREADS * LINES);
+        let expected: Vec<u64> = (1..=(THREADS * LINES) as u64).collect();
+        assert_eq!(seqs, expected, "published out of seq order");
+    }
+
+    /// The same without the layer: concurrent pushers through
+    /// [`LogBuffer::push_and_publish`] keep the bus in `seq` order, and the
+    /// file sink gets the lines in that order too.
+    #[test]
+    fn push_and_publish_keeps_seq_order_under_concurrency() {
+        const THREADS: u64 = 6;
+        const LINES: u64 = 500;
+        let dir = tempfile::tempdir().unwrap();
+        let buffer = LogBuffer::new(10);
+        let sink = Arc::new(FileSink::new(dir.path(), 0));
+        buffer.set_file_sink(Some(Arc::clone(&sink)));
+        let bus = EventBus::new((THREADS * LINES) as usize + 16);
+        let mut rx = bus.subscribe();
+        std::thread::scope(|scope| {
+            for thread in 0..THREADS {
+                let (buffer, bus) = (&buffer, &bus);
+                scope.spawn(move || {
+                    for n in 0..LINES {
+                        buffer.push_and_publish(line(T0, "info", &format!("t{thread} n{n}")), bus);
+                    }
+                });
+            }
+        });
+        let mut previous = 0;
+        let mut count = 0;
+        while let Ok(Event::Log(line)) = rx.try_recv() {
+            assert_eq!(line.seq, previous + 1);
+            previous = line.seq;
+            count += 1;
+        }
+        assert_eq!(count, THREADS * LINES);
+        let queued: Vec<u64> = sink.pending.lock().iter().map(|line| line.seq).collect();
+        assert_eq!(queued, (1..=THREADS * LINES).collect::<Vec<u64>>());
     }
 
     #[test]

@@ -919,11 +919,10 @@ impl Config {
         if self.server.data_dir.trim().is_empty() {
             issue("server.data_dir".into(), "must not be empty");
         }
-        if is_empty_reference(&self.admin.secret) {
-            issue(
-                "admin.secret".into(),
-                "names no environment variable after `env:`",
-            );
+        if let Some(message) = empty_reference_issue(&self.admin.secret)
+            .or_else(|| header_value_issue(&self.admin.secret))
+        {
+            issue("admin.secret".into(), message);
         }
         if self.routing.cooldown.rate_limit_max_secs < self.routing.cooldown.rate_limit_base_secs {
             issue(
@@ -966,11 +965,8 @@ impl Config {
             let k = key.key.trim();
             if k.is_empty() {
                 issue(format!("auth.keys[{i}].key"), "must not be empty");
-            } else if is_empty_reference(k) {
-                issue(
-                    format!("auth.keys[{i}].key"),
-                    "names no environment variable after `env:`",
-                );
+            } else if let Some(message) = empty_reference_issue(k) {
+                issue(format!("auth.keys[{i}].key"), message);
             } else if !seen_keys.insert(k.to_string()) {
                 issue(format!("auth.keys[{i}].key"), "duplicate key");
             }
@@ -1042,11 +1038,8 @@ impl Config {
             let mut seen_secrets = HashSet::new();
             for (j, k) in p.api_keys.iter().enumerate() {
                 let k = k.trim();
-                if is_empty_reference(k) {
-                    issue(
-                        format!("{path}.api_keys[{j}]"),
-                        "names no environment variable after `env:`",
-                    );
+                if let Some(message) = empty_reference_issue(k) {
+                    issue(format!("{path}.api_keys[{j}]"), message);
                 } else if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
                     issue(
                         format!("{path}.api_keys[{j}]"),
@@ -1056,11 +1049,8 @@ impl Config {
             }
             for (j, c) in p.credentials.iter().enumerate() {
                 let k = c.api_key.trim();
-                if is_empty_reference(k) {
-                    issue(
-                        format!("{path}.credentials[{j}].api_key"),
-                        "names no environment variable after `env:`",
-                    );
+                if let Some(message) = empty_reference_issue(k) {
+                    issue(format!("{path}.credentials[{j}].api_key"), message);
                 } else if !k.is_empty() && !seen_secrets.insert(k.to_string()) {
                     issue(
                         format!("{path}.credentials[{j}].api_key"),
@@ -1176,11 +1166,27 @@ impl Config {
                         "needs at least one model pattern",
                     );
                 }
-                if is_filter && r.remove.is_empty() {
-                    issue(format!("{section}[{i}].remove"), "needs at least one path");
-                }
-                if !is_filter && r.set.is_empty() {
-                    issue(format!("{section}[{i}].set"), "needs at least one field");
+                // Only the field of the rule's own section is ever read, so
+                // only its paths are checked. A key of `set` is named after
+                // `set.` exactly as written, dots and all.
+                if is_filter {
+                    if r.remove.is_empty() {
+                        issue(format!("{section}[{i}].remove"), "needs at least one path");
+                    }
+                    for (j, path) in r.remove.iter().enumerate() {
+                        if let Some(message) = payload_path_issue(path) {
+                            issue(format!("{section}[{i}].remove[{j}]"), message);
+                        }
+                    }
+                } else {
+                    if r.set.is_empty() {
+                        issue(format!("{section}[{i}].set"), "needs at least one field");
+                    }
+                    for path in r.set.keys() {
+                        if let Some(message) = payload_path_issue(path) {
+                            issue(format!("{section}[{i}].set.{path}"), message);
+                        }
+                    }
                 }
             }
         }
@@ -1189,12 +1195,19 @@ impl Config {
             if p.model.trim().is_empty() {
                 issue(format!("pricing[{i}].model"), "must not be empty");
             }
-            let prices = [Some(p.input), Some(p.output), p.cache_read, p.cache_write];
-            if prices.iter().flatten().any(|v| !v.is_finite() || *v < 0.0) {
-                issue(
-                    format!("pricing[{i}]"),
-                    "prices must be numbers of 0 or more",
-                );
+            let prices = [
+                ("input", Some(p.input)),
+                ("output", Some(p.output)),
+                ("cache_read", p.cache_read),
+                ("cache_write", p.cache_write),
+            ];
+            for (field, price) in prices {
+                if price.is_some_and(|v| !v.is_finite() || v < 0.0) {
+                    issue(
+                        format!("pricing[{i}].{field}"),
+                        "must be a number of 0 or more (USD per million tokens)",
+                    );
+                }
             }
         }
 
@@ -1299,16 +1312,91 @@ fn is_valid_header_name(name: &str) -> bool {
         })
 }
 
-/// A secret reference (`env:` / `${}`) that names no variable.
-fn is_empty_reference(value: &str) -> bool {
+/// The issue of a secret reference that names no variable (`env:`, `${}`),
+/// worded for the form it is written in; `None` for anything else.
+pub fn empty_reference_issue(value: &str) -> Option<&'static str> {
     let v = value.trim();
     match v.strip_prefix("env:") {
-        Some(name) => name.trim().is_empty(),
+        Some(name) => name
+            .trim()
+            .is_empty()
+            .then_some("names no environment variable after `env:`"),
         None => v
             .strip_prefix("${")
             .and_then(|r| r.strip_suffix('}'))
-            .is_some_and(|name| name.trim().is_empty()),
+            .filter(|name| name.trim().is_empty())
+            .map(|_| "names no environment variable between `${` and `}`"),
     }
+}
+
+/// What makes a value unfit for an HTTP header — where the admin secret
+/// travels (`Authorization: Bearer …`) — as the issue to report: spaces or
+/// line breaks around it, which a header cannot keep, or control
+/// characters inside it, which a header cannot carry at all.
+pub fn header_value_issue(value: &str) -> Option<&'static str> {
+    if value.chars().any(char::is_control) {
+        Some(
+            "must not contain control characters such as tabs or line breaks: an HTTP header \
+             cannot carry them",
+        )
+    } else if value.trim() != value {
+        Some("must not start or end with a space: an HTTP header cannot carry it")
+    } else {
+        None
+    }
+}
+
+/// The issue of a payload rule path (a key of `set`, an entry of `remove`)
+/// that can never address a field of a request body; `None` for a usable
+/// path.
+///
+/// The grammar is the gateway's (see `switchyard_translate::jsonpath`):
+/// segments separated by `.`, `\.` a literal dot and `\\` a literal
+/// backslash inside a segment, a segment of digits an array index when the
+/// value it is applied to is an array. There are no wildcards: `*` is a key
+/// like any other. Refused are the paths the gateway would ignore (an empty
+/// one) and those that only match a key no request body has — an empty key
+/// (`a..b`, `a.`, `.a`) or one with spaces or control characters in it —
+/// which is how a typo looks.
+pub fn payload_path_issue(path: &str) -> Option<&'static str> {
+    if path.trim().is_empty() {
+        return Some("is empty: name the field, such as `temperature` or `reasoning.effort`");
+    }
+    if path.trim() != path {
+        return Some("must not start or end with a space");
+    }
+    let mut segments: Vec<String> = vec![String::new()];
+    let mut chars = path.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if matches!(chars.peek(), Some('.' | '\\')) => {
+                if let (Some(escaped), Some(segment)) = (chars.next(), segments.last_mut()) {
+                    segment.push(escaped);
+                }
+            }
+            '.' => segments.push(String::new()),
+            other => {
+                if let Some(segment) = segments.last_mut() {
+                    segment.push(other);
+                }
+            }
+        }
+    }
+    if segments.iter().any(String::is_empty) {
+        return Some(
+            "has an empty part (two dots in a row, or a dot at the start or end); write a dot \
+             inside a field name as `\\.`",
+        );
+    }
+    if segments
+        .iter()
+        .any(|segment| segment.chars().any(|c| c.is_whitespace() || c.is_control()))
+    {
+        return Some(
+            "must not contain spaces or control characters; check the field name for a typo",
+        );
+    }
+    None
 }
 
 /// Resolves a secret value: `env:NAME` and `${NAME}` read the environment
@@ -1606,6 +1694,27 @@ targets = ["loop"]
             ]
         );
         assert!(issue_paths("[admin]\nsecret = \"env:REAL_NAME\"\n").is_empty());
+
+        // Regression (A2-3): the message is worded for the form written.
+        let message = |text: &str| match Config::from_toml(text) {
+            Err(ConfigError::Invalid(issues)) => issues[0].message.clone(),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            message("[admin]\nsecret = \"env:\"\n"),
+            "names no environment variable after `env:`"
+        );
+        assert_eq!(
+            message("[admin]\nsecret = \"${}\"\n"),
+            "names no environment variable between `${` and `}`"
+        );
+        assert_eq!(
+            message("[[auth.keys]]\nkey = \"${ }\"\n"),
+            "names no environment variable between `${` and `}`"
+        );
+        assert_eq!(empty_reference_issue("env:NAME"), None);
+        assert_eq!(empty_reference_issue("${NAME}"), None);
+        assert_eq!(empty_reference_issue("literal"), None);
     }
 
     #[test]
@@ -1682,18 +1791,144 @@ targets = ["loop"]
     fn prices_must_be_finite_and_not_negative() {
         let price = |body: &str| issue_paths(&format!("[[pricing]]\nmodel = \"m\"\n{body}"));
         assert!(price("input = 1.0\noutput = 2.0\ncache_read = 0.0\n").is_empty());
+        // Regression (A2-7): each bad price is named by its own field.
         assert_eq!(
             price("input = nan\noutput = 1.0\n"),
-            vec!["pricing[0]".to_string()]
+            vec!["pricing[0].input".to_string()]
         );
         assert_eq!(
             price("input = 1.0\noutput = inf\n"),
-            vec!["pricing[0]".to_string()]
+            vec!["pricing[0].output".to_string()]
         );
         assert_eq!(
             price("input = 1.0\noutput = 1.0\ncache_write = -0.5\n"),
-            vec!["pricing[0]".to_string()]
+            vec!["pricing[0].cache_write".to_string()]
         );
+        assert_eq!(
+            price("input = -1.0\noutput = 1.0\ncache_read = -inf\n"),
+            vec![
+                "pricing[0].input".to_string(),
+                "pricing[0].cache_read".to_string()
+            ]
+        );
+    }
+
+    /// Regression (A2-6): payload rule paths that can never address a field
+    /// are refused at the path itself; the gateway's grammar (indexes,
+    /// escapes, no wildcards) is accepted as it is.
+    #[test]
+    fn payload_rule_paths_are_checked() {
+        for good in [
+            "temperature",
+            "messages.0.role",
+            "metadata.trace\\.id",
+            "generationConfig.thinkingConfig.thinkingBudget",
+            "a\\\\b",
+            "*",
+            "0",
+        ] {
+            assert_eq!(payload_path_issue(good), None, "{good:?}");
+        }
+        for bad in [
+            "",
+            " ",
+            "a..b",
+            "a.",
+            ".a",
+            " a",
+            "a ",
+            "a. b",
+            "a b",
+            "a\tb",
+            "a.\\.\u{7}",
+        ] {
+            assert!(payload_path_issue(bad).is_some(), "{bad:?}");
+        }
+        assert!(payload_path_issue("a..b").unwrap().contains("empty part"));
+        assert!(payload_path_issue("").unwrap().starts_with("is empty"));
+
+        let text = r#"
+[[payload.default]]
+models = ["*"]
+set = { "ok" = 1, "a..b" = 2, " padded" = 3 }
+
+[[payload.override]]
+models = ["*"]
+set = { "reasoning.effort" = "low", "" = 1 }
+remove = ["not read here.."]
+
+[[payload.filter]]
+models = ["*"]
+remove = ["user", "metadata.", "has space"]
+"#;
+        assert_eq!(
+            issue_paths(text),
+            vec![
+                "payload.default[0].set.a..b".to_string(),
+                "payload.default[0].set. padded".to_string(),
+                "payload.override[0].set.".to_string(),
+                "payload.filter[0].remove[1]".to_string(),
+                "payload.filter[0].remove[2]".to_string(),
+            ]
+        );
+    }
+
+    /// Regression (A2-4): an admin secret a header cannot carry is refused.
+    #[test]
+    fn admin_secrets_must_fit_in_a_header() {
+        assert!(issue_paths("[admin]\nsecret = \"plain-secret-123\"\n").is_empty());
+        for bad in [
+            " leading",
+            "trailing ",
+            "line\\nbreak",
+            "tab\\there",
+            "\\u0000nul",
+            "ends\\r\\n",
+        ] {
+            let text = format!("[admin]\nsecret = \"{bad}\"\n");
+            let Err(ConfigError::Invalid(issues)) = Config::from_toml(&text) else {
+                panic!("{bad:?} should be refused");
+            };
+            assert_eq!(issues.len(), 1, "{issues:?}");
+            assert_eq!(issues[0].path, "admin.secret");
+            assert!(
+                issues[0].message.contains("HTTP header"),
+                "{bad:?}: {}",
+                issues[0].message
+            );
+        }
+    }
+
+    /// Regression (A2-8): the fields a payload rule sets, and the keys of
+    /// the objects it sets them to, keep the order of the file.
+    #[test]
+    fn payload_set_keeps_the_order_of_the_file() {
+        let c = Config::from_toml(
+            "[[payload.override]]\nmodels = [\"*\"]\n\
+             set = { \"zeta\" = 1, \"alpha\" = { \"y\" = 1, \"b\" = 2 }, \"mid\" = 3 }\n\n\
+             [[payload.default]]\nmodels = [\"*\"]\n\
+             [payload.default.set]\nzz = 1\naa = 2\n",
+        )
+        .unwrap();
+        let keys: Vec<&str> = c.payload.overrides[0]
+            .set
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["zeta", "alpha", "mid"]);
+        let inner: Vec<&str> = c.payload.overrides[0].set["alpha"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(inner, ["y", "b"]);
+        let keys: Vec<&str> = c.payload.default[0]
+            .set
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["zz", "aa"]);
     }
 
     #[test]

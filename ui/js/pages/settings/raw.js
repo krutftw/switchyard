@@ -15,7 +15,7 @@ import { formatDateTime, plural, sentence } from '../../lib/format.js';
 import { useAsync, useResource, useUid } from '../../lib/hooks.js';
 import { liveState, useLive, useLiveGap } from '../../lib/live.js';
 import { useStore } from '../../lib/store.js';
-import { SaveBar, confirmDiscard, expectSecret, focusAfterNotice, forgetSecret, isSecretReference, secretSettled, useSaveHotkey, useUnsavedGuard } from './common.js';
+import { SaveBar, confirmDiscard, deepEqual, expectSecret, focusAfterNotice, forgetSecret, getPath, isSecretReference, overrideNote, secretSettled, useSaveHotkey, useUnsavedGuard } from './common.js';
 
 // Asked once per page load, not once per visit to the tab.
 let revealed = false;
@@ -355,8 +355,11 @@ const REFUSED_POLL_MS = 5000;
  *           for a save on another tab that was refused because of the
  *           file), else null
  * onValid   called with that refusal when the file on disk is valid again
+ * config    the GET /config view in effect before a save, to tell which
+ *           settings the command line fixes were changed by it
+ * listen    GET /status listen: the address in use
  */
-function RawEditor({ onConfig, refused = null, onValid }) {
+function RawEditor({ onConfig, refused = null, onValid, config = null, listen = null }) {
   const liveOpen = useStore(liveState, (s) => s.status === 'open');
   const file = useResource('/config/raw', { pollMs: liveOpen ? 0 : 20_000 });
   useLive('config.reloaded', () => secretSettled().then(file.refresh));
@@ -522,6 +525,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
 
   const runSave = async () => {
     const saved = text;
+    const previous = config?.config;
     const before = adminSecretIn(disk ?? base);
     const after = adminSecretIn(saved);
     const change = after !== before && typeof after === 'string' && after !== '' && !isSecretReference(after) ? expectSecret(after) : null;
@@ -542,10 +546,17 @@ function RawEditor({ onConfig, refused = null, onValid }) {
     setReport(null);
     file.refresh();
     const notes = [];
-    if (result.restart_required?.length > 0) notes.push(`Restart the gateway to apply ${result.restart_required.join(', ')}.`);
+    // A setting the command line fixes (--host, --port) is not applied by a
+    // restart with the same command line: say so for one this save changed.
+    const overrides = result.command_line_overrides ?? [];
+    const restart = (result.restart_required ?? []).filter((setting) => !overrides.includes(setting));
+    const overridden = previous ? overrides.filter((setting) => !deepEqual(getPath(previous, setting), getPath(result.config, setting))) : [];
+    if (restart.length > 0) notes.push(`Restart the gateway to apply ${restart.join(', ')}.`);
+    const fixed = overrideNote(overridden, listen);
+    if (fixed) notes.push(fixed);
     if (change) notes.push(accepted ? 'This browser stays signed in with the new admin secret.' : 'SWITCHYARD_ADMIN_SECRET overrides the secret in the file, so the current secret stays in effect.');
     const description = notes.join(' ') || 'The gateway runs on the new configuration.';
-    if (result.restart_required?.length > 0) toast.warning('switchyard.toml saved', { description });
+    if (restart.length > 0 || overridden.length > 0) toast.warning('switchyard.toml saved', { description });
     else toast.success('switchyard.toml saved', { description });
   };
 
@@ -685,7 +696,7 @@ function RawEditor({ onConfig, refused = null, onValid }) {
   `;
 }
 
-export function RawTab({ onConfig, refused, onValid }) {
+export function RawTab({ onConfig, refused, onValid, config, listen }) {
   const [shown, setShown] = useState(revealed);
   if (!shown) {
     return html`
@@ -708,5 +719,5 @@ export function RawTab({ onConfig, refused, onValid }) {
       <//>
     `;
   }
-  return html`<${RawEditor} onConfig=${onConfig} refused=${refused} onValid=${onValid} />`;
+  return html`<${RawEditor} onConfig=${onConfig} refused=${refused} onValid=${onValid} config=${config} listen=${listen} />`;
 }

@@ -471,6 +471,83 @@ hide_targets = true
     assert_eq!(value[0]["ignored"], false);
 }
 
+/// An alias whose name is, ignoring case, that of a model a provider serves
+/// says so (`shadows_model`), so that a dashboard need not parse the
+/// warning sentence to know which names are hidden. A model of a disabled
+/// provider is served by nobody, and an ignored alias hides nothing.
+#[test]
+fn an_alias_says_whether_it_hides_a_served_model() {
+    let f = fixture(
+        r#"
+[[providers]]
+name = "openai"
+kind = "openai"
+api_keys = ["sk-one-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "gpt-5.5"
+
+[[providers.models]]
+id = "Large"
+
+[[providers]]
+name = "parked"
+kind = "anthropic"
+enabled = false
+api_keys = ["sk-ant-aaaaaaaaaaaaaaaaaaaa"]
+
+[[providers.models]]
+id = "claude-opus-4-6"
+
+[[aliases]]
+name = "gpt-5.5"
+targets = ["Large"]
+
+# Stands in front of the model of its own name, pinning a depth on it.
+[[aliases]]
+name = "LARGE"
+targets = ["Large(high)"]
+
+[[aliases]]
+name = "claude-opus-4-6"
+targets = ["gpt-5.5"]
+
+[[aliases]]
+name = "fast"
+targets = ["gpt-5.5"]
+
+[[aliases]]
+name = "Gpt-5.5-dead"
+targets = ["nothing"]
+"#,
+    );
+    let table = f.scheduler.models();
+    let flags: Vec<(&str, bool, bool)> = table
+        .iter()
+        .filter(|m| m.alias_targets.is_some())
+        .map(|m| (m.name.as_str(), m.shadows_model, m.ignored))
+        .collect();
+    assert_eq!(
+        flags,
+        vec![
+            ("claude-opus-4-6", false, false),
+            ("fast", false, false),
+            ("gpt-5.5", true, false),
+            ("Gpt-5.5-dead", false, true),
+            ("LARGE", true, false),
+        ]
+    );
+    // Models never shadow anything; the field is always there.
+    let value = serde_json::to_value(&table).unwrap();
+    for entry in value.as_array().unwrap() {
+        let is_alias = entry.get("alias_targets").is_some();
+        assert!(entry["shadows_model"].is_boolean(), "{entry}");
+        if !is_alias {
+            assert_eq!(entry["shadows_model"], false, "{entry}");
+        }
+    }
+}
+
 /// Regression: routes carried no priority, so a dashboard had to join the
 /// provider list to tell which routes take the requests.
 #[test]

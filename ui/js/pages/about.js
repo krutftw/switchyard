@@ -316,8 +316,11 @@ function ConnectPanel({ status, models }) {
   const [addrParam] = useQueryParam('addr', 'browser');
   // A choice made here also names this section in the URL, so the link that
   // reproduces the snippets lands on them. Defaults stay out of the URL.
-  const choose = (key, value, fallbackValue) => setQuery({ [key]: value === fallbackValue ? null : value, section: 'connect' });
-  const setClient = (value) => choose('client', value, CLIENTS[0].id);
+  const choose = (key, value, fallbackValue, options) => setQuery({ [key]: value === fallbackValue ? null : value, section: 'connect' }, options);
+  // The client tab is a step Back returns to; the other choices replace.
+  const setClient = (value) => {
+    if (value !== client) choose('client', value, CLIENTS[0].id, { replace: false });
+  };
   const setAddr = (value) => choose('addr', value, 'browser');
   const [shellPref, setShell] = useLocalStorage('about.shell', null);
 

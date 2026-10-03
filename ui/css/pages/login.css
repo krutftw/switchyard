@@ -57,6 +57,11 @@
   letter-spacing: -0.015em;
 }
 
+/* The lockout countdown, set off from the notice text around it. */
+.login-countdown {
+  color: var(--text);
+}
+
 .login-help {
   padding-top: var(--space-4);
   border-top: var(--hairline) solid var(--rule);

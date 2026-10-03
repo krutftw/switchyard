@@ -99,16 +99,18 @@ fn parse_with(text: &str, scalars: Scalars) -> Result<Value, YamlError> {
         ..Builder::default()
     };
     let mut parser = Parser::new_from_str(text);
-    if let Err(error) = parser.load(&mut builder, false) {
-        // A problem the builder found comes first: the parser may have
-        // stumbled over what followed it.
-        if let Some(error) = builder.error {
-            return Err(error);
-        }
-        return Err(YamlError {
+    // The parser's load helper recursively walks collections even after a
+    // receiver rejects one. Drive events directly, stopping at our limits.
+    while !builder.done && builder.error.is_none() {
+        let (event, mark) = parser.next_token().map_err(|error| YamlError {
             line: Some(error.marker().line()),
             message: scan_message(error.info()),
-        });
+        })?;
+        let end = matches!(event, Event::StreamEnd);
+        builder.on_event(event, mark);
+        if end {
+            break;
+        }
     }
     if let Some(error) = builder.error {
         return Err(error);
@@ -420,11 +422,15 @@ fn too_deep() -> String {
 }
 
 fn shown_key(key: &str) -> String {
-    if key.chars().count() <= LONGEST_KEY_SHOWN {
+    let shown = if key.chars().count() <= LONGEST_KEY_SHOWN {
         key.to_string()
     } else {
         mask_secret(key)
-    }
+    };
+    shown
+        .chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// Weighs a finished value. Its depth is bounded by [`MAX_DEPTH`], which is
@@ -836,6 +842,18 @@ quoted:
         assert!(error.message.contains("levels deep"), "{error}");
         let fine = format!("{}1{}", "[".repeat(30), "]".repeat(30));
         assert!(parse(&fine).is_ok());
+        let block = format!("{}value", "- ".repeat(MAX_DEPTH + 1));
+        assert!(parse(&block).unwrap_err().message.contains("levels deep"));
+    }
+
+    #[test]
+    fn displayed_mapping_keys_have_no_control_characters() {
+        assert_eq!(shown_key("line\nname\t"), "line?name?");
+        assert!(
+            !shown_key(&format!("\u{1b}{}\u{7}", "long".repeat(20)))
+                .chars()
+                .any(char::is_control)
+        );
     }
 
     /// Each line nests the previous one thirty levels further down: no

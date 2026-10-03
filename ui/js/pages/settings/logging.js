@@ -5,17 +5,20 @@ import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { Notice, Panel } from '../../components/index.js';
 import { NumberRow, OptionRow, Rows, SelectRow, SettingsForm, SwitchRow, useEdits, useSettingsSave } from './common.js';
 
-// What each level adds, as the gateway logs it: every request and every
-// failed upstream call is a debug line (switchyard_server::app "request",
-// switchyard_gateway::generate "request failed"); info has start-up,
-// configuration changes and model discovery; trace adds the HTTP client's
-// own lines. The Requests page lists every request at any level. The labels
-// stay short enough for the closed select (about 34 characters).
+// What each level adds, as the gateway logs it: every request is a debug
+// line (switchyard_server::app "request"); a request that fails because of
+// the gateway or an upstream (5xx, an upstream-caused 429) logs its final
+// "request failed" line at warn, one the client caused (auth, invalid
+// request, unknown model, its own rate limit) at debug
+// (switchyard_gateway::generate); info has start-up, configuration changes
+// and model discovery; trace adds the HTTP client's own lines. The Requests
+// page lists every request at any level. Labels and description are the
+// wording agreed for the whole dashboard (stage 7 brief, C4).
 const LEVELS = [
   { value: 'trace', label: 'Trace: also HTTP internals, noisy' },
-  { value: 'debug', label: 'Debug: every request and failure' },
-  { value: 'info', label: 'Info: start-up and config changes' },
-  { value: 'warn', label: 'Warn: warnings and errors only' },
+  { value: 'debug', label: 'Debug: also every request' },
+  { value: 'info', label: 'Info: start-up, config changes, failures' },
+  { value: 'warn', label: 'Warn: failures and warnings only' },
   { value: 'error', label: 'Error: internal errors only' },
 ];
 
@@ -44,7 +47,7 @@ export function LoggingTab({ config, status, onDiskInvalid }) {
     <${SettingsForm} form=${form} saver=${saver} what="logging and usage settings">
       <${Panel} title="Application log" description="What the gateway says about its own work. Shown live on the Logs page.">
         <${Rows}>
-          <${SelectRow} form=${form} issues=${issues} path="logging.level" label="Level" options=${LEVELS} description=${html`Lines below this level are dropped. Takes effect at once. Requests and failed upstream calls are logged at Debug; the <a href="#/requests">Requests</a> page lists every request at any level.`} />
+          <${SelectRow} form=${form} issues=${issues} path="logging.level" label="Level" options=${LEVELS} description=${html`Requests that fail because of the gateway or a provider are logged at Warn; every request is logged at Debug. The <a href="#/requests">Requests</a> page lists every request at any level.`} />
           <${SwitchRow}
             form=${form}
             issues=${issues}

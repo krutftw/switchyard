@@ -502,6 +502,12 @@ pub const MAX_PAGE_SIZE: usize = 500;
 /// string: every field is optional, empty values count as absent, and an
 /// unparseable `limit` or `status` is ignored rather than rejected.
 ///
+/// Two values are refused instead, because guessing would answer with the
+/// wrong list: a `since` that is not a whole number fails deserialisation,
+/// and a `before` that is not a cursor makes
+/// [`UsageStore::try_requests`](crate::UsageStore::try_requests) fail with
+/// [`BadCursor`].
+///
 /// Only **finished** requests are listed: a record exists from the moment a
 /// request ends. Requests still in flight are announced on the event bus
 /// (`request.started`) and counted by the gauges, but are in no list and
@@ -518,14 +524,27 @@ pub struct RequestQuery {
     /// request id, or a bare unix-millisecond timestamp.
     #[serde(deserialize_with = "lenient::opt_string")]
     pub before: Option<String>,
+    /// Only requests that started at or after this instant, unix
+    /// milliseconds. A filter, not a cursor: `total` counts only those
+    /// requests. A value that is not a whole number fails deserialisation.
+    #[serde(deserialize_with = "lenient::opt_whole_ms")]
+    pub since: Option<i64>,
     /// Exact model name (requested, client-facing or upstream),
     /// case-insensitive. `unknown` selects the requests that have no model
     /// (refused before one could be read from the body), which is the name
     /// the summaries group them under ([`crate::UNKNOWN`]).
     #[serde(deserialize_with = "lenient::opt_string")]
     pub model: Option<String>,
-    /// Exact provider name, case-insensitive; `unknown` selects requests
-    /// that failed before routing.
+    /// Exact client-facing model name, case-insensitive, compared with
+    /// [`RequestRecord::model_name`] alone — the name `by_model` of the
+    /// summary and `group_by=model` of the time series count a request
+    /// under — so that a row of those opens exactly its requests. `unknown`
+    /// selects the requests without a model.
+    #[serde(deserialize_with = "lenient::opt_string")]
+    pub client_model: Option<String>,
+    /// Exact provider name, case-insensitive; `unknown` selects the requests
+    /// no provider served: they failed before routing, or every credential
+    /// of the model was cooling down.
     #[serde(deserialize_with = "lenient::opt_string")]
     pub provider: Option<String>,
     /// Client key name or id, case-insensitive; `anonymous` selects requests
@@ -548,6 +567,25 @@ impl RequestQuery {
             .clamp(1, MAX_PAGE_SIZE)
     }
 }
+
+/// A `before` of [`RequestQuery`] that is not a cursor: neither
+/// `<started_at>:<id>`, nor a request id the list knows or that carries its
+/// creation time (a UUIDv7), nor a unix-millisecond timestamp. Answering it
+/// with the first page would make a paging client loop, and with an empty
+/// page would hide the mistake, so it is refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BadCursor;
+
+impl fmt::Display for BadCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(
+            "is not a cursor: pass the `next_before` of a previous page, a request id or a \
+             unix-millisecond timestamp",
+        )
+    }
+}
+
+impl std::error::Error for BadCursor {}
 
 /// One page of the request list, newest first.
 ///
@@ -645,6 +683,24 @@ pub(crate) mod lenient {
         d: D,
     ) -> Result<Option<StatusFilter>, D::Error> {
         Ok(opt_string(d)?.and_then(|text| text.parse::<StatusFilter>().ok()))
+    }
+
+    /// What [`opt_whole_ms`] says about a value it refuses: a fragment that
+    /// reads after the parameter's name, without the value (which is
+    /// echoed nowhere).
+    pub(crate) const NOT_WHOLE_MS: &str = "must be a whole number of unix milliseconds";
+
+    /// A unix-millisecond instant. Not lenient: empty is absent, but
+    /// anything else that is not a whole number is an error, because
+    /// ignoring a time filter would answer with a different list.
+    pub(crate) fn opt_whole_ms<'de, D: Deserializer<'de>>(d: D) -> Result<Option<i64>, D::Error> {
+        match opt_string(d)? {
+            None => Ok(None),
+            Some(text) => text
+                .parse::<i64>()
+                .map(Some)
+                .map_err(|_| de::Error::custom(NOT_WHOLE_MS)),
+        }
     }
 }
 
@@ -861,6 +917,34 @@ mod tests {
         assert_eq!(q.page_size(), DEFAULT_PAGE_SIZE);
         let q: RequestQuery = serde_json::from_value(json!({})).unwrap();
         assert_eq!(q, RequestQuery::default());
+    }
+
+    /// `since` is a time filter: ignoring a value that cannot be read would
+    /// answer with a longer list than was asked for, so it is refused.
+    #[test]
+    fn since_must_be_a_whole_number_and_client_model_is_read() {
+        let q: RequestQuery = serde_json::from_value(json!({
+            "since": "1790942400000", "client_model": " Mock-Echo "
+        }))
+        .unwrap();
+        assert_eq!(q.since, Some(1_790_942_400_000));
+        assert_eq!(q.client_model.as_deref(), Some("Mock-Echo"));
+        let q: RequestQuery = serde_json::from_value(json!({"since": -5})).unwrap();
+        assert_eq!(q.since, Some(-5));
+        let q: RequestQuery = serde_json::from_value(json!({"since": ""})).unwrap();
+        assert_eq!(q.since, None);
+        for bad in [
+            json!("yesterday"),
+            json!("1.5"),
+            json!(1.5),
+            json!("99999999999999999999"),
+        ] {
+            let error = serde_json::from_value::<RequestQuery>(json!({ "since": bad }))
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(lenient::NOT_WHOLE_MS), "{bad}: {error}");
+            assert!(!error.contains("yesterday"), "{error}");
+        }
     }
 
     #[test]

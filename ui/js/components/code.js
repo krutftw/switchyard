@@ -17,6 +17,8 @@ import { CopyButton, IconButton } from './button.js';
 // Above this size colouring is skipped: tens of thousands of spans cost more
 // than they are worth.
 const HIGHLIGHT_LIMIT = 200_000;
+const FORMAT_DEPTH_LIMIT = 64;
+const FORMAT_OUTPUT_LIMIT = 1_000_000;
 
 // A JSON string, written as an unrolled loop: the obvious (?:\\.|[^"\\])*
 // overflows the regex engine's stack on a string of a few megabytes, and a
@@ -28,6 +30,15 @@ const JSON_TOKEN = new RegExp(`(${STRING})(\\s*:)?|\\b(true|false|null)\\b|(${NU
 
 /** Split JSON text into coloured spans and plain strings. Exported for tests. */
 export function highlightJson(text) {
+  // Only lex complete, bounded JSON. Partial tool arguments and truncated
+  // captures are plain text; a failed string must never be retried at each
+  // later quote by the regular expression.
+  if (text.length > HIGHLIGHT_LIMIT) return [text];
+  try {
+    JSON.parse(text);
+  } catch {
+    return [text];
+  }
   const out = [];
   let last = 0;
   JSON_TOKEN.lastIndex = 0;
@@ -58,7 +69,8 @@ const JSON_LEX = new RegExp(`${STRING}|${NUMBER}|true|false|null|[{}[\\],:]`, 'g
 
 /**
  * Re-indent JSON text (two spaces, like JSON.stringify) without changing a
- * single token. Returns null when `text` is not valid JSON.
+ * single token. Returns null when `text` is not valid JSON or exceeds the
+ * formatting size/depth budget; the caller then shows the original text.
  *
  * It does not go through JSON.parse + JSON.stringify, because that rewrites
  * what was on the wire: integers above 2^53 are rounded (a 64-bit `seed`),
@@ -67,6 +79,7 @@ const JSON_LEX = new RegExp(`${STRING}|${NUMBER}|true|false|null|[{}[\\],:]`, 'g
  * text is the point. Exported for tests.
  */
 export function formatJson(text) {
+  if (text.length > HIGHLIGHT_LIMIT) return null;
   try {
     // Only to learn whether it is JSON; the parsed value is not used.
     JSON.parse(text);
@@ -93,7 +106,9 @@ export function formatJson(text) {
       if (prev === '{' || prev === '[' || prev === ',') out += newline();
       out += token;
       if (token === '{' || token === '[') depth += 1;
+      if (depth > FORMAT_DEPTH_LIMIT) return null;
     }
+    if (out.length > FORMAT_OUTPUT_LIMIT) return null;
     prev = token;
   }
   return out;
@@ -128,8 +143,9 @@ function toText(value, language) {
  *            JavaScript sees it (large integers rounded, 1.0 as 1).
  * language   "auto" (default): objects and JSON-looking strings are
  *            pretty-printed and coloured; "json": always colour; "text": never
- * title      label in the header bar (text or markup); without it the tools
- *            float top right
+ * title      label in the header bar (text or markup); without it the bar
+ *            holds only the tools, at its right end. The tools never sit
+ *            over the code.
  * label      accessible name of the scrolling block. Default: the title
  *            when it is a string, else "Code". Give one when the title is
  *            markup.
@@ -159,11 +175,12 @@ export function CodeBlock({ value, language = 'auto', title, label, wrap = false
     </div>
   `;
 
+  // The tools always sit in a bar of their own, above the code: tools
+  // floating over the block would cover the end of a long first line, and a
+  // line that scrolls sideways passes under them whatever room is reserved.
   return html`
-    <div class=${cx('code', !title && 'code-floating', className)} data-wrap=${wrapped ? '' : undefined}>
-      ${title
-        ? html`<div class="code-bar"><span class="code-title">${title}</span>${tools}</div>`
-        : tools}
+    <div class=${cx('code', className)} data-wrap=${wrapped ? '' : undefined}>
+      <div class="code-bar" data-untitled=${title ? undefined : ''}>${title && html`<span class="code-title">${title}</span>`}${tools}</div>
       <pre class="code-pre" tabindex="0" style=${maxHeight ? `max-height:${maxHeight}` : undefined} aria-label=${label || (typeof title === 'string' && title) || 'Code'}><code>${body}</code></pre>
       ${note && html`<div class="code-note">${note}</div>`}
     </div>

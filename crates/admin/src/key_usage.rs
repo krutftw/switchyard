@@ -23,7 +23,11 @@
 //!
 //! The range is the usage store's `30d`: the 720 hour buckets ending with
 //! the current hour, a request counting at the time it finished, and
-//! nothing older than `usage.retention_days`.
+//! nothing older than `usage.retention_days`. `last_used_at` covers the same
+//! range — the start of the latest request counted — so that "no request in
+//! the last 30 days" is what a `null` means; reading every usage file of a
+//! long retention window only for that one date would cost a parse of
+//! months of records on the first `GET /keys`.
 
 use crate::views::KeyUsage;
 use parking_lot::Mutex;
@@ -90,6 +94,30 @@ fn key_of(record: &RequestRecord) -> Option<&str> {
     record.client.key_id.as_deref().filter(|id| !id.is_empty())
 }
 
+/// What one key did in one hour.
+#[derive(Clone, Copy, Debug)]
+struct KeyHour {
+    totals: Totals,
+    /// Start of the key's most recent request counted in the hour.
+    last_started: i64,
+}
+
+impl Default for KeyHour {
+    fn default() -> Self {
+        KeyHour {
+            totals: Totals::default(),
+            last_started: i64::MIN,
+        }
+    }
+}
+
+impl KeyHour {
+    fn add(&mut self, record: &RequestRecord) {
+        self.totals.add_record(record);
+        self.last_started = self.last_started.max(record.started_at);
+    }
+}
+
 /// What one usage file says about each key.
 #[derive(Debug, Default)]
 struct DayFile {
@@ -97,10 +125,8 @@ struct DayFile {
     consumed: u64,
     /// The first bytes of the file as it was when they were read.
     head: Vec<u8>,
-    /// Hour → key id → counters.
-    hours: BTreeMap<i64, HashMap<String, Totals>>,
-    /// Key id → start of its most recent request in this file.
-    last_used: HashMap<String, i64>,
+    /// Hour → key id → counters and latest start.
+    hours: BTreeMap<i64, HashMap<String, KeyHour>>,
 }
 
 impl DayFile {
@@ -113,9 +139,7 @@ impl DayFile {
             .or_default()
             .entry(key.to_string())
             .or_default()
-            .add_record(record);
-        let last = self.last_used.entry(key.to_string()).or_insert(i64::MIN);
-        *last = (*last).max(record.started_at);
+            .add(record);
     }
 
     /// Reads what was appended to the file since the last call. A file
@@ -212,20 +236,19 @@ impl Files {
         let mut usage: HashMap<String, KeyUsage> = HashMap::new();
         for file in self.days.values() {
             for by_key in file.hours.range(hours.first..=hours.last).map(|(_, v)| v) {
-                for (key, totals) in by_key {
-                    usage.entry(key.clone()).or_default().totals.merge(totals);
+                for (key, hour) in by_key {
+                    let entry = usage.entry(key.clone()).or_default();
+                    entry.totals.merge(&hour.totals);
+                    entry.last_used_at = entry.last_used_at.max(Some(hour.last_started));
                 }
-            }
-            for (key, started_at) in &file.last_used {
-                let entry = usage.entry(key.clone()).or_default();
-                entry.last_used_at = entry.last_used_at.max(Some(*started_at));
             }
         }
         usage
     }
 }
 
-/// Usage of every key that made one of the requests still in memory.
+/// Usage of every key that made one of the requests still in memory and
+/// counted in the range.
 fn in_memory(store: &UsageStore, hours: Hours) -> HashMap<String, KeyUsage> {
     let mut usage: HashMap<String, KeyUsage> = HashMap::new();
     let mut before = None;
@@ -239,11 +262,13 @@ fn in_memory(store: &UsageStore, hours: Hours) -> HashMap<String, KeyUsage> {
             let Some(key) = key_of(record) else {
                 continue;
             };
+            // Counts and the last use cover the same range.
+            if !hours.contains(hour_of(record)) {
+                continue;
+            }
             let entry = usage.entry(key.to_string()).or_default();
             entry.last_used_at = entry.last_used_at.max(Some(record.started_at));
-            if hours.contains(hour_of(record)) {
-                entry.totals.add_record(record);
-            }
+            entry.totals.add_record(record);
         }
         match page.next_before {
             Some(cursor) => before = Some(cursor),
@@ -523,13 +548,41 @@ mod tests {
         assert_eq!(usage["key_a"].totals.requests, 1);
         assert_eq!(usage["key_b"].totals.requests, 1);
         assert!(!usage.contains_key("key_c"));
-        assert_eq!(usage["key_d"].totals.requests, 0);
+        // The last use is that of a request in the range, like the counts:
+        // the older request of `key_a` is not it, nor the future one of
+        // `key_d`.
+        assert_eq!(usage["key_a"].last_used_at, Some(old));
+        assert_eq!(usage["key_b"].last_used_at, Some(NOON - 31 * DAY_MS));
+        assert!(!usage.contains_key("key_d"), "{usage:?}");
 
-        // A week of retention: the old requests are past it.
+        // A week of retention: the old requests are past it — and so is
+        // their last use.
         let week = Hours::ending(NOON, 7);
         let usage = files.usage(dir.path(), NOON, week);
-        assert_eq!(usage["key_a"].totals.requests, 0);
-        assert_eq!(usage["key_b"].totals.requests, 0);
+        assert!(usage.is_empty(), "{usage:?}");
+    }
+
+    /// Regression: `last_used_at` was the latest request of any file read
+    /// (31 days) or still in memory (older still), while the counts and the
+    /// keys page ("no request in the last 30 days") cover the 30-day range.
+    #[test]
+    fn the_last_use_is_that_of_the_range() {
+        let dir = tempfile::tempdir().unwrap();
+        // Finished an hour before the range began: in a file that is read,
+        // but not in the range.
+        let before = NOON - 30 * DAY_MS;
+        append(dir.path(), &record(Some(("key_a", "a")), before, 1, true));
+        let mut files = Files::default();
+        assert!(files.usage(dir.path(), NOON, hours()).is_empty());
+
+        let store = UsageStore::in_memory();
+        let now = switchyard_core::util::now_unix_ms();
+        store.record(&record(Some(("key_a", "a")), now - 40 * DAY_MS, 1, true));
+        assert!(in_memory(&store, Hours::ending(now, 30)).is_empty());
+        store.record(&record(Some(("key_a", "a")), now - 2 * DAY_MS, 1, true));
+        let usage = in_memory(&store, Hours::ending(now, 30));
+        assert_eq!(usage["key_a"].last_used_at, Some(now - 2 * DAY_MS));
+        assert_eq!(usage["key_a"].totals.requests, 1);
     }
 
     #[test]
@@ -563,8 +616,8 @@ mod tests {
             (usage["key_b"].totals.requests, usage["key_b"].totals.errors),
             (1, 1)
         );
-        assert_eq!(usage["key_c"].totals.requests, 0);
-        assert_eq!(usage["key_c"].last_used_at, Some(now - 31 * DAY_MS));
-        assert_eq!(usage.len(), 3);
+        // Past the range: neither counted nor its last use.
+        assert!(!usage.contains_key("key_c"));
+        assert_eq!(usage.len(), 2);
     }
 }

@@ -14,7 +14,7 @@ use parking_lot::{Mutex, RwLock};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
-use std::io;
+use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::SystemTime;
@@ -350,12 +350,19 @@ impl BodyStore {
         let path = Self::path_for(dir, started_at, id);
         let text = serde_json::to_vec(&self.prepared(bodies)).map_err(io::Error::other)?;
         if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            crate::private_files::create_dir_all(parent)?;
         }
         // Written under a temporary name first, so a reader never sees half
         // a file.
         let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, text)?;
+        let mut file =
+            crate::private_files::open(fs::OpenOptions::new().create_new(true).write(true), &tmp)?;
+        if let Err(error) = file.write_all(&text) {
+            drop(file);
+            let _ = fs::remove_file(&tmp);
+            return Err(error);
+        }
+        drop(file);
         match fs::rename(&tmp, &path) {
             Ok(()) => Ok(true),
             Err(error) => {

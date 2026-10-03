@@ -62,8 +62,8 @@ fn body_is_json(content_type: Option<&str>, body: &[u8]) -> bool {
 }
 
 /// The body to send upstream: the client's, with the `model` field of a
-/// JSON body replaced by the upstream id. A body that already names that id
-/// — or is not a JSON object with a `model` — is sent byte for byte.
+/// JSON body replaced by the upstream id. Re-serialization also ensures that
+/// duplicate JSON fields cannot make an upstream select a different model.
 fn with_upstream_model(body: &Bytes, json: bool, upstream_model: &str) -> Bytes {
     if !json {
         return body.clone();
@@ -72,7 +72,7 @@ fn with_upstream_model(body: &Bytes, json: bool, upstream_model: &str) -> Bytes 
         return body.clone();
     };
     match object.get("model") {
-        Some(Value::String(current)) if current != upstream_model => {}
+        Some(Value::String(_)) => {}
         _ => return body.clone(),
     }
     object.insert(
@@ -145,9 +145,13 @@ impl Inner {
             return self.reject(recorder, client, &error);
         }
         let resolution = self.scheduler.resolve(&request.model);
-        if let Err(error) =
-            check_identity(&request.identity, &request.model, resolution.as_ref().ok())
-        {
+        if let Err(error) = check_identity(
+            &self.keys.load(),
+            &request.identity,
+            &request.model,
+            resolution.as_ref().ok(),
+            serde_json::from_slice::<Value>(&request.body).ok().as_ref(),
+        ) {
             return self.reject(recorder, client, &error);
         }
         let mut resolved = match resolution {
@@ -391,9 +395,17 @@ mod tests {
     }
 
     #[test]
-    fn bodies_that_need_no_change_keep_their_bytes() {
+    fn json_models_are_normalized_and_other_bodies_keep_their_bytes() {
         let same = Bytes::from_static(b"{ \"model\" : \"m\" ,  \"input\":\"x\" }");
-        assert_eq!(with_upstream_model(&same, true, "m"), same);
+        assert_eq!(
+            with_upstream_model(&same, true, "m"),
+            Bytes::from_static(b"{\"model\":\"m\",\"input\":\"x\"}")
+        );
+        let repeated = Bytes::from_static(b"{\"model\":\"first\",\"model\":\"m\",\"input\":\"x\"}");
+        assert_eq!(
+            with_upstream_model(&repeated, true, "m"),
+            Bytes::from_static(b"{\"model\":\"m\",\"input\":\"x\"}")
+        );
         let no_model = Bytes::from_static(b"{ \"input\":\"x\" }");
         assert_eq!(with_upstream_model(&no_model, true, "m"), no_model);
         let not_object = Bytes::from_static(b"[1, 2]");

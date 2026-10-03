@@ -24,7 +24,9 @@ function Fact({ label, loading, wide = false, count = false, children }) {
 }
 
 /**
- * One line that answers "is it healthy, what is it, where is it".
+ * One line that answers "is it healthy, what is it, where is it". While the
+ * configuration file on disk is refused the verdict says so and links to the
+ * raw file (see gatewayVerdict).
  * status     /status (useResource)
  * providers  /providers (useResource)
  * down       null, or { at, unreachable } while the gateway does not answer:
@@ -53,6 +55,8 @@ export function StatusStrip({ status, providers, down = null }) {
               <div class="overview-verdict-text">
                 <span class="overview-verdict-label">${verdict.label}</span>
                 <span class="overview-verdict-detail">${verdict.detail}</span>
+                ${verdict.refused &&
+                html`<span class="overview-verdict-refused">The file on disk was refused. <a href=${href('/settings', { tab: 'raw' })}>Open the raw file</a></span>`}
               </div>
             `
           : html`<${Skeleton} width="160px" height="20px" />`}
@@ -292,11 +296,11 @@ export function FirstRun({ status, providers, onHide }) {
             : `${plural(status.data.counts.client_keys, 'client key')} can call the gateway.`}
         <//>
         <${Step} done=${state.hasTraffic} title="3. Send a request" action=${html`<${Button} size="sm" icon="playground" href=${href('/playground')}>Open the playground<//>`}>
-          <p>Try a model in the playground, or call the gateway from a terminal.</p>
+          <p>Try a model in the playground, or use the example below in bash or zsh.</p>
           <${CodeBlock}
             class="overview-curl"
             language="text"
-            title="Example request"
+            title="Example request for bash/zsh"
             value=${curl}
             note=${state.authRequired || !state.model || viaPage
               ? html`${state.authRequired &&

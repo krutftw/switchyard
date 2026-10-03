@@ -30,6 +30,15 @@ const X_REQUEST_ID: HeaderName = HeaderName::from_static("x-request-id");
 /// How much of an unknown path a 404 repeats back, in characters.
 const MAX_ECHOED_PATH: usize = 200;
 
+/// The query parameter a client key may be given in.
+const KEY_PARAM: &str = "key";
+
+/// The query parameter a WebSocket ticket is given in.
+pub(crate) const TICKET_PARAM: &str = "ticket";
+
+/// Query parameters that carry a credential: never passed on, never shown.
+const CREDENTIAL_PARAMS: [&str; 2] = [KEY_PARAM, TICKET_PARAM];
+
 /// What every handler needs.
 #[derive(Clone)]
 pub(crate) struct App {
@@ -114,7 +123,7 @@ fn add_cors(headers: &mut HeaderMap, requested_headers: Option<HeaderValue>) {
 async fn finalize(State(app): State<App>, request: Request, next: Next) -> Response {
     let started = Instant::now();
     let method = request.method().clone();
-    // The path only: a query string may carry the client's key.
+    // The path only: a query string may carry the client's key or ticket.
     let path = request.uri().path().to_string();
     let cors = app.gateway.config().server.cors && !is_admin_path(&path);
     let requested_headers = request
@@ -196,8 +205,8 @@ impl Query {
     }
 
     /// The query string as received, without the parameters named in
-    /// `drop` — and never with the client's `key`. `None` when nothing is
-    /// left.
+    /// `drop` — and never with the client's `key` or WebSocket `ticket`.
+    /// `None` when nothing is left.
     pub(crate) fn without(&self, drop: &[&str]) -> Option<String> {
         let kept: Vec<&str> = self
             .raw
@@ -209,7 +218,7 @@ impl Query {
                     .next()
                     .map(|(name, _)| name.into_owned())
                     .unwrap_or_default();
-                name != "key" && !drop.contains(&name.as_str())
+                !CREDENTIAL_PARAMS.contains(&name.as_str()) && !drop.contains(&name.as_str())
             })
             .collect();
         if kept.is_empty() {
@@ -340,10 +349,18 @@ async fn dispatch(State(app): State<App>, request: Request) -> Response {
     };
 
     let query = Query::parse(parts.uri.query());
+    let mut presented = PresentedCredentials::from_headers(
+        &parts.headers,
+        query.get(KEY_PARAM).map(str::to_string),
+    );
+    // WebSocket upgrades also take a single-use ticket bought with a key
+    // (`POST /v1/ws-ticket`), so that a browser need not put the key itself
+    // into the URL.
+    if route.is_websocket() {
+        presented.ws_ticket = query.get(TICKET_PARAM).map(str::to_string);
+    }
     // The Realtime route accepts one more place for the key (a WebSocket
     // subprotocol, the only place a browser can put it).
-    let mut presented =
-        PresentedCredentials::from_headers(&parts.headers, query.get("key").map(str::to_string));
     if route == Route::Realtime
         && presented.authorization.is_none()
         && let Some(key) = ws::realtime::subprotocol_key(&parts.headers)
@@ -376,13 +393,18 @@ async fn dispatch(State(app): State<App>, request: Request) -> Response {
         }
     };
 
+    // Anonymous access never authorizes another site's browser requests,
+    // including names that resolve to this listener through DNS rebinding.
     // With CORS switched off, other sites' pages get nothing done here:
     // not over a WebSocket (which a browser opens to any host and lets the
     // page read), and not blind either. See `origin`.
-    if !route.is_listing() && !app.gateway.config().server.cors && origin::is_foreign_page(&parts) {
+    let config = app.gateway.config();
+    if !route.is_listing()
+        && ((identity.anonymous && !origin::anonymous_host_is_allowed(&parts, &config.server.host))
+            || ((identity.anonymous || !config.server.cors) && origin::is_foreign_page(&parts)))
+    {
         let error = ApiError::permission(
-            "this gateway does not serve web pages of other origins (cross-origin access is \
-             switched off)",
+            "this gateway does not serve web pages of other origins without permitted authentication",
         )
         .with_code("origin_not_allowed");
         let response = respond::error(&app.gateway, protocol, &error);
@@ -407,6 +429,7 @@ async fn dispatch(State(app): State<App>, request: Request) -> Response {
         Route::GeminiModel(name) => handlers::gemini_model(&context, &name),
         Route::ResponsesWebSocket => ws::responses::upgrade(context, &mut parts),
         Route::Realtime => ws::realtime::upgrade(context, &mut parts).await,
+        Route::WsTicket => handlers::ws_ticket(&context, body).await,
         Route::ChatCompletions
         | Route::Completions
         | Route::Responses
@@ -620,6 +643,13 @@ mod tests {
             "the key never survives, however often it is given"
         );
         assert_eq!(Query::parse(Some("key=x")).without(&[]), None);
+        assert_eq!(
+            Query::parse(Some("ticket=t1&model=m&tick%65t=t2&ticket"))
+                .without(&[])
+                .as_deref(),
+            Some("model=m"),
+            "nor does a WebSocket ticket"
+        );
         assert_eq!(
             Query::parse(Some("%6Bey=x&a=1")).without(&[]).as_deref(),
             Some("a=1")

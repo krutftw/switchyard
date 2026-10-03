@@ -88,6 +88,78 @@ impl CaptureBuf {
     }
 }
 
+/// Whose doing a failed request is, as far as the level of its log line
+/// goes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cause {
+    /// The gateway decided on the error itself, from the request alone:
+    /// a body it cannot read, a model it does not know or the key may not
+    /// use, the key's own rate limit.
+    Client,
+    /// What the upstreams answered, or did not: the attempt loop's final
+    /// error, a stream or session that broke.
+    Upstream,
+}
+
+/// The level of the `request failed` line of a request that ended with
+/// `status` and an error of `kind` (the record's `error.kind`).
+///
+/// Failures that are the gateway's or an upstream's — any 5xx, a `429`
+/// that is not the client key's own rate limit (every credential of the
+/// model resting, an upstream's rate limit), a stream or WebSocket session
+/// that failed after its `200` / `101` — are logged at WARN. What the
+/// client brought on itself — a request the gateway or the upstream
+/// refused as faulty (other 4xx), the key's own rate limit, a client that
+/// went away — stays at DEBUG, where every request is logged anyway.
+pub(crate) fn failure_level(status: u16, kind: &str, cause: Cause) -> tracing::Level {
+    let client_side = match status {
+        _ if kind == "client_disconnect" => true,
+        500.. => false,
+        429 => cause == Cause::Client,
+        400..=499 => true,
+        // A failure under a success status: the stream or session broke.
+        _ => false,
+    };
+    if client_side {
+        tracing::Level::DEBUG
+    } else {
+        tracing::Level::WARN
+    }
+}
+
+/// Logs the final line of a failed request, at [`failure_level`].
+fn log_failure(record: &RequestRecord, cause: Cause) {
+    let (kind, message) = match record.error.as_ref() {
+        Some(error) => (error.kind.as_str(), error.message.as_str()),
+        None => ("", "(no details)"),
+    };
+    let attempts = record.attempts.len();
+    let model = record.model_name();
+    // Two macros: a `tracing` level must be known where the event is
+    // declared.
+    if failure_level(record.status, kind, cause) == tracing::Level::WARN {
+        tracing::warn!(
+            request = %record.id,
+            endpoint = %record.endpoint,
+            model,
+            status = record.status,
+            kind,
+            attempts,
+            "request failed: {message}"
+        );
+    } else {
+        tracing::debug!(
+            request = %record.id,
+            endpoint = %record.endpoint,
+            model,
+            status = record.status,
+            kind,
+            attempts,
+            "request failed: {message}"
+        );
+    }
+}
+
 /// See the module docs.
 pub(crate) struct Recorder {
     telemetry: Telemetry,
@@ -98,6 +170,7 @@ pub(crate) struct Recorder {
     announced: bool,
     finished: bool,
     on_drop: DropOutcome,
+    cause: Cause,
     _in_flight: GaugeGuard,
 }
 
@@ -115,6 +188,7 @@ impl Recorder {
             announced: false,
             finished: false,
             on_drop: DropOutcome::CLIENT_GONE,
+            cause: Cause::Upstream,
         }
     }
 
@@ -230,11 +304,13 @@ impl Recorder {
         }
     }
 
-    /// Records the error the client is told about.
+    /// Records the error the client is told about: one the gateway decided
+    /// on itself, from the request ([`Cause::Client`] for the log line).
     pub(crate) fn fail_with(&mut self, error: &ApiError, upstream_status: Option<u16>) {
         let mut entry = RecordError::from_api(error);
         entry.upstream_status = upstream_status;
         self.builder.set_error(entry);
+        self.cause = Cause::Client;
     }
 
     /// Records the error an attempt loop ended with: what the client is
@@ -263,8 +339,9 @@ impl Recorder {
         self.on_drop = outcome;
     }
 
-    /// Completes and publishes the record. `status` is the HTTP status sent
-    /// to the client.
+    /// Completes and publishes the record, and logs a failed request's
+    /// `request failed` line (see [`failure_level`]). `status` is the HTTP
+    /// status sent to the client.
     pub(crate) fn finish(mut self, status: u16) -> Arc<RequestRecord> {
         self.publish(status)
     }
@@ -286,7 +363,13 @@ impl Recorder {
             let bodies = std::mem::take(&mut self.bodies);
             record.has_bodies = self.telemetry.capture_bodies(&record, bodies);
         }
-        self.telemetry.finish_request(record)
+        let record = self.telemetry.finish_request(record);
+        // The one log line of a failed request: whatever path it took,
+        // and only once, as the record.
+        if !record.ok {
+            log_failure(&record, self.cause);
+        }
+        record
     }
 }
 
@@ -303,11 +386,14 @@ impl Drop for Recorder {
 }
 
 fn header_map(headers: &HeaderMap) -> std::collections::BTreeMap<String, String> {
-    redact_headers(
-        headers
-            .iter()
-            .map(|(name, value)| (name.as_str(), String::from_utf8_lossy(value.as_bytes()))),
-    )
+    redact_headers(headers.iter().map(|(name, value)| {
+        let value = if value.is_sensitive() {
+            std::borrow::Cow::Borrowed(switchyard_telemetry::redact::REDACTED)
+        } else {
+            String::from_utf8_lossy(value.as_bytes())
+        };
+        (name.as_str(), value)
+    }))
 }
 
 #[cfg(test)]
@@ -316,6 +402,21 @@ mod tests {
     use switchyard_core::Protocol;
     use switchyard_core::config::PriceConfig;
     use switchyard_telemetry::{Attempt, TelemetryOptions};
+
+    #[test]
+    fn sensitive_http_headers_stay_redacted_under_arbitrary_names() {
+        let mut headers = HeaderMap::new();
+        let mut secret = http::HeaderValue::from_static("opaque-test-value");
+        secret.set_sensitive(true);
+        headers.insert("x-custom-routing-data", secret);
+        headers.insert(
+            "content-type",
+            http::HeaderValue::from_static("application/json"),
+        );
+        let captured = header_map(&headers);
+        assert_eq!(captured["x-custom-routing-data"], "[redacted]");
+        assert_eq!(captured["content-type"], "application/json");
+    }
 
     fn start() -> RequestStart {
         RequestStart::new(
@@ -374,6 +475,71 @@ mod tests {
         assert_eq!(events.try_recv().unwrap().topic(), "request.started");
         assert_eq!(events.try_recv().unwrap().topic(), "request.finished");
         assert!(events.try_recv().is_err(), "published exactly once");
+    }
+
+    #[test]
+    fn failures_of_the_gateway_or_an_upstream_are_warnings() {
+        use Cause::{Client, Upstream};
+        use tracing::Level;
+        for (status, kind, cause) in [
+            (500, "internal", Upstream),
+            (502, "upstream", Upstream),
+            (503, "overloaded", Upstream),
+            (504, "timeout", Upstream),
+            // A 5xx is never the client's doing, whoever decided on it.
+            (500, "internal", Client),
+            // Every credential resting; an upstream's rate limit.
+            (429, "rate_limit", Upstream),
+            // A stream that broke after its 200, a session after its 101.
+            (200, "upstream", Upstream),
+            (101, "upstream", Upstream),
+            (101, "aborted", Upstream),
+        ] {
+            assert_eq!(
+                failure_level(status, kind, cause),
+                Level::WARN,
+                "{status} {kind} {cause:?}"
+            );
+        }
+        for (status, kind, cause) in [
+            (400, "invalid_request", Client),
+            (401, "authentication", Client),
+            (403, "permission", Client),
+            (404, "not_found", Client),
+            (413, "invalid_request", Client),
+            // The client key's own rate limit.
+            (429, "rate_limit", Client),
+            // An upstream refused the request as faulty.
+            (400, "invalid_request", Upstream),
+            // The client went away, before or after the answer began.
+            (499, "client_disconnect", Upstream),
+            (200, "client_disconnect", Upstream),
+            (101, "client_disconnect", Upstream),
+        ] {
+            assert_eq!(
+                failure_level(status, kind, cause),
+                Level::DEBUG,
+                "{status} {kind} {cause:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn errors_the_gateway_decides_on_itself_are_the_clients() {
+        let telemetry = Telemetry::new(TelemetryOptions::default());
+        let mut recorder = Recorder::begin(&telemetry, Arc::new(Config::default()), start());
+        assert_eq!(recorder.cause, Cause::Upstream);
+        recorder.fail_with(&ApiError::rate_limit("slow down"), None);
+        assert_eq!(recorder.cause, Cause::Client);
+        let record = recorder.finish(429);
+        assert_eq!(
+            failure_level(
+                record.status,
+                &record.error.as_ref().unwrap().kind,
+                Cause::Client
+            ),
+            tracing::Level::DEBUG
+        );
     }
 
     #[test]

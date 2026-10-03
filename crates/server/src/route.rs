@@ -113,6 +113,8 @@ pub(crate) enum Route {
     },
     /// `GET /v1/realtime` (WebSocket)
     Realtime,
+    /// `POST /v1/ws-ticket`: a single-use ticket for a WebSocket.
+    WsTicket,
     /// `POST /v1/embeddings` and friends.
     Raw(RawEndpoint),
 }
@@ -121,6 +123,12 @@ impl Route {
     /// Whether the route is served without authentication.
     pub(crate) fn is_public(&self) -> bool {
         matches!(self, Route::Banner | Route::Health)
+    }
+
+    /// Whether the route is a WebSocket upgrade, which accepts a ticket
+    /// from `POST /v1/ws-ticket` (`?ticket=`) in place of a key.
+    pub(crate) fn is_websocket(&self) -> bool {
+        matches!(self, Route::ResponsesWebSocket | Route::Realtime)
     }
 
     /// Whether the route only shows what the gateway serves — the model
@@ -242,6 +250,7 @@ pub(crate) fn resolve(method: &Method, path: &str) -> Resolved {
         "/v1/messages" => post(Route::Messages),
         "/v1/messages/count_tokens" => post(Route::MessagesCountTokens),
         "/v1/realtime" => get(Route::Realtime),
+        "/v1/ws-ticket" => post(Route::WsTicket),
         "/v1/embeddings" => post(Route::Raw(RawEndpoint::Embeddings)),
         "/v1/images/generations" => post(Route::Raw(RawEndpoint::ImageGenerations)),
         "/v1/moderations" => post(Route::Raw(RawEndpoint::Moderations)),
@@ -357,6 +366,7 @@ mod tests {
             ),
             (Method::GET, "/v1beta/models", Route::GeminiModels),
             (Method::GET, "/v1/realtime", Route::Realtime),
+            (Method::POST, "/v1/ws-ticket", Route::WsTicket),
             (
                 Method::POST,
                 "/v1/embeddings",
@@ -517,6 +527,7 @@ mod tests {
                 "GET, POST",
             ),
             (Method::POST, "/v1/realtime", Protocol::OpenaiChat, "GET"),
+            (Method::GET, "/v1/ws-ticket", Protocol::OpenaiChat, "POST"),
         ] {
             assert_eq!(
                 resolve(&method, path),
@@ -548,5 +559,21 @@ mod tests {
         assert!(Route::Health.is_public());
         assert!(!Route::Models.is_public());
         assert!(!Route::Realtime.is_public());
+        assert!(!Route::WsTicket.is_public());
+    }
+
+    #[test]
+    fn only_websocket_upgrades_take_tickets() {
+        assert!(Route::ResponsesWebSocket.is_websocket());
+        assert!(Route::Realtime.is_websocket());
+        for route in [
+            Route::Responses,
+            Route::WsTicket,
+            Route::ChatCompletions,
+            Route::Models,
+            Route::Raw(RawEndpoint::Embeddings),
+        ] {
+            assert!(!route.is_websocket(), "{route:?}");
+        }
     }
 }

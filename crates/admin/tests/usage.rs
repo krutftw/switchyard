@@ -63,13 +63,13 @@ async fn the_summary_adds_up() {
     assert_eq!(summary["by_provider"][0]["requests"], 4);
     assert_eq!(summary["by_key"][0]["name"], "tester");
 
-    // Every range is accepted; nonsense falls back to the default.
+    // Every documented range is accepted; unknown parameter names are ignored.
     for range in ["1h", "24h", "7d", "30d"] {
         let summary = app.get_ok(&format!("/usage/summary?range={range}")).await;
         assert_eq!(summary["range"], range);
         assert_eq!(summary["totals"]["requests"], 4, "{range}");
     }
-    let summary = app.get_ok("/usage/summary?range=forever&unknown=1").await;
+    let summary = app.get_ok("/usage/summary?unknown=1").await;
     assert_eq!(summary["range"], "24h");
 }
 
@@ -108,7 +108,7 @@ async fn the_timeseries_is_bucketed_and_grouped() {
         ("range=24h", "hour", "none"),
         ("range=7d&bucket=day&group_by=provider", "day", "provider"),
         ("range=30d&group_by=key", "day", "key"),
-        ("range=24h&bucket=bogus&group_by=bogus", "hour", "none"),
+        ("range=24h&bucket=auto&group_by=none", "hour", "none"),
     ] {
         let series = app.get_ok(&format!("/usage/timeseries?{query}")).await;
         assert_eq!(series["bucket"], bucket, "{query}");
@@ -155,7 +155,7 @@ async fn requests_are_listed_filtered_and_paged() {
         ("key=tester", 4),
         ("key=anonymous", 0),
         ("q=lorem", 1),
-        ("status=nonsense&limit=abc", 4),
+        ("status=success&limit=500", 3),
     ] {
         let page = app.get_ok(&format!("/requests?{query}")).await;
         assert_eq!(page["total"], total, "{query}");
@@ -294,7 +294,7 @@ async fn logs_are_paged_and_filtered() {
         .collect();
     assert_eq!(messages, ["picked credential", "credential cooling down"]);
 
-    // Garbage in the query is ignored, not an error.
-    let page = app.get_ok("/logs?level=shouting&limit=many&before=x").await;
+    // Unknown parameter names are still forward-compatible.
+    let page = app.get_ok("/logs?unknown=value").await;
     assert_eq!(page["lines"].as_array().unwrap().len(), 5);
 }

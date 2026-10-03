@@ -4,9 +4,10 @@ use crate::auth::{ClientIdentity, KeyTable};
 use crate::ops::Discoveries;
 use crate::reply::{Served, error_reply};
 use crate::summary::SummaryRefusals;
+use crate::ticket::{TICKET_TTL, Tickets};
 use crate::types::{
     ClientRequest, DiscoveryState, FullReply, GatewayOptions, PresentedCredentials, ProviderTest,
-    RawRequest, Reply, StartError, WsOpenRequest,
+    RawRequest, Reply, StartError, WsOpenRequest, WsTicket,
 };
 use crate::ws::UpstreamWsSession;
 use arc_swap::ArcSwap;
@@ -15,7 +16,7 @@ use serde_json::Value;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::{Arc, Weak};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 use switchyard_config_store::{ConfigEvent, ConfigStore};
 use switchyard_core::config::{Config, ConfigIssue, ProviderConfig, ProviderKind, resolve_secret};
 use switchyard_core::util::now_unix_ms;
@@ -55,6 +56,8 @@ pub(crate) struct Inner {
     pub(crate) upstream: UpstreamClient,
     pub(crate) reasoning: ReasoningStore,
     pub(crate) keys: ArcSwap<KeyTable>,
+    /// Single-use tickets for client WebSockets.
+    tickets: Tickets,
     /// Parsed service-account key files, by resolved path. Cleared when the
     /// configuration changes, so an edited file is read again.
     pub(crate) service_accounts: Mutex<HashMap<PathBuf, Arc<ServiceAccount>>>,
@@ -152,6 +155,7 @@ impl Gateway {
             upstream,
             reasoning,
             keys: ArcSwap::from_pointee(keys),
+            tickets: Tickets::default(),
             service_accounts: Mutex::new(HashMap::new()),
             file_marks: tokio::sync::Mutex::new(HashSet::new()),
             summary_refusals: SummaryRefusals::new(Arc::clone(&config)),
@@ -238,11 +242,63 @@ impl Gateway {
     /// Nothing presented → 401 "missing API key"; presented but no match →
     /// 401 "invalid API key". With `auth.required = false` both cases yield
     /// an anonymous identity instead.
+    ///
+    /// A WebSocket ticket ([`PresentedCredentials::ws_ticket`]) is the last
+    /// candidate, looked at only when no key matched; looking at it uses it
+    /// up. A live ticket authenticates as the key that bought it — that
+    /// key's name, id, allow-list and rate limit, as configured now (a key
+    /// disabled or removed since takes its tickets with it); a ticket
+    /// bought anonymously, as an anonymous client while those are admitted.
+    /// An unknown, expired or used ticket counts as a wrong key.
     pub fn authenticate(
         &self,
         presented: &PresentedCredentials,
     ) -> Result<ClientIdentity, ApiError> {
-        self.inner.keys.load().authenticate(presented)
+        let now = Instant::now();
+        self.inner
+            .keys
+            .load()
+            .authenticate_with(presented, |ticket| self.inner.tickets.redeem(ticket, now))
+    }
+
+    /// Revalidates a previously authenticated client and returns its current
+    /// restrictions, without consuming a request from its rate limit.
+    /// Long-lived relays should call this periodically as well as on messages.
+    pub fn refresh_identity(&self, identity: &ClientIdentity) -> Result<ClientIdentity, ApiError> {
+        self.inner.keys.load().refresh(identity)
+    }
+
+    /// Checks that a long-lived session still has the access it opened with.
+    /// A changed model allow-list or rate limit requires reconnecting.
+    pub fn validate_session_identity(&self, identity: &ClientIdentity) -> Result<(), ApiError> {
+        let current = self.refresh_identity(identity)?;
+        if !identity.same_permissions(&current) {
+            return Err(
+                ApiError::authentication("client access changed; reconnect required")
+                    .with_code("invalid_api_key"),
+            );
+        }
+        Ok(())
+    }
+
+    /// Mints a single-use ticket for a client WebSocket, for the client
+    /// `identity` (from [`Gateway::authenticate`]): browsers cannot set
+    /// headers on a WebSocket, and a ticket in the URL is worth nothing
+    /// after one use or 30 seconds, where a key would be.
+    ///
+    /// Not a request: no record, no usage, no rate-limit hit. Each client
+    /// key (and the anonymous client) has at most 32 tickets outstanding;
+    /// minting another drops its oldest. The gateway's built-in clients
+    /// (the playground) get an error.
+    pub fn issue_ws_ticket(&self, identity: &ClientIdentity) -> Result<WsTicket, ApiError> {
+        let identity = self.refresh_identity(identity)?;
+        let holder = identity.ticket_holder().ok_or_else(|| {
+            ApiError::permission("built-in clients of the gateway do not use WebSocket tickets")
+        })?;
+        Ok(WsTicket {
+            ticket: self.inner.tickets.issue(holder, Instant::now()),
+            expires_in: TICKET_TTL.as_secs(),
+        })
     }
 
     /// The identity of the admin playground: internal, no model

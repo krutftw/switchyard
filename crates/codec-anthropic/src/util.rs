@@ -3,7 +3,7 @@
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet, VecDeque};
 use switchyard_core::Protocol;
 
 /// The protocol this crate implements.
@@ -84,16 +84,6 @@ pub(crate) fn sanitize_tool_name(raw: &str) -> String {
         name.push_str("tool");
     }
     name
-}
-
-/// 32-bit FNV-1a, used to disambiguate ids that collide after sanitising.
-fn fnv1a(data: &str) -> u32 {
-    let mut hash: u32 = 0x811c_9dc5;
-    for byte in data.bytes() {
-        hash ^= u32::from(byte);
-        hash = hash.wrapping_mul(0x0100_0193);
-    }
-    hash
 }
 
 /// Whether `id` already matches `^[a-zA-Z0-9_-]+$`.
@@ -189,13 +179,6 @@ pub(crate) enum Unmatched {
     Sanitize,
 }
 
-/// A tool call of the assistant turn that is waiting for its results.
-struct OpenCall {
-    raw: String,
-    wire: String,
-    answered: bool,
-}
-
 /// Gives the `tool_use` / `tool_result` blocks of a conversation ids the
 /// Messages API accepts: each matches `^[a-zA-Z0-9_-]+$`, no two `tool_use`
 /// blocks share one, and a result carries the id of the call it answers.
@@ -207,7 +190,7 @@ struct OpenCall {
 /// * invalid characters become `_`; an id an earlier call already has (two
 ///   ids that are equal after sanitising, or one id reused by a later call,
 ///   as vendors that number their calls from zero in every response do) gets
-///   a hash suffix; id-less calls are numbered;
+///   a numbered suffix; id-less calls are numbered;
 /// * a result is matched to the first not yet answered call *with the same
 ///   original id in the assistant turn before it*, the only place the API
 ///   lets its call be.
@@ -218,8 +201,9 @@ struct OpenCall {
 #[derive(Default)]
 pub(crate) struct ToolIds {
     used: HashSet<String>,
+    next_suffix: HashMap<String, usize>,
     unnamed: usize,
-    open: Vec<OpenCall>,
+    open: HashMap<String, VecDeque<String>>,
     after_assistant: bool,
 }
 
@@ -239,11 +223,7 @@ impl ToolIds {
             {
                 object.insert("id".to_string(), Value::String(wire.clone()));
             }
-            self.open.push(OpenCall {
-                raw,
-                wire,
-                answered: false,
-            });
+            self.open.entry(raw).or_default().push_back(wire);
         }
     }
 
@@ -253,15 +233,9 @@ impl ToolIds {
         self.after_assistant = false;
         for block in blocks.iter_mut().filter(|b| is_block(b, "tool_result")) {
             let raw = str_field(block, "tool_use_id").unwrap_or("").to_string();
-            let call = self
-                .open
-                .iter_mut()
-                .find(|call| !call.answered && call.raw == raw);
+            let call = self.open.get_mut(&raw).and_then(VecDeque::pop_front);
             let wire = match call {
-                Some(call) => {
-                    call.answered = true;
-                    call.wire.clone()
-                }
+                Some(wire) => wire,
                 None => match unmatched {
                     Unmatched::Mark => String::new(),
                     Unmatched::Sanitize => sanitize_ident(&raw),
@@ -286,14 +260,19 @@ impl ToolIds {
             }
         }
         let base = sanitize_ident(raw);
-        let mut candidate = base.clone();
-        let mut salt = raw.to_string();
-        while self.used.contains(&candidate) {
-            candidate = format!("{base}_{:08x}", fnv1a(&salt));
-            salt.push('#');
+        if self.used.insert(base.clone()) {
+            return base;
         }
-        self.used.insert(candidate.clone());
-        candidate
+        // Each base resumes after the last suffix it tried. Reused ids
+        // must not rescan all earlier collisions or rehash growing salts.
+        let next = self.next_suffix.entry(base.clone()).or_insert(0);
+        loop {
+            *next += 1;
+            let candidate = format!("{base}_{next}");
+            if self.used.insert(candidate.clone()) {
+                return candidate;
+            }
+        }
     }
 }
 
@@ -494,6 +473,27 @@ mod tests {
         assert_eq!(first[0]["id"], "call_0");
         let renamed = second[0]["id"].as_str().unwrap();
         assert!(renamed.starts_with("call_0_") && is_valid_ident(renamed));
+    }
+
+    #[test]
+    fn numbered_collisions_preserve_result_order_and_skip_existing_ids() {
+        let mut ids = ToolIds::default();
+        let mut calls = vec![call("a_1"), call("a_2"), call("a")];
+        calls.extend((0..8).map(|_| call("a")));
+        ids.assistant_blocks(&mut calls);
+        let wire = ids_of(&calls, "id");
+        assert_eq!(&wire[..4], ["a_1", "a_2", "a", "a_3"]);
+        assert_eq!(wire.iter().collect::<HashSet<_>>().len(), calls.len());
+        assert!(wire.iter().all(|id| is_valid_ident(id)));
+
+        // Equal raw ids match in call order even when distinct calls are
+        // answered in a different order, and cannot be answered twice.
+        let mut results: Vec<Value> = (0..9).map(|_| result("a")).collect();
+        results.extend([result("a_2"), result("a_1"), result("a")]);
+        ids.user_blocks(&mut results, Unmatched::Mark);
+        let answered = ids_of(&results, "tool_use_id");
+        assert_eq!(answered[..9], wire[2..]);
+        assert_eq!(&answered[9..], ["a_2", "a_1", ""]);
     }
 
     #[test]

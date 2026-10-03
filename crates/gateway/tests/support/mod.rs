@@ -5,6 +5,8 @@
 
 pub mod fake;
 
+// Each integration test uses a different subset of the shared fake API.
+#[allow(unused_imports)]
 pub use fake::{Answer, Behaviour, Fake, Kind, Recorded, Wire};
 
 use bytes::Bytes;

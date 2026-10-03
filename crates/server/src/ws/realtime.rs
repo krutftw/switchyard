@@ -2,8 +2,8 @@
 //!
 //! The gateway authenticates the client, opens the upstream's Realtime
 //! WebSocket with one of its own credentials, and then passes frames both
-//! ways untouched until either side closes. It adds nothing of its own to
-//! the conversation: no pings, no timeouts, no rewriting.
+//! ways until either side closes. Access is revalidated while open, and
+//! upstream error messages are scrubbed of the upstream credential.
 
 use super::{ClientSocket, GOING_AWAY, INTERNAL_ERROR};
 use crate::app::Context;
@@ -251,9 +251,27 @@ async fn relay(context: Context, mut client: ClientSocket, mut session: Upstream
     // Pings passed on to the upstream, and to the client.
     let mut to_upstream = PingLedger::default();
     let mut to_client = PingLedger::default();
+    let mut access_check = tokio::time::interval(Duration::from_secs(1));
+    access_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     let outcome = loop {
+        if context
+            .gateway()
+            .validate_session_identity(&context.identity)
+            .is_err()
+        {
+            let goodbye = super::close_frame(1008, "client access changed; reconnect required");
+            super::send_close(&mut session.socket, Some(goodbye)).await;
+            super::close(
+                &mut client,
+                1008,
+                "client access changed; reconnect required",
+            )
+            .await;
+            break WsOutcome::closed();
+        }
         tokio::select! {
+            _ = access_check.tick() => {}
             _ = shutdown.cancelled() => {
                 // A realtime session has no natural end to wait for.
                 let goodbye = super::close_frame(GOING_AWAY, "the gateway is shutting down");
@@ -327,9 +345,14 @@ async fn relay(context: Context, mut client: ClientSocket, mut session: Upstream
                 }
                 Some(Ok(WsMessage::Frame(_))) => {}
                 Some(Ok(WsMessage::Pong(payload))) if to_upstream.answers(&payload) => {}
-                Some(Ok(message)) => {
-                    match &message {
-                        WsMessage::Text(text) => count_usage(text.as_str(), &mut usage),
+                Some(Ok(mut message)) => {
+                    match &mut message {
+                        WsMessage::Text(text) => {
+                            count_usage(text.as_str(), &mut usage);
+                            if let Some(redacted) = redact_error_event(text.as_str(), |value| session.redact(value)) {
+                                *text = redacted.into();
+                            }
+                        }
                         WsMessage::Ping(payload) => to_client.passed_on(payload),
                         _ => {}
                     }
@@ -354,9 +377,53 @@ async fn relay(context: Context, mut client: ClientSocket, mut session: Upstream
     session.finish(outcome.with_usage(usage));
 }
 
+/// Error payloads may quote a credential with JSON escapes, so redact
+/// decoded strings and serialize them again without changing ordinary content.
+fn redact_error_event(text: &str, redact: impl Fn(&str) -> String) -> Option<String> {
+    let mut value: Value = serde_json::from_str(text).ok()?;
+    if value.get("type").and_then(Value::as_str) != Some("error") {
+        return None;
+    }
+    fn visit(value: &mut Value, redact: &impl Fn(&str) -> String) {
+        match value {
+            Value::String(text) => *text = redact(text),
+            Value::Array(values) => values.iter_mut().for_each(|value| visit(value, redact)),
+            Value::Object(values) => values.values_mut().for_each(|value| visit(value, redact)),
+            _ => {}
+        }
+    }
+    visit(&mut value, &redact);
+    Some(value.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_frames_redact_decoded_strings_without_rewriting_content_frames() {
+        let secret = "opaque\"test-value";
+        let frame = serde_json::json!({"type":"error", "error":{"message":format!("invalid credential: {secret}")}}).to_string();
+        let redacted =
+            redact_error_event(&frame, |value| value.replace(secret, "[redacted]")).unwrap();
+        let decoded: Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(
+            decoded["error"]["message"],
+            "invalid credential: [redacted]"
+        );
+        let escaped_type = r#"{"type":"\u0065rror","message":"opaque-value"}"#;
+        let redacted = redact_error_event(escaped_type, |value| {
+            value.replace("opaque-value", "[redacted]")
+        })
+        .unwrap();
+        let decoded: Value = serde_json::from_str(&redacted).unwrap();
+        assert_eq!(decoded["message"], "[redacted]");
+        let content =
+            serde_json::json!({"type":"response.output_text.delta", "delta":"error"}).to_string();
+        assert!(
+            redact_error_event(&content, |_| panic!("ordinary content is untouched")).is_none()
+        );
+    }
     use pretty_assertions::assert_eq;
 
     fn headers(protocols: &[&str]) -> HeaderMap {

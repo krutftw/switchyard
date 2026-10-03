@@ -8,9 +8,12 @@
 //                    normalize_depth) and each codec's write_reasoning
 //   SHORTCUTS        every useHotkey call (js/shell/shell.js, the "/" of
 //                    pages/requests/filters.js, pages/models/table.js and
-//                    pages/logs.js, useSaveHotkey in pages/settings/common.js)
-//                    and the key handlers of the palette and the shared
-//                    components
+//                    pages/logs.js, useSaveHotkey in pages/settings/common.js),
+//                    the key handlers of the palette and the shared
+//                    components, and the Logs page's line list (onKeyDown in
+//                    pages/logs/list.js, described by the sr-only #logs-keys
+//                    hint in pages/logs.js; End is the browser's own scroll
+//                    to the end of the list, which resumes following)
 //   MIT_LICENCE      LICENSE at the repository root
 
 // ---------------------------------------------------------------------------
@@ -101,7 +104,7 @@ export const REASONING = [
     },
     anthropic: {
       code: ['thinking.type: "enabled"', 'thinking.budget_tokens: 16000'],
-      note: 'Kept below max_tokens. Models that only take levels, such as claude-opus-5, get adaptive thinking with effort high.',
+      note: 'Kept below max_tokens: a budget at or above it becomes max_tokens − 1. If max_tokens is 1024 or less, it is raised to the model’s output limit, or thinking is dropped when that limit is unknown. Without max_tokens, a known model’s limit is written. Models that only take levels, such as claude-opus-5, get adaptive thinking with effort high.',
     },
     gemini: {
       code: ['thinkingBudget: 16000'],
@@ -233,6 +236,16 @@ export const SHORTCUTS = [
       { keys: [['enter'], ['space']], action: 'Open the focused row.' },
       { keys: [['left'], ['right']], action: 'Read a focused chart point by point.' },
       { keys: [['home'], ['end']], action: 'First or last point of a focused chart.' },
+    ],
+  },
+  {
+    title: 'Log lines',
+    items: [
+      { keys: [['up'], ['down']], action: 'With the list of lines focused on the Logs page, move between lines.' },
+      { keys: [['enter'], ['space']], action: 'Open or close the selected line.' },
+      { keys: [['c']], action: 'Copy the selected line.' },
+      { keys: [['escape']], action: 'Let go of the selected line.' },
+      { keys: [['end']], action: 'Jump to the latest line and follow new ones.' },
     ],
   },
   {

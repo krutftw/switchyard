@@ -433,6 +433,14 @@ fn allowed_tools_narrows_the_tool_list() {
         choice(allowed("auto", &[])),
         (Some(ToolChoice::None), vec![])
     );
+    // Repeated permissions do not duplicate tools or change declaration order.
+    assert_eq!(
+        choice(allowed("required", &["ping", "get_weather", "ping"])),
+        (
+            Some(ToolChoice::Required),
+            vec!["get_weather".to_string(), "ping".to_string()]
+        )
+    );
 }
 
 #[test]
@@ -551,6 +559,60 @@ fn tool_messages_without_ids_pair_with_pending_calls_in_order() {
         .map(|r| r.call_id.as_str())
         .collect();
     assert_eq!(ids, ["c1", "c2"]);
+}
+
+#[test]
+fn pending_calls_preserve_order_and_duplicate_counts_after_explicit_answers() {
+    let calls: Vec<Value> = ["c1", "c2", "c1", "c3", "c3"]
+        .into_iter()
+        .map(|id| json!({"id": id, "type": "function", "function": {"name": "f", "arguments": "{}"}}))
+        .collect();
+    let req = decode_request(json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "tool_calls": calls},
+            {"role": "tool", "tool_call_id": "c1", "content": "explicit"},
+            {"role": "tool", "content": "second"},
+            {"role": "tool", "content": "third"},
+            {"role": "tool", "content": "fourth"},
+            {"role": "tool", "content": "unpaired"},
+            {"role": "assistant", "tool_calls": [
+                {"id": "c1", "type": "function", "function": {"name": "f", "arguments": "{}"}}
+            ]},
+            {"role": "tool", "content": "new turn"}
+        ]
+    }));
+    let ids: Vec<&str> = req.messages[1]
+        .tool_results()
+        .map(|r| r.call_id.as_str())
+        .collect();
+    assert_eq!(ids, ["c1", "c2", "c3", "c3", ""]);
+    assert_eq!(req.messages[3].tool_results().next().unwrap().call_id, "c1");
+}
+
+#[test]
+fn legacy_results_pair_by_name_and_then_declaration_order() {
+    let req = decode_request(json!({
+        "model": "m",
+        "messages": [
+            {"role": "assistant", "function_call": {"name": "a", "arguments": "{}"}},
+            {"role": "assistant", "function_call": {"name": "b", "arguments": "{}"}},
+            {"role": "assistant", "function_call": {"name": "a", "arguments": "{}"}},
+            {"role": "function", "name": "b", "content": "b"},
+            {"role": "function", "name": "a", "content": "first a"},
+            {"role": "function", "name": "a", "content": "second a"}
+        ]
+    }));
+    let calls: Vec<&str> = req.messages[..3]
+        .iter()
+        .flat_map(Message::tool_calls)
+        .map(|c| c.id.as_str())
+        .collect();
+    let results: Vec<&str> = req.messages[3]
+        .tool_results()
+        .map(|r| r.call_id.as_str())
+        .collect();
+    assert_eq!(results, [calls[1], calls[0], calls[2]]);
 }
 
 #[test]

@@ -21,11 +21,18 @@
 //! for one.
 //!
 //! A turn the pipeline answers with an error becomes one frame
-//! `{"type":"error","status":<n>,"error":{…}}`. When the answer carried a
-//! `retry-after` header (a `429`: the model's credentials are resting, or
-//! the client key is over its rate limit), the frame's error object also
-//! has `headers: {"retry-after": "<seconds>"}` — a socket has no response
-//! headers to put it in.
+//! `{"type":"error","status":<n>,"error":{…},"request_id":"<id>"}`. When
+//! the answer carried a `retry-after` header (a `429`: the model's
+//! credentials are resting, or the client key is over its rate limit), the
+//! frame's error object also has `headers: {"retry-after": "<seconds>"}` —
+//! a socket has no response headers to put it in.
+//!
+//! Every error frame that belongs to a turn carries `request_id`, the id of
+//! the turn's request record (the `x-request-id` an HTTP request would have
+//! been answered with): the frame for a turn the pipeline refused, and an
+//! `error` event in the middle of a turn's stream. Frames that answer a
+//! message the gateway never ran as a request (not JSON, an unknown type,
+//! a full queue, a broken continuation) have no record and no `request_id`.
 
 use super::transcript::{self, Completed, Fault, Prepared, Transcript};
 use super::{ClientSocket, GOING_AWAY, INTERNAL_ERROR};
@@ -137,6 +144,8 @@ struct Turn {
     lane: Option<String>,
     state: TurnState,
     tracker: Tracker,
+    /// The id of the turn's request record, once the pipeline has answered.
+    request_id: Option<String>,
     /// Cancels the gateway request when the turn is dropped unfinished.
     _cancel: DropGuard,
 }
@@ -290,8 +299,9 @@ fn with_lane(frame: String, lane: Option<&str>) -> String {
 }
 
 /// The error frame for a turn the pipeline answered with an error: the
-/// `error` object of the reply's body, under the status it came with:
-/// `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?}}`.
+/// `error` object of the reply's body, under the status it came with, and
+/// the id of the turn's request record:
+/// `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?},"request_id"}`.
 ///
 /// `error.headers` is present only when the reply carried a `retry-after`
 /// header, and then holds exactly that: `{"retry-after": "<seconds>"}` (a
@@ -326,7 +336,39 @@ fn error_frame(reply: &FullReply) -> Value {
     {
         error.insert("headers".to_string(), json!({"retry-after": wait}));
     }
+    if !reply.request_id.is_empty()
+        && let Some(frame) = frame.as_object_mut()
+    {
+        frame.insert("request_id".to_string(), json!(reply.request_id));
+    }
     frame
+}
+
+/// Whether a streamed event is an `error` event (as opposed to a response
+/// event, `response.failed` included). Only events named `error`, or
+/// unnamed ones whose payload says so, are looked into.
+fn is_error_event(event: &SseEvent) -> bool {
+    match event.event.as_deref() {
+        Some("error") => true,
+        Some(name) if name.starts_with("response.") => false,
+        _ => serde_json::from_str::<Value>(&event.data)
+            .is_ok_and(|payload| payload.get("type").and_then(Value::as_str) == Some("error")),
+    }
+}
+
+/// An `error` event's payload with the gateway turn's `request_id`.
+/// A provider id cannot identify a record in the gateway's request log.
+fn with_request_id(data: String, request_id: &str) -> String {
+    if request_id.is_empty() {
+        return data;
+    }
+    match serde_json::from_str::<Value>(&data) {
+        Ok(Value::Object(mut payload)) => {
+            payload.insert("request_id".to_string(), json!(request_id));
+            Value::Object(payload).to_string()
+        }
+        _ => data,
+    }
 }
 
 /// Whether an error status leaves the connection usable: the request was
@@ -377,8 +419,18 @@ impl Session {
         let mut heard = socket.get_ref().bytes_heard();
         let mut unanswered = 0u32;
         let mut draining = false;
+        let mut access_check = tokio::time::interval(Duration::from_secs(1));
+        access_check.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         let end = loop {
+            if self
+                .context
+                .gateway()
+                .validate_session_identity(&self.context.identity)
+                .is_err()
+            {
+                break End::Close(1008, "client access changed; reconnect required");
+            }
             if turn.is_none() {
                 if draining {
                     break End::Close(GOING_AWAY, "the server is shutting down");
@@ -410,6 +462,7 @@ impl Session {
                     // The turn in progress may finish; nothing new starts.
                     draining = true;
                 }
+                _ = access_check.tick() => {}
                 incoming = socket.next() => {
                     let payload: Bytes = match incoming {
                         None => break End::Gone,
@@ -439,6 +492,7 @@ impl Session {
                 step = advance(&mut turn), if turn.is_some() => match step {
                     Step::Reply(Reply::Stream(stream)) => {
                         if let Some(turn) = turn.as_mut() {
+                            turn.request_id = Some(stream.request_id);
                             turn.state = TurnState::Streaming(stream.events);
                         }
                     }
@@ -457,14 +511,18 @@ impl Session {
                         if event.is_done_marker() {
                             continue;
                         }
-                        let lane = match turn.as_mut() {
+                        let (lane, request_id) = match turn.as_mut() {
                             Some(turn) => {
                                 turn.tracker.observe(&event);
-                                turn.lane.clone()
+                                (turn.lane.clone(), turn.request_id.clone())
                             }
-                            None => None,
+                            None => (None, None),
                         };
-                        if !send_text(&mut socket, with_lane(event.data, lane.as_deref())).await {
+                        let data = match request_id {
+                            Some(id) if is_error_event(&event) => with_request_id(event.data, &id),
+                            _ => event.data,
+                        };
+                        if !send_text(&mut socket, with_lane(data, lane.as_deref())).await {
                             break End::Gone;
                         }
                     }
@@ -579,6 +637,7 @@ impl Session {
             lane,
             state: TurnState::Starting(reply),
             tracker: Tracker::default(),
+            request_id: None,
             _cancel: cancel.drop_guard(),
         }))
     }
@@ -760,7 +819,7 @@ mod tests {
             json!({"type": "error", "status": 404, "error": {
                 "message": "unknown model `x`", "type": "invalid_request_error",
                 "param": "model", "code": "model_not_found"
-            }})
+            }, "request_id": "req"})
         );
 
         let frame = error_frame(&reply(
@@ -780,6 +839,42 @@ mod tests {
         // A success that is not a stream cannot be relayed.
         let frame = error_frame(&reply(200, "{}", &[]));
         assert_eq!(frame["status"], 502);
+        // Every one names the request record of its turn.
+        assert_eq!(frame["request_id"], "req");
+        let mut nameless = reply(500, "{}", &[]);
+        nameless.request_id = String::new();
+        assert!(error_frame(&nameless).get("request_id").is_none());
+    }
+
+    #[test]
+    fn error_events_of_a_stream_are_told_apart_and_tagged() {
+        assert!(is_error_event(&named("error", json!({"type": "error"}))));
+        assert!(is_error_event(&SseEvent::data(
+            json!({"type": "error", "error": {"message": "x"}}).to_string()
+        )));
+        assert!(is_error_event(&SseEvent::data(r#"{"type":"er\u0072or"}"#)));
+        for event in [
+            named("response.failed", json!({"type": "response.failed"})),
+            named("response.output_text.delta", json!({"delta": "\"error\""})),
+            SseEvent::data(json!({"type": "response.completed"}).to_string()),
+            SseEvent::data("not json, \"error\""),
+        ] {
+            assert!(!is_error_event(&event), "{event:?}");
+        }
+
+        let tagged: Value = serde_json::from_str(&with_request_id(
+            json!({"type": "error", "error": {"message": "x"}}).to_string(),
+            "req_1",
+        ))
+        .unwrap();
+        assert_eq!(tagged["request_id"], "req_1");
+        assert_eq!(tagged["error"]["message"], "x");
+        // Always identify the gateway record, even if the provider sent an id.
+        let own = json!({"type": "error", "request_id": "theirs"}).to_string();
+        let replaced: Value = serde_json::from_str(&with_request_id(own.clone(), "req_1")).unwrap();
+        assert_eq!(replaced["request_id"], "req_1");
+        assert_eq!(with_request_id(own.clone(), ""), own);
+        assert_eq!(with_request_id("[1]".into(), "req_1"), "[1]");
     }
 
     #[test]

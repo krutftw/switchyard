@@ -40,7 +40,7 @@ const PASSED_HEADERS: [&str; 6] = [
     "session_id",
 ];
 
-#[derive(Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct PlaygroundRequest {
     protocol: Protocol,
@@ -49,6 +49,102 @@ struct PlaygroundRequest {
     model: Option<String>,
     #[serde(default)]
     stream: Option<bool>,
+}
+
+/// Reads the envelope. When it is not JSON because its `body` is not, the
+/// place is given in the body (`line 1, column 9` of what the operator
+/// typed), not in the envelope around it: the dashboard writes the body
+/// into the envelope as text, so an envelope position is offset by the
+/// envelope's own prefix and means nothing to whoever edits the body.
+fn parse_envelope(bytes: &[u8]) -> Result<PlaygroundRequest, ApiFailure> {
+    parse_json(bytes).map_err(|failure| body_syntax_error(bytes).unwrap_or(failure))
+}
+
+/// The 400 for an envelope whose syntax error lies in its `body` value, at
+/// the place in the body; `None` when the error is elsewhere (or there is
+/// none). Line and column follow serde's counting, except that the column
+/// counts characters rather than bytes, as an editor does.
+fn body_syntax_error(bytes: &[u8]) -> Option<ApiFailure> {
+    let error = serde_json::from_slice::<serde::de::IgnoredAny>(bytes).err()?;
+    if !(error.is_syntax() || error.is_eof()) || error.line() == 0 {
+        return None;
+    }
+    let start = body_start(bytes)?;
+    // serde's column is the byte count from the start of the line.
+    let line_start = line_starts(bytes).nth(error.line() - 1)?;
+    let at = (line_start + error.column()).min(bytes.len());
+    if at < start {
+        return None;
+    }
+    let inside = &bytes[start..at];
+    let line = 1 + inside.iter().filter(|&&b| b == b'\n').count();
+    let line_begins = inside
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map_or(0, |newline| newline + 1);
+    let column = String::from_utf8_lossy(&inside[line_begins..])
+        .chars()
+        .count();
+    Some(ApiFailure::bad_field(
+        "body",
+        format!(
+            "is not valid JSON: line {line}, column {column}: {}",
+            crate::shape::syntax_reason(&error)
+        ),
+    ))
+}
+
+/// Byte offsets at which the lines of `bytes` begin.
+fn line_starts(bytes: &[u8]) -> impl Iterator<Item = usize> + '_ {
+    std::iter::once(0).chain(
+        bytes
+            .iter()
+            .enumerate()
+            .filter(|(_, b)| **b == b'\n')
+            .map(|(index, _)| index + 1),
+    )
+}
+
+/// Where the value of the envelope's top-level `body` begins (a byte
+/// offset), found by reading the envelope up to it: `None` when the text up
+/// to there is not the start of a JSON object, or it has no `body`.
+fn body_start(bytes: &[u8]) -> Option<usize> {
+    let skip = |mut at: usize| {
+        while bytes.get(at).is_some_and(u8::is_ascii_whitespace) {
+            at += 1;
+        }
+        at
+    };
+    // One JSON value at `at`; its length in bytes.
+    let value_len = |at: usize| -> Option<usize> {
+        let mut values = serde_json::Deserializer::from_slice(bytes.get(at..)?)
+            .into_iter::<serde::de::IgnoredAny>();
+        values.next()?.ok()?;
+        Some(values.byte_offset())
+    };
+    let mut at = skip(0);
+    if bytes.get(at) != Some(&b'{') {
+        return None;
+    }
+    at += 1;
+    loop {
+        at = skip(at);
+        let mut keys = serde_json::Deserializer::from_slice(bytes.get(at..)?).into_iter::<String>();
+        let key = keys.next()?.ok()?;
+        at = skip(at + keys.byte_offset());
+        if bytes.get(at) != Some(&b':') {
+            return None;
+        }
+        at = skip(at + 1);
+        if key == "body" {
+            return Some(at);
+        }
+        at = skip(at + value_len(at)?);
+        if bytes.get(at) != Some(&b',') {
+            return None;
+        }
+        at += 1;
+    }
 }
 
 fn body_limit(config: &Config) -> usize {
@@ -129,7 +225,7 @@ pub(crate) async fn playground(
     let config = state.gateway.config();
     let headers = passed_headers(request.headers());
     let bytes = read_body(request, body_limit(&config)).await?;
-    let prepared = prepare(parse_json(&bytes)?)?;
+    let prepared = prepare(parse_envelope(&bytes)?)?;
     let body = serde_json::to_vec(&prepared.body)
         .map_err(|_| ApiFailure::internal("the request body could not be serialised"))?;
 
@@ -286,6 +382,90 @@ mod tests {
         assert!(
             serde_json::from_value::<PlaygroundRequest>(json!({"protocol": "smoke", "body": {}}))
                 .is_err()
+        );
+    }
+
+    /// The envelope as the dashboard writes it: the body's text spliced in.
+    fn spliced(body: &str) -> String {
+        format!(r#"{{"protocol":"openai-chat","model":"mock-echo","body":{body}}}"#)
+    }
+
+    /// Regression: a body that is not JSON was reported at its place in
+    /// the envelope (`line 1, column 72`), shifted by the envelope's prefix,
+    /// so the column pointed nowhere in what the operator typed.
+    #[test]
+    fn a_broken_body_is_reported_at_its_place_in_the_body() {
+        for body in [
+            r#"{"model": "x", "messages": [}"#,
+            "{\"messages\": [\n  {\"role\": \"user\" \"content\": \"hi\"}\n]}",
+            r#"{"max_tokens": 01}"#,
+            r#"{"a": tru}"#,
+            "{\n\n  \"a\": 1,,\n}",
+        ] {
+            let alone = serde_json::from_str::<Value>(body).unwrap_err();
+            let failure = parse_envelope(spliced(body).as_bytes()).unwrap_err();
+            assert_eq!(failure.status, StatusCode::BAD_REQUEST, "{body}");
+            assert_eq!(failure.issues.len(), 1, "{body}");
+            assert_eq!(failure.issues[0].path, "body", "{body}");
+            let expected = format!(
+                "is not valid JSON: line {}, column {}: {}",
+                alone.line(),
+                alone.column(),
+                crate::shape::syntax_reason(&alone)
+            );
+            assert_eq!(failure.issues[0].message, expected, "{body}");
+            assert_eq!(
+                failure.message,
+                format!("invalid request: body: {expected}")
+            );
+        }
+
+        // Columns count characters, as an editor does.
+        let failure = parse_envelope(spliced(r#"{"text": "héllo", x}"#).as_bytes()).unwrap_err();
+        assert!(
+            failure.issues[0].message.contains("line 1, column 19:"),
+            "{}",
+            failure.issues[0].message
+        );
+
+        // Whitespace around the body and keys in any order still work.
+        let envelope = "{ \"body\" :\n  {\"a\": ]}, \"protocol\": \"anthropic\"}";
+        let failure = parse_envelope(envelope.as_bytes()).unwrap_err();
+        assert_eq!(failure.issues[0].path, "body");
+        assert!(
+            failure.issues[0]
+                .message
+                .starts_with("is not valid JSON: line 1, column 7:"),
+            "{}",
+            failure.issues[0].message
+        );
+    }
+
+    /// A syntax error before the body is the envelope's own, and is
+    /// reported as before; so is a body that is JSON but not an object.
+    #[test]
+    fn other_envelope_errors_are_unchanged() {
+        let broken = parse_envelope(br#"{"protocol": openai, "body": {}}"#).unwrap_err();
+        assert!(broken.issues.is_empty());
+        assert!(
+            broken
+                .message
+                .starts_with("the request body is not valid JSON: line 1, column 14:"),
+            "{}",
+            broken.message
+        );
+        let no_body = parse_envelope(br#"{"protocol": "openai-chat", "model": x}"#).unwrap_err();
+        assert!(
+            no_body.message.contains("not valid JSON"),
+            "{}",
+            no_body.message
+        );
+        assert!(no_body.issues.is_empty());
+        assert!(parse_envelope(spliced(r#"{"messages": []}"#).as_bytes()).is_ok());
+        assert!(body_start(b"[1, 2]").is_none());
+        assert_eq!(
+            body_start(br#"{"model": {"body": 1}, "body": 7}"#),
+            Some(31)
         );
     }
 

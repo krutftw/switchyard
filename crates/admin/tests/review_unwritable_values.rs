@@ -230,19 +230,21 @@ async fn values_toml_can_hold_are_written_however_odd() {
     let app = App::start().await;
     // The largest integers, awkward keys, control characters, line breaks,
     // empty and nested containers: all of it has a TOML spelling, so none
-    // of it may be refused — and it must come back as it was sent.
+    // of it may be refused — and it must come back as it was sent. (The
+    // keys are rule paths, which may not be empty or hold spaces; the
+    // values and the keys inside them may.)
     let set = json!({
         "largest": i64::MAX,
         "smallest": i64::MIN,
         "floats": [1.0, -0.0, 1e300, 5e-324],
-        "": "an empty key",
+        "nested": {"": "an empty key", "line\nbreak": "a key with a line break"},
         "a.b\\.c": "dots",
-        "quote\"s and 'ticks' = # [x]": true,
-        "line\nbreak": "text\r\nwith \"quotes\", a \\ and a \u{0}",
+        "quote\"s'ticks'=#[x]": true,
+        "line-break": "text\r\nwith \"quotes\", a \\ and a \u{0}",
         "ключ": "значение 🔐",
         "empty": {"list": [], "table": {}},
         "mixed": [1, "two", 3.5, false, [1, [2]], {"k": {"deep": ["v"]}}],
-        "looks like a date": "2026-10-02T12:00:00Z",
+        "looks-like-a-date": "2026-10-02T12:00:00Z",
     });
     let rules = json!({"override": [{"models": ["*"], "set": set}]});
     let (status, body) = app.put("/payload", rules.clone()).await;

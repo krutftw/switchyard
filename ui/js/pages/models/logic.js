@@ -461,6 +461,7 @@ export function buildRows(models, providers) {
       hidden: !!entry.hidden,
       // An alias without a routable target: no request can be served under the name.
       ignored: !!entry.ignored,
+      shadows_model: entry.shadows_model === true,
       isAlias,
       kind: isAlias ? 'alias' : 'model',
       aliasTargets: entry.alias_targets ?? null,

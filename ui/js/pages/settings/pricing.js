@@ -139,8 +139,8 @@ class PriceRow extends Component {
 // The messages a refused save left on one row, as an object that keeps its
 // identity while the messages stay the same (so the row is not redrawn).
 // The body of PUT /pricing is the list itself, so an issue's path starts at
-// the row: "[2].model", or "[2]" for the row as a whole (a price that is
-// negative or not a number).
+// the row: "[2].model", "[2].input" for an invalid price, or "[2]" for
+// a problem with the row as a whole.
 function useRowErrors(issues, rows) {
   const cache = useRef(new Map());
   if (issues.all.length === 0) {

@@ -26,7 +26,7 @@ import { useAsync, useResource } from '../lib/hooks.js';
 import { liveState, useLive, useLiveGap } from '../lib/live.js';
 import { navigate, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
-import { FormSkeleton, fileProblems, focusAfterNotice, secretSettled } from './settings/common.js';
+import { FormSkeleton, OVERRIDE_FLAGS, fileProblems, focusAfterNotice, getPath, secretSettled, valueInUse } from './settings/common.js';
 import { GeneralTab } from './settings/general.js';
 import { LoggingTab } from './settings/logging.js';
 import { PayloadTab } from './settings/payload.js';
@@ -49,23 +49,75 @@ const TABS = [
 
 const FORM_TABS = { general: GeneralTab, routing: RoutingTab, streaming: StreamingTab, logging: LoggingTab };
 
+// How many of a refused file's issues the notice quotes; the rest are counted.
+const ISSUES_QUOTED = 3;
+
+/** "the file is not valid: line 3, column 8: …; … (and 2 more)": the first issues of a refused file. */
+function invalidFile(issues) {
+  const list = Array.isArray(issues) ? issues : [];
+  if (list.length === 0) return 'the file is not a valid configuration';
+  const more = list.length > ISSUES_QUOTED ? ` (and ${list.length - ISSUES_QUOTED} more)` : '';
+  return `the file is not valid: ${fileProblems({ issues: list.slice(0, ISSUES_QUOTED) })}${more}`;
+}
+
+/**
+ * The notice's refusal from `config_rejected` of GET /config, the gateway's
+ * own record of a file it refused: it is there from the first load, also on
+ * a page opened after the refusal.
+ */
+const fromRecord = (record) => ({ ok: false, source: 'record', at: record.at ?? null, issues: record.issues ?? [], message: invalidFile(record.issues) });
+
+/**
+ * The notice's refusal from a config.reloaded frame with ok: false. Its
+ * message starts with words the notice says anyway ("configuration
+ * rejected; the previous one stays in effect"); what follows is the file's
+ * problems. The GET /config the frame triggers then brings the full record.
+ */
+function fromFrame(frame) {
+  const rest = String(frame.message ?? '').replace(/^configuration rejected; the previous one stays in effect:?\s*/i, '');
+  const message = rest === frame.message ? frame.message : rest ? `the file is not valid: ${rest}` : '';
+  return { ok: false, source: 'frame', at: frame.at ?? null, message };
+}
+
 export default function Settings() {
-  const [tabParam, setTab] = useQueryParam('tab', 'general');
+  const [tabParam, setTab] = useQueryParam('tab', 'general', { push: true });
   const tab = TABS.some((entry) => entry.id === tabParam) ? tabParam : 'general';
+  // A stale ?tab= in a link shows General; the address says so too, without
+  // a step in the history.
+  useEffect(() => {
+    if (tabParam !== tab) setTab(tab, { replace: true });
+  }, [tabParam, tab]);
 
   // Live frames keep the forms fresh; without the live connection, poll.
   const liveOpen = useStore(liveState, (s) => s.status === 'open');
   const config = useResource('/config', { pollMs: liveOpen ? 0 : 20_000 });
   const status = useResource('/status');
-  // The file on disk, while the gateway refuses it: { message, at } (null
-  // while the file is fine). The frames come in the order things happened
-  // and one with ok: true follows when a refused file is valid again, so
-  // the latest frame says how the file stands. A save that is refused
-  // because of the file (409) says the same, without a time.
+  // The file on disk, while the gateway refuses it: { message, at, source }
+  // (null while the file is fine). It starts from config_rejected of
+  // GET /config, so it is there after a reload of the page too, and follows
+  // the frames: they come in the order things happened and one with ok: true
+  // follows when a refused file is valid again, so the latest frame says how
+  // the file stands until the GET /config it triggers has answered. A save
+  // that is refused because of the file (409) says the same, without a time.
   const [rejected, setRejected] = useState(null);
 
+  // Each answer of GET /config (and each mutation's, which has the same
+  // shape) is the gateway's word on the file at that moment. The same
+  // refusal keeps its object, so the Raw file tab does not take it for a
+  // new one. A 409 a save ran into stays while the gateway records no
+  // refusal: the file can be broken before the watcher has judged it.
+  const record = config.data?.config_rejected;
+  useEffect(() => {
+    if (config.data === undefined) return;
+    setRejected((current) => {
+      if (!record) return current?.source === 'save' ? current : null;
+      if (current?.source === 'record' && current.at === record.at && current.issues.length === (record.issues ?? []).length) return current;
+      return fromRecord(record);
+    });
+  }, [config.data]);
+
   useLive('config.reloaded', (data) => {
-    setRejected(data && data.ok === false ? data : null);
+    setRejected(data && data.ok === false ? fromFrame(data) : null);
     // After a change of the admin secret, wait until this session uses it.
     secretSettled().then(() => {
       config.refresh();
@@ -80,7 +132,7 @@ export default function Settings() {
   });
 
   // A refusal that is already shown says more (when it happened) and stays.
-  const diskInvalid = (error) => setRejected((current) => current ?? { ok: false, message: `the file is not valid: ${fileProblems(error)}`, at: null });
+  const diskInvalid = (error) => setRejected((current) => current ?? { ok: false, source: 'save', message: invalidFile(error?.issues), at: null });
 
   useCommands(
     () =>
@@ -108,10 +160,27 @@ export default function Settings() {
     }
   };
   useEffect(() => {
-    if (reload.error) setRejected({ ok: false, message: reload.error.message, at: Date.now() });
+    if (reload.error) setRejected({ ok: false, source: 'reload', message: reload.error.message, at: Date.now() });
   }, [reload.error]);
 
-  const restart = config.data?.restart_required ?? [];
+  // A setting the command line fixes (--host, --port) is never waiting for
+  // a restart: a restart with the same command line keeps the flag's value.
+  // The gateway leaves such settings out of restart_required; so does this.
+  const overrides = config.data?.command_line_overrides ?? status.data?.command_line_overrides ?? [];
+  const restart = (config.data?.restart_required ?? []).filter((setting) => !overrides.includes(setting));
+  // Overridden settings whose value in the file is not the one in use: the
+  // restart notice says a restart does not apply them. (On their own they
+  // get no notice: the General tab says it next to Port and Host.)
+  const listen = status.data?.listen ?? null;
+  const pinned = config.data
+    ? overrides.flatMap((setting) => {
+        const inUse = valueInUse(setting, listen);
+        const inFile = getPath(config.data.config, setting);
+        // listen is the bound address: "localhost" in the file reads as 127.0.0.1 there.
+        const same = String(inFile) === String(inUse) || (setting === 'server.host' && /^localhost$/i.test(String(inFile)) && /^(127\.|::1$)/.test(String(inUse)));
+        return inUse == null || inFile == null || same ? [] : [{ setting, inFile, inUse }];
+      })
+    : [];
   const FormTab = FORM_TABS[tab];
 
   let body;
@@ -124,7 +193,7 @@ export default function Settings() {
   else {
     // `refused` is the refusal itself, so the tab can tell a new one from the
     // one it has already looked into; it reports back which one was resolved.
-    body = html`<${RawTab} key="raw" onConfig=${config.mutate} refused=${rejected} onValid=${(resolved) => setRejected((current) => (current === resolved ? null : current))} />`;
+    body = html`<${RawTab} key="raw" onConfig=${config.mutate} config=${config.data} listen=${listen} refused=${rejected} onValid=${(resolved) => setRejected((current) => (current === resolved ? null : current))} />`;
   }
 
   return html`
@@ -145,7 +214,10 @@ export default function Settings() {
       <//>`}
       ${restart.length > 0 &&
       html`<${Notice} tone="caution" title="Restart needed">
-        Saved, but only applied when the gateway restarts: ${restart.map((setting, i) => html`${i > 0 ? ', ' : ''}<span class="mono" key=${setting}>${setting}</span>`)}. Until then it keeps running with the previous ${restart.length === 1 ? 'value' : 'values'}.
+        Saved, but only applied when the gateway restarts: ${restart.map((setting, i) => html`${i > 0 ? ', ' : ''}<span class="mono" key=${setting}>${setting}</span>`)}. Until then it keeps running with the previous ${restart.length === 1 ? 'value' : 'values'}.${pinned.map(
+          ({ setting, inFile, inUse }) =>
+            html`<span key=${setting}>${' '}A restart does not apply <span class="mono">${setting}</span> = <span class="mono">${String(inFile)}</span> from the file: the gateway was started with <span class="mono">${OVERRIDE_FLAGS[setting]}</span>, which keeps <span class="mono">${String(inUse)}</span> in effect.</span>`,
+        )}
       <//>`}
       ${config.error &&
       config.data &&

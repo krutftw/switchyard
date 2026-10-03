@@ -176,8 +176,9 @@ function Headline({ summary, range, priced, hasPrices, loading, stale }) {
 
 export default function Usage() {
   const route = useRoute();
-  const [rangeParam, setRange] = useQueryParam('range', DEFAULT_RANGE);
-  const [groupParam, setGroup] = useQueryParam('group', DEFAULT_GROUP);
+  // Picking a range or a grouping is a step Back returns to.
+  const [rangeParam, setRange] = useQueryParam('range', DEFAULT_RANGE, { push: true });
+  const [groupParam, setGroup] = useQueryParam('group', DEFAULT_GROUP, { push: true });
   // A stale link (?range=90d) shows the default instead of an empty page.
   const range = rangeOf(rangeParam);
   const group = groupOf(groupParam);
@@ -286,7 +287,7 @@ export default function Usage() {
     const ok = await confirm({
       danger: true,
       title: 'Clear all usage statistics?',
-      message: 'This deletes the request list, every time bucket of every range and the usage files on disk. Totals since start and captured bodies are kept. It cannot be undone.',
+      message: 'This deletes the request list, every time bucket of every range and the usage files on disk, and resets the usage shown for each client key on the API keys page. Totals since start and captured bodies are kept. It cannot be undone.',
       confirmLabel: 'Clear statistics',
       typeToConfirm: 'clear',
       action: () => api.del('/usage'),
@@ -421,6 +422,7 @@ export default function Usage() {
                 group=${g}
                 rows=${shaped[g.value].rows}
                 range=${shownRange}
+                since=${summary?.from}
                 slots=${timeseries && g.value === chartGroup.value ? shaped[g.value].slots : null}
                 loading=${firstLoad}
                 stale=${rangeChanging}

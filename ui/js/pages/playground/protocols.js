@@ -945,22 +945,40 @@ export function createReader(protocol) {
 const quote = (text) => JSON.stringify(text.length > 60 ? `${text.slice(0, 60)}…` : text);
 
 /**
+ * An error event in a few words: its status, its code (else its type) and
+ * the start of its message, `429 rate_limit_exceeded "Mock rate limit…"`.
+ * `named`: the event's own name already says it failed (an `error` frame or
+ * SSE event, `response.failed`), so the note does not say "error" again.
+ */
+function errorNote(json, named) {
+  const error = readError(json);
+  const parts = [named ? null : 'error', error.status || null, error.code ?? error.type, error.message ? quote(error.message) : null].filter((part) => part != null && part !== '');
+  return parts.length > 0 ? parts.join(' ') : 'error';
+}
+
+/**
  * What one stream event carries, in a few words, for the event list: the
  * raw data of consecutive chunks starts with the same forty characters, so
  * the list would otherwise not say which chunk holds what. Returns '' when
  * there is nothing short to say; the raw data is always shown next to it.
+ *
+ * `event` is { event, data, json }: `event` is the SSE event name ("message"
+ * when the stream names none); a WebSocket frame has none, its name is its
+ * `type`.
  */
 export function digestEvent(protocol, event) {
   if (event.data === '[DONE]') return 'end of stream';
   const json = event.json;
   if (!isObject(json)) return '';
-  if (json.error != null || json.type === 'error') return `error ${quote(readError(json).message)}`;
+  const type = String(json.type ?? '');
+  if (json.error != null || type === 'error' || type === 'response.failed') {
+    const name = event.event && event.event !== 'message' ? event.event : type;
+    return errorNote(json, name === 'error' || name === 'response.failed');
+  }
 
   if (protocol === 'openai-responses') {
-    const type = String(json.type ?? '');
     if (typeof json.delta === 'string') return quote(json.delta);
     if (type === 'response.output_item.added' || type === 'response.output_item.done') return [json.item?.type, json.item?.name].filter(Boolean).join(' ');
-    if (type === 'response.failed') return `error ${quote(readError(json).message)}`;
     if (type === 'response.completed' || type === 'response.incomplete') {
       const usage = readUsage(protocol, json.response?.usage);
       return usage ? `${usage.input ?? 0} in, ${usage.output ?? 0} out` : String(json.response?.status ?? '');

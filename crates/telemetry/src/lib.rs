@@ -22,6 +22,7 @@ pub mod bodies;
 pub mod bus;
 pub mod gauges;
 pub mod logs;
+mod private_files;
 pub mod record;
 pub mod redact;
 mod telemetry;
@@ -48,8 +49,8 @@ pub use redact::{
 pub use telemetry::{PruneReport, Telemetry, TelemetryOptions};
 pub use time::utc_day;
 pub use usage::{
-    BucketSize, DEFAULT_PAGE_SIZE, DEFAULT_RECENT_CAPACITY, GroupBy, GroupPoint, Latency,
-    LoadReport, MAX_PAGE_SIZE, NamedTotals, OTHER, Range, RequestPage, RequestQuery, StatsTick,
-    StatusFilter, TimePoint, Timeseries, Totals, USAGE_DIR, UsageQuery, UsageStore, UsageStoreInfo,
-    UsageStoreOptions, UsageSummary, usage_dir,
+    BadCursor, BucketSize, DEFAULT_PAGE_SIZE, DEFAULT_RECENT_CAPACITY, GroupBy, GroupPoint,
+    Latency, LoadReport, MAX_PAGE_SIZE, NamedTotals, OTHER, Range, RequestPage, RequestQuery,
+    StatsTick, StatusFilter, TimePoint, Timeseries, Totals, USAGE_DIR, UsageQuery, UsageStore,
+    UsageStoreInfo, UsageStoreOptions, UsageSummary, usage_dir,
 };

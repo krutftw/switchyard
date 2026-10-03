@@ -3,10 +3,11 @@
 //
 // The HTTP view sends through POST /admin/api/playground (no client key
 // needed; the request runs as the built-in "dashboard" client). The
-// WebSocket view talks to the public endpoint, GET /v1/responses.
+// WebSocket view mints a single-use ticket with a header-only client key,
+// then talks to GET /v1/responses?ticket=… without putting the key in a URL.
 //
-//   #/playground?mode=ws           the WebSocket view
-//   #/playground?inspect=events    the inspector tab
+//   #/playground?mode=ws           the WebSocket view (each pick is a history step)
+//   #/playground?inspect=events    the inspector tab (each pick is a history step)
 //   #/playground?from=<request id> load that request's captured body in raw mode
 //
 // Sub-modules, in pages/playground/:
@@ -47,6 +48,7 @@ import { copyText, loadStyles, nextId } from '../lib/dom.js';
 import { formatDateTime, formatNumber, plural } from '../lib/format.js';
 import { useDebounced, useLocalStorage, useMediaQuery, useResource } from '../lib/hooks.js';
 import { liveState, useLive, useLiveGap } from '../lib/live.js';
+import { replayProblem } from '../lib/replay.js';
 import { href, useQueryParam } from '../lib/router.js';
 import { useStore } from '../lib/store.js';
 import Combobox from './playground/combobox.js';
@@ -81,9 +83,6 @@ await loadStyles('pages/playground.css');
 
 /** Request records seen on the live connection, by id, for the Info tab. */
 const RECORD_MEMORY = 24;
-
-/** Recorded endpoints whose captured body is a request the playground can send again. */
-const REPLAYABLE = /\/v1\/chat\/completions$|\/v1\/responses(?: \(WebSocket\))?$|\/v1\/messages$|:(?:stream)?[gG]enerateContent$|\/playground$/;
 
 /** Issue paths of the playground envelope that have a field on this page. */
 const FIELD_PATHS = ['protocol', 'model', 'stream', 'body'];
@@ -159,8 +158,12 @@ function suffixHint(raw) {
 
 export default function Playground() {
   const origin = useMemo(gatewayOrigin, []);
-  const [mode, setMode] = useQueryParam('mode', 'http');
-  const [inspect, setInspect] = useQueryParam('inspect', 'request');
+  // The transport and the inspector tab are picked from a few choices: each
+  // pick is a step in the history, so Back returns to the previous one.
+  // Nothing on the page is lost by such a step (the conversation and the
+  // raw body live in session.js), so none of them asks first.
+  const [mode, setMode] = useQueryParam('mode', 'http', { push: true });
+  const [inspect, setInspect] = useQueryParam('inspect', 'request', { push: true });
   const [from, setFrom] = useQueryParam('from', '');
   const coarse = useMediaQuery('(pointer: coarse)');
 
@@ -499,7 +502,8 @@ export default function Playground() {
     const check = checkRawBody(raw.text);
     if (check.error) {
       setRawError(check.error);
-      setInspect('request');
+      // Shows the field at fault; the reader did not pick the tab.
+      setInspect('request', { replace: true });
       setView('next');
       return;
     }
@@ -638,21 +642,25 @@ export default function Playground() {
     if (!source.data || work.appliedFrom === from) return;
     const record = source.data.record ?? {};
     work.appliedFrom = from;
-    const text = source.data.bodies?.client_request;
-    if (typeof text !== 'string' || text === '') {
-      setReplay({ id: from, kind: 'no-body', record });
+    // "no-body", "protocol" (not one of the four) or "endpoint" (embeddings,
+    // token counts and the like): the same check the request drawer makes
+    // before it offers "Open in playground".
+    const problem = replayProblem(record, source.data.bodies);
+    if (problem) {
+      setReplay({ id: from, kind: problem, record });
       return;
     }
-    if (!PROTOCOL_IDS.includes(record.client_protocol)) {
-      setReplay({ id: from, kind: 'protocol', record });
+    const editing = session.get().raw;
+    // The editor still holds this request's body, as it was loaded or as it
+    // was edited since: Back or Forward to an entry with this ?from= (the
+    // tabs and the transport are steps in the history), or the same link
+    // followed again. Keep it, and say again where it is.
+    const loaded = work.loaded;
+    if (loaded?.id === from && editing.on && editing.seed === loaded.seed) {
+      setReplay({ id: from, kind: 'loaded', record, cut: loaded.cut, edited: editing.text !== editing.seed });
       return;
     }
-    // Embeddings, images, token counts and the like are logged under a
-    // protocol too, but their bodies are not generation requests.
-    if (typeof record.endpoint === 'string' && !REPLAYABLE.test(record.endpoint)) {
-      setReplay({ id: from, kind: 'endpoint', record });
-      return;
-    }
+    const text = source.data.bodies.client_request;
     const pretty = formatJson(text.trim());
     const load = () => {
       patch({
@@ -663,11 +671,12 @@ export default function Playground() {
         stream: !!record.stream,
       });
       enterRaw(pretty ?? text);
-      setInspect('request');
-      if (mode !== 'http') setMode('http');
-      setReplay({ id: from, kind: 'loaded', record, cut: pretty === null });
+      work.loaded = { id: from, seed: pretty ?? text, cut: pretty === null };
+      // Not steps of their own: the link that brought ?from= is the step.
+      setInspect('request', { replace: true });
+      if (mode !== 'http') setMode('http', { replace: true });
+      setReplay({ id: from, kind: 'loaded', record, cut: pretty === null, edited: false });
     };
-    const editing = session.get().raw;
     if (!editing.on || editing.text === editing.seed) {
       load();
       return;
@@ -703,8 +712,9 @@ export default function Playground() {
     if (source.loading || !replay || replay.id !== from) return html`<${Notice} tone="info" title="Loading the request to replay">Fetching the captured body of ${name}.<//>`;
     if (replay.kind === 'asking') return html`<${Notice} tone="info" title="A recorded request is ready to load">The body of ${name} replaces the raw JSON you edited once you confirm.<//>`;
     if (replay.kind === 'no-body') {
+      // Named as the Settings page names them (and as the request drawer does).
       return html`<${Notice} tone="caution" title="This request has no captured body" action=${dismiss}>
-        Bodies are only captured while logging.request_log is "errors" or "all". Turn it on in <a href=${href('/settings')}>Settings</a>, send the request again, then replay it from the request log.
+        Bodies are captured only while Capture is set to Failed requests or Every request under Request bodies, on the Logging and usage tab of <a href=${href('/settings', { tab: 'logging' })}>Settings</a>. Send the request again once it is, then replay it from the request log.
       <//>`;
     }
     if (replay.kind === 'protocol') {
@@ -718,9 +728,11 @@ export default function Playground() {
       <//>`;
     }
     return html`<${Notice} tone=${replay.cut ? 'caution' : 'info'} title="Loaded a recorded request" action=${dismiss}>
-      The body of ${name}${replay.record.started_at ? `, sent ${formatDateTime(replay.record.started_at)}` : ''}, is in raw mode under Request. ${replay.cut
+      The body of ${name}${replay.record.started_at ? `, sent ${formatDateTime(replay.record.started_at)}` : ''}, is in raw mode under Request${replay.edited ? ', with your edits' : ''}. ${replay.cut && !replay.edited
         ? 'The capture was cut off or redacted, so it is not valid JSON yet: complete it before sending.'
-        : 'Edit it if you like, then send it.'}
+        : replay.edited
+          ? 'Send it when you are ready.'
+          : 'Edit it if you like, then send it.'}
     <//>`;
   })();
 
@@ -758,7 +770,7 @@ export default function Playground() {
     mode === 'ws'
       ? null
       : html`
-          <${CopyButton} variant="secondary" size="md" value=${curl} label="Copy as curl">Copy as curl<//>
+          <${CopyButton} variant="secondary" size="md" value=${curl} label="Copy curl for bash/zsh">Copy curl (bash/zsh)<//>
           <${Menu}
             label="Copy SDK setup"
             trigger=${(props) => html`<${Button} iconRight="chevron-down" ...${props}>Copy code<//>`}

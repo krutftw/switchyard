@@ -211,12 +211,16 @@ pub(crate) fn describe(path: &str, message: &str) -> ConfigIssue {
 /// Why a body is not JSON at all, with the place written the way the rest
 /// of the API writes places (`line L, column C`).
 pub(crate) fn syntax(error: &serde_json::Error) -> String {
-    let text = error.to_string();
-    let what = without_position(&text);
+    let what = syntax_reason(error);
     if error.line() == 0 {
-        return what.to_string();
+        return what;
     }
     format!("line {}, column {}: {what}", error.line(), error.column())
+}
+
+/// Why a body is not JSON, without the place.
+pub(crate) fn syntax_reason(error: &serde_json::Error) -> String {
+    without_position(&error.to_string()).to_string()
 }
 
 #[cfg(test)]

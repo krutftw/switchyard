@@ -9,7 +9,7 @@ it takes or returns. All of it is re-exported from the crate root.
 use switchyard_gateway::{
     ClientIdentity, ClientRequest, DiscoveryState, DiscoveryStatus, FullReply, Gateway,
     GatewayOptions, PresentedCredentials, ProviderTest, RawRequest, Reply, StartError,
-    StreamReply, UpstreamWsSession, WsEnd, WsOpenRequest, WsOutcome,
+    StreamReply, UpstreamWsSession, WsEnd, WsOpenRequest, WsOutcome, WsTicket,
     // conveniences re-exported from dependencies:
     ConfigStore, Transport, UpstreamWebSocket, WsMessage,
 };
@@ -135,28 +135,77 @@ without applying anything twice.)
 
 ## Authentication
 
-### `PresentedCredentials { authorization, x_api_key, x_goog_api_key, query_key }`
+### `PresentedCredentials { authorization, x_api_key, x_goog_api_key, query_key, ws_ticket }`
 
 The four places a client may put its key, as `Option<String>`s taken verbatim
-from the request. `PresentedCredentials::from_headers(&headers, query_key)`
-fills the three header slots. `Debug` shows only which slots are filled.
+from the request, plus the `ticket` query parameter of a WebSocket upgrade.
+`PresentedCredentials::from_headers(&headers, query_key)` fills the three
+header slots (and no ticket). `Debug` shows only which slots are filled. Fill
+`ws_ticket` on WebSocket routes only: presenting a ticket uses it up.
 
 ### `Gateway::authenticate(&self, &PresentedCredentials) -> Result<ClientIdentity, ApiError>`
 
 Candidates in order: `Authorization` (`Bearer x`, else the raw value),
-`x-api-key`, `x-goog-api-key`, query `key`. The first candidate that
-**matches** an enabled key wins. Nothing presented → 401 `missing API key`;
-presented, no match → 401 `invalid API key`. With `auth.required = false`
-both cases give an anonymous identity. Comparison is constant-time, on keys
-with secret references (`env:NAME`) resolved.
+`x-api-key`, `x-goog-api-key`, query `key`, then the WebSocket ticket. The
+first candidate that **matches** an enabled key wins; the ticket is looked at
+(and used up) only when no key matched. Nothing presented → 401 `missing API
+key`; presented, no match → 401 `invalid API key` — also for a ticket that is
+unknown, expired or already used. With `auth.required = false` both cases
+give an anonymous identity. Comparison is constant-time, on keys with secret
+references (`env:NAME`) resolved.
+
+A live ticket authenticates as the key that bought it **as configured now**:
+its name, id, allow-list and rate-limit window (shared with the key's other
+requests). A key disabled or removed after minting takes its tickets with it
+(401). A ticket bought anonymously authenticates as the anonymous identity
+while `auth.required` is off, and not at all once it is on.
+
+### `Gateway::refresh_identity(&self, &ClientIdentity) -> Result<ClientIdentity, ApiError>`
+
+Revalidates an issued identity against the current key table and returns its
+current name, model allow-list and rate-limit window. Removed or disabled
+keys return 401 `invalid_api_key`; anonymous identities also fail when keys
+become required. Internal dashboard identities remain internal. This does
+not consume a request from the rate limit.
+
+### `Gateway::validate_session_identity(&self, &ClientIdentity) -> Result<(), ApiError>`
+
+Checks current access without consuming a rate-limit request. In addition to
+revocation, a changed model allow-list or requests-per-minute limit returns
+401 and requires reconnection. The server calls this between socket messages
+and on a one-second timer, closing Responses and Realtime sessions with code
+1008 when access changes.
+
+### `Gateway::issue_ws_ticket(&self, &ClientIdentity) -> Result<WsTicket, ApiError>`
+
+Mints a single-use ticket for a client WebSocket, standing for `identity` (a
+client key, or the anonymous client): browsers cannot set headers on a
+WebSocket, and a ticket in the URL is worth nothing after one use or 30
+seconds, where the key itself would be. Not a request: no record, no usage, no
+rate-limit hit. Each key (and the anonymous client) has at most 32 tickets
+outstanding; minting another drops its oldest, so one client never spoils
+another's. The built-in `dashboard` identity gets a 403 error. Tickets live in
+memory only (a restart forgets them) and are never logged. Minting revalidates
+the identity first, so a revoked identity cannot buy another ticket.
+
+### `WsTicket { ticket, expires_in }`
+
+`ticket`: 43 URL-safe characters (32 random bytes, base64url), to be sent as
+`?ticket=`; `expires_in`: `30` (seconds). `Debug` hides the ticket.
 
 ### `ClientIdentity { key_id, key_name, anonymous, internal, .. }`
 
 Who a request runs as. `key_id` is `ConfigStore`'s `client_key_id` of the
 resolved key (never the key). The model allow-list and rate limit are
 private; `allows_model(&str) -> bool` and `rate_limit_rpm() -> Option<u32>`
-read them. The pipeline enforces both (403 naming the model; 429 with
-`Retry-After`, sliding one-minute window).
+read their captured values. Each generation, count, raw request and upstream
+WebSocket handshake revalidates the identity and enforces the current
+restrictions (403 naming the model; 429 with `Retry-After`, sliding one-minute
+window). Model authorization uses the resolved registered model or alias
+name, not a fuzzy spelling supplied by the client. Restricted keys cannot
+send non-null root-level `models`, `route`, `fallbacks`,
+`context_window_fallbacks` or `preset` fields that let an upstream select
+another model outside the gateway's routing decision.
 
 ### `Gateway::dashboard_identity(&self) -> ClientIdentity`
 
@@ -208,8 +257,9 @@ The pipeline. Never fails as a Rust call.
   `Full` reply**, so the client sees a real HTTP status.
 * `Reply::Stream(StreamReply)` — the upstream produced its first event.
 
-Inside: JSON parse → model + stream flag → allow-list and rate limit →
-resolve (reasoning suffix split off) → attempt loop (`routing.max_attempts`;
+Inside: JSON parse → model + stream flag → resolve (reasoning suffix split
+off) → current identity, registered-model allow-list and rate-limit checks →
+attempt loop (`routing.max_attempts`;
 streams additionally `streaming.bootstrap_retries` for failures inside the
 stream) → passthrough when the upstream speaks the client's protocol and the
 body carries no foreign signature, translation otherwise → reply. Failed
@@ -348,6 +398,21 @@ They can be read (`telemetry().bodies().read(id)`) from the moment
 reacts to the event finds them, whether or not the file is written yet. A
 request served by a `mock` provider has no upstream response to capture.
 
+**Log lines.** Every request whose record is not `ok` — of any kind:
+generation, token counting, raw side endpoints, relayed WebSocket sessions —
+logs one `request failed: <message>` line when its record is published, with
+`request`, `endpoint`, `model`, `status`, `kind` and `attempts` fields and
+the record's (redacted) error message. Its level says whose failure it was:
+
+| Level | Failures |
+|---|---|
+| WARN | the gateway's or an upstream's: any 5xx (a rejected upstream credential is a 502), a `429` that is not the client key's own limit (every credential resting, an upstream's rate limit), a stream or WebSocket session that failed after its `200` / `101`, a task that ended without settling its request |
+| DEBUG | the client's: what the gateway refused from the request alone (unreadable body, unknown model, a model the key may not use, the key's own rate limit), other 4xx an upstream answered (a request fault), a client that went away (`client_disconnect`) |
+
+Authentication failures never reach the gateway's pipeline; the server's
+per-request access line (DEBUG) covers them. The per-attempt `upstream call
+failed` lines of the transport stay at DEBUG.
+
 **What the client sees of the upstream.** Passthrough forwards the upstream's
 bytes — a complete Responses body that reports a failed generation excepted
 (above) — with two exceptions on streams: a Chat Completions client that did not
@@ -425,8 +490,11 @@ the server; `query` must not contain the client's gateway key.
 
 Always a `Reply::Full`. Picks an `openai` / `openai-compat` credential for
 the model (404 when the model has no such route), forwards the body with only
-the JSON `model` field replaced by the upstream id (bodies that are not JSON
-are forwarded byte for byte), and returns the upstream's status, body and
+the JSON `model` field replaced by the upstream id and the object serialized
+again even when the model id was already correct. The server's raw JSON routes
+also serialize the parsed body regardless of its media-type label, so duplicate
+JSON fields cannot change the authorized model downstream. Library callers'
+non-JSON bodies are forwarded byte for byte. Returns the upstream's status, body and
 `Content-Type`. Errors are in the OpenAI envelope.
 
 Side endpoints are optional — an upstream may serve chat and nothing else, a
@@ -452,7 +520,8 @@ handshake (`openai-beta`, `openai-safety-identifier`,
 
 ### `Gateway::open_upstream_ws(&self, WsOpenRequest) -> Result<UpstreamWsSession, ApiError>` (async)
 
-Checks allow-list and rate limit, resolves, and connects with failover across
+Resolves, revalidates current client access, checks the registered model's
+allow-list and rate limit, and connects with failover across
 credentials on handshake failures (an upstream 401/403 is a 502, as
 everywhere). 404 when no provider of the required kind serves the model; 429
 with `retry_after_secs` — and no upstream wording — when every credential
@@ -614,6 +683,18 @@ Some(method == "streamGenerateContent")`; route `countTokens` to
 `count_tokens` and `raw` always return `Reply::Full`; treat a `Stream` there
 as unreachable (answer 500).
 
+## WebSocket tickets
+
+`POST /v1/ws-ticket`: authenticate as above (headers or `?key=`; never a
+ticket), then answer `201 {"ticket": t.ticket, "expires_in": t.expires_in}`
+with `cache-control: no-store` for `gateway.issue_ws_ticket(&identity)`, or
+`error_reply` for its `Err`. Do not call `generate`: minting is not a request.
+
+On every WebSocket upgrade route, put the `ticket` query parameter into
+`presented.ws_ticket` before calling `authenticate`; leave it out everywhere
+else. Never pass `ticket` (or `key`) on to an upstream, and never log a query
+string.
+
 ## SSE
 
 For a `Reply::Stream`: status 200, `content-type: text/event-stream`,
@@ -652,6 +733,10 @@ above, covers every case with one line.
 
 ## A Responses WebSocket turn
 
+The gateway revalidates the identity for each turn. The socket owner must also
+call `validate_session_identity` between messages and periodically while idle
+or streaming; close with code 1008 on failure and cancel any active turn.
+
 For each `response.create` on a client WebSocket, build the Responses request
 body (transcript merging is `switchyard_codecs::responses`' job), force
 `stream: true`, and call:
@@ -672,7 +757,11 @@ match gateway.generate(request).await {
 }
 ```
 
-The error frame is `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?}}`.
+The error frame is `{"type":"error","status":<n>,"error":{"message","type","code"?,"param"?,"headers"?},"request_id"}`,
+`request_id` being `full.request_id` — the id of the turn's request record.
+An `error` event that arrives in the middle of a turn's stream is given the
+same member (`stream.request_id`) before it is sent. Only error frames for
+messages that never became a request (not JSON, a full queue, …) have none.
 The Responses WebSocket error frame may carry `error.headers`: when
 `full.header("retry-after")` is set (a `429` for resting credentials or for
 the client key's rate limit), put it there as
@@ -702,7 +791,12 @@ session.finish(WsOutcome::closed().with_usage(usage));
 ```
 
 Hold `gateway.telemetry().track_ws()` for the lifetime of each client
-WebSocket so the dashboard's connection gauge is right.
+WebSocket so the dashboard's connection gauge is right. Revalidate session
+access between messages and on a one-second timer, closing both sides on a
+change. Parse upstream `type: "error"` frames and redact their decoded string
+values with `session.redact` before re-serializing them; preserve ordinary
+content frames. JSON escapes in the event type and credential do not bypass
+this handling.
 
 ## Model listings
 

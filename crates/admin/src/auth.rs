@@ -34,7 +34,7 @@
 
 use crate::error::ApiFailure;
 use crate::{Access, Shared};
-use axum::extract::{ConnectInfo, Query, Request, State};
+use axum::extract::{ConnectInfo, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use base64::Engine;
@@ -53,7 +53,7 @@ use subtle::ConstantTimeEq;
 pub(crate) const MAX_FAILURES: u32 = 5;
 /// How long a locked-out address is refused.
 pub(crate) const LOCKOUT: Duration = Duration::from_secs(30 * 60);
-/// Addresses remembered at most; the least recently seen is forgotten first.
+/// Addresses remembered at most; only unlocked entries may be forgotten.
 pub(crate) const LOCKOUT_CAPACITY: usize = 10_000;
 /// An address that is not locked out and has not failed for this long is
 /// forgotten.
@@ -182,6 +182,22 @@ pub(crate) struct Lockouts {
 impl Lockouts {
     /// How much longer `key` is locked out, if it is.
     pub fn locked(&mut self, key: LockoutKey, now: Instant) -> Option<Duration> {
+        if !self.entries.contains_key(&key) && self.entries.len() >= LOCKOUT_CAPACITY {
+            self.sweep(now);
+            if self.entries.len() >= LOCKOUT_CAPACITY
+                && self
+                    .entries
+                    .values()
+                    .all(|entry| entry.locked_until.is_some_and(|until| until > now))
+            {
+                return self
+                    .entries
+                    .values()
+                    .filter_map(|entry| entry.locked_until)
+                    .min()
+                    .map(|until| until - now);
+            }
+        }
         let until = self.entries.get(&key)?.locked_until?;
         if until > now {
             return Some(until - now);
@@ -194,6 +210,9 @@ impl Lockouts {
     /// Counts a wrong secret. Returns the lockout that this failure started,
     /// if it was the fifth in a row.
     pub fn failure(&mut self, key: LockoutKey, now: Instant) -> Option<Duration> {
+        if let Some(wait) = self.locked(key, now) {
+            return Some(wait);
+        }
         self.sweep(now);
         if !self.entries.contains_key(&key) && self.entries.len() >= LOCKOUT_CAPACITY {
             self.evict_oldest();
@@ -243,6 +262,7 @@ impl Lockouts {
         let oldest = self
             .entries
             .iter()
+            .filter(|(_, entry)| entry.locked_until.is_none())
             .min_by_key(|(_, entry)| entry.last_seen)
             .map(|(key, _)| *key);
         if let Some(key) = oldest {
@@ -260,18 +280,20 @@ impl Lockouts {
 /// the ticket in the URL instead of the secret.
 #[derive(Debug, Default)]
 pub(crate) struct Tickets {
-    live: HashMap<String, Instant>,
+    live: HashMap<String, (Instant, [u8; 32])>,
 }
 
 impl Tickets {
     /// A new ticket: 32 random bytes, URL-safe, valid for [`TICKET_TTL`].
-    pub fn issue(&mut self, now: Instant) -> String {
-        self.live.retain(|_, expires| *expires > now);
+    pub fn issue(&mut self, secret_digest: [u8; 32], now: Instant) -> String {
+        self.live.retain(|_, (expires, issued_digest)| {
+            *expires > now && *issued_digest == secret_digest
+        });
         while self.live.len() >= TICKET_CAPACITY {
             let soonest = self
                 .live
                 .iter()
-                .min_by_key(|(_, expires)| **expires)
+                .min_by_key(|(_, (expires, _))| *expires)
                 .map(|(ticket, _)| ticket.clone());
             match soonest {
                 Some(ticket) => self.live.remove(&ticket),
@@ -281,15 +303,18 @@ impl Tickets {
         let mut bytes = [0u8; 32];
         rand::rng().fill_bytes(&mut bytes);
         let ticket = URL_SAFE_NO_PAD.encode(bytes);
-        self.live.insert(ticket.clone(), now + TICKET_TTL);
+        self.live
+            .insert(ticket.clone(), (now + TICKET_TTL, secret_digest));
         ticket
     }
 
     /// Uses a ticket up. True when it existed and had not expired.
-    pub fn redeem(&mut self, ticket: &str, now: Instant) -> bool {
+    pub fn redeem(&mut self, ticket: &str, secret_digest: &[u8; 32], now: Instant) -> bool {
         self.live
             .remove(ticket)
-            .is_some_and(|expires| expires > now)
+            .is_some_and(|(expires, issued_digest)| {
+                expires > now && bool::from(issued_digest.ct_eq(secret_digest))
+            })
     }
 
     #[cfg(test)]
@@ -357,6 +382,13 @@ struct TicketQuery {
     ticket: String,
 }
 
+impl crate::routes::QueryParams for TicketQuery {
+    fn validate(_name: &str, _value: &str) -> Result<(), ApiFailure> {
+        // Ticket validity is checked when it is redeemed below.
+        Ok(())
+    }
+}
+
 fn not_found() -> ApiFailure {
     ApiFailure::not_found("not found")
 }
@@ -389,10 +421,10 @@ fn admit(state: &Shared, access: &Access, request: &Request) -> Result<AuthConte
     };
 
     if is_ws_route(request.uri().path()) {
-        let ticket = Query::<TicketQuery>::try_from_uri(request.uri())
-            .map(|Query(query)| query.ticket)
-            .unwrap_or_default();
-        if ticket.is_empty() || !state.tickets.lock().redeem(&ticket, now) {
+        let ticket =
+            crate::routes::parse_query::<TicketQuery>(request.uri().query().unwrap_or_default())?
+                .ticket;
+        if ticket.is_empty() || !state.tickets.lock().redeem(&ticket, &secret_digest, now) {
             return Err(ApiFailure::unauthorized(
                 "the ticket is missing, expired or already used",
             ));
@@ -414,6 +446,7 @@ fn admit(state: &Shared, access: &Access, request: &Request) -> Result<AuthConte
     }
     if any_matches(&candidates, &secret_digest) {
         lockouts.success(key);
+        crate::routes::validate_query(request.uri().query().unwrap_or_default())?;
         return Ok(context);
     }
     match lockouts.failure(key, now) {
@@ -698,8 +731,8 @@ mod tests {
     fn tickets_are_single_use_and_expire() {
         let start = Instant::now();
         let mut tickets = Tickets::default();
-        let a = tickets.issue(start);
-        let b = tickets.issue(start);
+        let a = tickets.issue([7; 32], start);
+        let b = tickets.issue([7; 32], start);
         assert_ne!(a, b);
         // 32 bytes, URL-safe, no padding.
         assert_eq!(a.len(), 43);
@@ -708,30 +741,69 @@ mod tests {
                 .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
         );
 
-        assert!(tickets.redeem(&a, start + Duration::from_secs(1)));
-        assert!(!tickets.redeem(&a, start + Duration::from_secs(1)));
-        assert!(!tickets.redeem("made-up", start));
+        assert!(tickets.redeem(&a, &[7; 32], start + Duration::from_secs(1)));
+        assert!(!tickets.redeem(&a, &[7; 32], start + Duration::from_secs(1)));
+        assert!(!tickets.redeem("made-up", &[7; 32], start));
         // Thirty seconds on, the other one is worthless.
-        assert!(!tickets.redeem(&b, start + TICKET_TTL));
+        assert!(!tickets.redeem(&b, &[7; 32], start + TICKET_TTL));
         assert_eq!(tickets.len(), 0);
 
-        let c = tickets.issue(start);
-        assert!(tickets.redeem(&c, start + TICKET_TTL - Duration::from_millis(1)));
+        let c = tickets.issue([7; 32], start);
+        assert!(tickets.redeem(&c, &[7; 32], start + TICKET_TTL - Duration::from_millis(1)));
+    }
+
+    #[test]
+    fn tickets_are_bound_to_the_secret_that_issued_them() {
+        let start = Instant::now();
+        let mut tickets = Tickets::default();
+        let old = tickets.issue([1; 32], start);
+        assert!(!tickets.redeem(&old, &[2; 32], start));
+        assert!(!tickets.redeem(&old, &[1; 32], start));
+        let old = tickets.issue([1; 32], start);
+        let current = tickets.issue([2; 32], start);
+        assert!(!tickets.redeem(&old, &[1; 32], start));
+        assert!(tickets.redeem(&current, &[2; 32], start));
+    }
+
+    #[test]
+    fn active_lockouts_are_never_evicted_to_admit_new_addresses() {
+        let now = Instant::now();
+        let mut table = Lockouts::default();
+        for i in 0..LOCKOUT_CAPACITY as u32 {
+            let key = LockoutKey {
+                ip: IpAddr::V4(Ipv4Addr::from(0x0b00_0000 + i)),
+                relayed: false,
+            };
+            table.entries.insert(
+                key,
+                Entry {
+                    failures: 0,
+                    locked_until: Some(now + LOCKOUT),
+                    last_seen: now,
+                },
+            );
+        }
+        let newcomer = direct("10.0.0.1");
+        assert_eq!(table.locked(newcomer, now), Some(LOCKOUT));
+        assert_eq!(table.failure(newcomer, now), Some(LOCKOUT));
+        assert_eq!(table.len(), LOCKOUT_CAPACITY);
+        assert!(!table.entries.contains_key(&newcomer));
+        assert_eq!(table.locked(newcomer, now + LOCKOUT), None);
     }
 
     #[test]
     fn the_ticket_store_is_bounded() {
         let start = Instant::now();
         let mut tickets = Tickets::default();
-        let first = tickets.issue(start);
+        let first = tickets.issue([7; 32], start);
         for i in 1..=TICKET_CAPACITY as u64 {
-            tickets.issue(start + Duration::from_millis(i));
+            tickets.issue([7; 32], start + Duration::from_millis(i));
         }
         assert_eq!(tickets.len(), TICKET_CAPACITY);
         // The oldest outstanding ticket made room.
-        assert!(!tickets.redeem(&first, start + Duration::from_secs(1)));
+        assert!(!tickets.redeem(&first, &[7; 32], start + Duration::from_secs(1)));
         // Expired tickets are dropped when the next one is issued.
-        tickets.issue(start + TICKET_TTL + Duration::from_secs(5));
+        tickets.issue([7; 32], start + TICKET_TTL + Duration::from_secs(5));
         assert_eq!(tickets.len(), 1);
     }
 

@@ -48,6 +48,8 @@ zstd = { version = "0.14", default-features = false }
 pretty_assertions.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
+# Captures every log line of a test, to check that no credential is in one.
+tracing-subscriber.workspace = true
 # `start_paused` lets keep-alive timing be tested without waiting.
 tokio = { workspace = true, features = ["test-util"] }
 # A self-signed certificate for the TLS test (ring backend, like the server).

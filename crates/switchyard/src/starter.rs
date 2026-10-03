@@ -57,12 +57,88 @@ fn random_token(len: usize) -> String {
         .collect()
 }
 
+/// The `--host` / `--port` flags of the run that writes the starter
+/// configuration (the first `serve`). They override the file for that run,
+/// so the file says so instead of naming an address that is not in use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Flags {
+    /// `--host`, when given.
+    pub host: Option<String>,
+    /// `--port`, when given (`0`: a free port chosen at start-up).
+    pub port: Option<u16>,
+}
+
+impl Flags {
+    /// The lines the `[server]` section opens with: which flags this run
+    /// used and that the values below apply without them. Empty without
+    /// flags.
+    fn server_note(&self) -> String {
+        let host = self.shown_host();
+        let port = self.port.map(|port| match port {
+            0 => "--port 0 (a free port chosen at start-up)".to_string(),
+            port => format!("--port {port}"),
+        });
+        let (used, without, values) = match (host, port) {
+            (None, None) => return String::new(),
+            (Some(host), None) => (format!("--host {host}"), "--host", "the host below applies"),
+            (None, Some(port)) => (port, "--port", "the port below applies"),
+            (Some(host), Some(port)) => (
+                format!("--host {host} {port}"),
+                "them",
+                "the host and port below apply",
+            ),
+        };
+        format!(
+            "# This first run used {used}; without {without} {values}.\n\
+             # A flag on the command line always overrides the value in this file.\n"
+        )
+    }
+
+    /// `--host` as it may be shown in a comment: a control character (a
+    /// line break) would end the comment.
+    fn shown_host(&self) -> Option<String> {
+        self.host
+            .as_deref()
+            .map(|host| host.chars().filter(|c| !c.is_control()).collect())
+    }
+
+    /// The line(s) the `[admin]` section opens with: what the secret is for
+    /// and where the dashboard of this run is.
+    fn admin_note(&self) -> String {
+        let host = self.shown_host();
+        let host = host.as_deref().unwrap_or(STARTER_HOST);
+        match self.port.unwrap_or(DEFAULT_PORT) {
+            0 => "# Secret for the dashboard (at /admin/ on the address the gateway prints at\n\
+                  # start-up) and the admin API.\n"
+                .to_string(),
+            port => {
+                let url = urls::dashboard_url(&urls::base_url(host, port, false));
+                if *self == Flags::default() {
+                    format!("# Secret for the dashboard ({url}) and the admin API.\n")
+                } else {
+                    format!(
+                        "# Secret for the dashboard and the admin API. Started as on the first\n\
+                         # run, the dashboard is at {url}\n"
+                    )
+                }
+            }
+        }
+    }
+}
+
 /// The text of a starter configuration: loopback listener, the given admin
 /// secret and client key, the mock provider, and commented-out examples of
 /// the real provider kinds.
 pub fn starter_config(secrets: &StarterSecrets) -> String {
+    starter_config_for(secrets, &Flags::default())
+}
+
+/// [`starter_config`] written by a run with these command-line flags.
+pub fn starter_config_for(secrets: &StarterSecrets, flags: &Flags) -> String {
     let admin_secret = &secrets.admin_secret;
     let client_key = &secrets.client_key;
+    let server_note = flags.server_note();
+    let admin_note = flags.admin_note();
     format!(
         r#"# Switchyard configuration, written by `switchyard init`.
 #
@@ -74,12 +150,11 @@ pub fn starter_config(secrets: &StarterSecrets) -> String {
 # variable: "env:OPENAI_API_KEY" or "${{OPENAI_API_KEY}}".
 
 [server]
-host = "{STARTER_HOST}"        # "0.0.0.0" to accept connections from other machines
+{server_note}host = "{STARTER_HOST}"        # "0.0.0.0" to accept connections from other machines
 port = {DEFAULT_PORT}
 
 [admin]
-# Secret for the dashboard (http://{STARTER_HOST}:{DEFAULT_PORT}/admin/) and the admin API.
-# It was generated for this file. SWITCHYARD_ADMIN_SECRET in the environment
+{admin_note}# It was generated for this file. SWITCHYARD_ADMIN_SECRET in the environment
 # overrides it; with no secret at all, both are switched off.
 secret = "{admin_secret}"
 
@@ -153,22 +228,30 @@ impl Created {
     /// `dashboard` is the dashboard URL; `None` when the port is not known
     /// yet (`serve --port 0`), in which case the start banner names it.
     pub fn announcement(&self, dashboard: Option<&str>) -> String {
-        let mut text = format!(
-            "wrote a starter configuration to {}\n\
+        self.announcement_with_secrets(dashboard, true)
+    }
+
+    /// Server startup logs omit credentials when stderr is redirected.
+    pub fn announcement_with_secrets(&self, dashboard: Option<&str>, show_secrets: bool) -> String {
+        let mut text = format!("wrote a starter configuration to {}\n", self.path.display(),);
+        if show_secrets {
+            text.push_str(&format!(
+                "\
              \x20 admin secret  {}\n\
              \x20 client key    {}  (name: {STARTER_KEY_NAME})\n",
-            self.path.display(),
-            self.secrets.admin_secret,
-            self.secrets.client_key,
-        );
+                self.secrets.admin_secret, self.secrets.client_key,
+            ));
+        }
         match dashboard {
             Some(url) => text.push_str(&format!("  dashboard     {url}\n")),
             None => text.push_str("  dashboard     see the address below, under /admin/\n"),
         }
-        text.push_str(
-            "Both secrets are stored in that file and are not shown again. \
-             The mock provider is enabled, so clients can connect right away.",
-        );
+        text.push_str(if show_secrets {
+            "Both secrets are stored in that file and are not shown again. "
+        } else {
+            "Read the admin secret and client key from that file; credentials are omitted from startup logs. "
+        });
+        text.push_str("The mock provider is enabled, so clients can connect right away.");
         text
     }
 }
@@ -183,8 +266,13 @@ pub fn starter_dashboard_url() -> String {
 /// An existing file is left alone unless `force` is set, in which case it is
 /// replaced. Missing parent directories are created.
 pub fn create(path: &Path, force: bool) -> Result<Created, CliError> {
+    create_for(path, force, &Flags::default())
+}
+
+/// [`create`] for a run with these command-line flags (see [`Flags`]).
+pub fn create_for(path: &Path, force: bool, flags: &Flags) -> Result<Created, CliError> {
     let secrets = StarterSecrets::generate();
-    let text = starter_config(&secrets);
+    let text = starter_config_for(&secrets, flags);
     write_new_file(path, &text, force)?;
     Ok(Created {
         path: absolute(path),
@@ -330,6 +418,90 @@ mod tests {
         );
     }
 
+    /// Regression (A2-2): a first run with `--port` wrote a file whose
+    /// comment named the dashboard at the default port, which that run did
+    /// not use, and nothing said the flag overrode the file.
+    #[test]
+    fn a_first_run_with_flags_names_the_address_in_use() {
+        let plain = starter_config(&fixed());
+        assert!(plain.contains("# Secret for the dashboard (http://127.0.0.1:8317/admin/) and"));
+        assert!(!plain.contains("first run"));
+
+        let port = Flags {
+            host: None,
+            port: Some(18534),
+        };
+        let text = starter_config_for(&fixed(), &port);
+        assert!(
+            text.contains(
+                "[server]\n# This first run used --port 18534; without --port the port below \
+                 applies.\n# A flag on the command line always overrides the value in this \
+                 file.\nhost = \"127.0.0.1\""
+            ),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "[admin]\n# Secret for the dashboard and the admin API. Started as on the first\n\
+                 # run, the dashboard is at http://127.0.0.1:18534/admin/\n"
+            ),
+            "{text}"
+        );
+
+        let both = Flags {
+            host: Some("0.0.0.0".into()),
+            port: Some(9000),
+        };
+        let text = starter_config_for(&fixed(), &both);
+        assert!(
+            text.contains(
+                "# This first run used --host 0.0.0.0 --port 9000; without them the host and port \
+                 below apply."
+            ),
+            "{text}"
+        );
+        // A wildcard is reached on loopback.
+        assert!(
+            text.contains("dashboard is at http://127.0.0.1:9000/admin/\n"),
+            "{text}"
+        );
+
+        // Nothing a flag holds can break out of the comments.
+        let host = Flags {
+            host: Some("gw.local\nport = 1".into()),
+            port: None,
+        };
+        let text = starter_config_for(&fixed(), &host);
+        assert!(
+            text.contains(
+                "# This first run used --host gw.localport = 1; without --host the host below \
+                 applies."
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("\nport = 1"), "{text}");
+
+        let any_port = Flags {
+            host: None,
+            port: Some(0),
+        };
+        let text = starter_config_for(&fixed(), &any_port);
+        assert!(
+            text.contains("--port 0 (a free port chosen at start-up)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("(at /admin/ on the address the gateway prints at\n# start-up)"),
+            "{text}"
+        );
+
+        // Whatever the flags, the file itself is the same configuration.
+        for flags in [port, both, host, any_port] {
+            let config = validate_text(&starter_config_for(&fixed(), &flags)).unwrap();
+            assert_eq!(config, validate_text(&plain).unwrap(), "{flags:?}");
+        }
+    }
+
     #[test]
     fn starter_config_points_to_the_full_example() {
         let text = starter_config(&fixed());
@@ -395,5 +567,9 @@ mod tests {
         let pending = created.announcement(None);
         assert!(pending.contains("/admin/"));
         assert_eq!(starter_dashboard_url(), "http://127.0.0.1:8317/admin/");
+        let logged = created.announcement_with_secrets(None, false);
+        assert!(!logged.contains(&created.secrets.admin_secret));
+        assert!(!logged.contains(&created.secrets.client_key));
+        assert!(logged.contains("switchyard.toml"));
     }
 }

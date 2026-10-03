@@ -82,7 +82,8 @@ fix is not a regression test: run it against the old code once.
 
 ```
 ui/
-  index.html            shell document, font preloads; loads js/theme-boot.js and js/app.js
+  index.html            shell document, the two font faces and their preloads;
+                        loads js/theme-boot.js and js/app.js
   favicon.svg
   package.json          marks the .js files as ES modules for Node and editors; no dependencies
   UI_GUIDE.md           this file
@@ -105,7 +106,9 @@ ui/
     shell/              shell.js (frame, navigation, signOut), palette.js (Ctrl/Cmd+K)
     lib/
       api.js            fetch wrapper, ApiError, session, streamSSE
-      live.js           live event client, useLive, useLiveGap, liveState
+      live.js           live event client, useLive, useLiveGap (and its onDown), liveState
+      replay.js         canReplayInPlayground, replayProblem: can the playground
+                        send a recorded request again
       store.js          createStore, useStore
       router.js         useRoute, navigate, href, useQueryParam, setQuery;
                         leave guards: useLeaveGuard, registerLeaveGuard, mayLeave
@@ -322,6 +325,24 @@ Only an action that can itself resolve `0`, `''` or `false` needs
 Destructive writes go through `confirm({ ..., action })` or `ConfirmDialog`,
 which run the request, show progress and keep the error in the dialog.
 
+### Replaying a recorded request
+
+The playground loads a recorded request from `#/playground?from=<request id>`.
+Whether it can is answered in one place, `js/lib/replay.js`, so a link is
+never offered for a request the playground then refuses:
+
+```js
+import { canReplayInPlayground, replayProblem } from '../lib/replay.js';
+
+canReplayInPlayground(record, bodies)   // offer "Open in playground": right kind, body captured
+canReplayInPlayground(record)           // the right kind of request, body or not
+replayProblem(record, bodies)           // null, 'no-body', 'protocol' or 'endpoint'
+```
+
+`record` and `bodies` are what `GET /requests/{id}` returns. The protocols
+(`REPLAY_PROTOCOLS`, the playground's own four) and the generation endpoints
+(`REPLAY_ENDPOINTS`) are exported for tests; do not keep a copy in a page.
+
 ## Live updates
 
 `js/lib/live.js` holds one WebSocket for the whole app. It buys a ticket,
@@ -353,6 +374,16 @@ connection is open again after being down (not on the first connection of a
 session) and `reason: 'lagged'` for a lagged frame. Outside components:
 `live.onGap(fn)` returns the unsubscribe function.
 
+**Down.** A view that must act the moment the connection is lost, not only
+once it is back (stop calling a list live, start polling, end a run of
+frames), passes `onDown` as well: `useLiveGap(feed.resync, { onDown: feed.down })`.
+`onDown({ reason: 'down' })` is called once when a connection that was open
+closes, with `liveState.status` already reading `reconnecting`; not for a
+socket that never opened, not again for each failed retry, and not for a
+sign-out. The gap handler's `reason: 'reconnect'` closes the pair. Outside
+components: `live.onDown(fn)` returns the unsubscribe function. Do not watch
+`liveState.status` for transitions to learn the same thing.
+
 Patterns:
 
 - **Live table:** load a page with `useResource`, prepend frames with
@@ -361,7 +392,9 @@ Patterns:
   "12 new requests" as the way back. `useLiveGap(res.refresh)` covers
   reconnects and lag.
 - **Live numbers:** render the last `stats` frame; fall back to polling
-  `/status` when `liveState.status` is not `open`.
+  `/status` when `liveState.status` is not `open` (reading the state to
+  decide what to show is fine; `onDown` is for doing something once, when
+  it changes).
 - **config.reloaded / credential:** refetch the resource the page shows.
 
 ## Forms and API issues
@@ -394,11 +427,15 @@ html`<${Form} onSubmit=${async () => { if (await save.run()) { toast.success('Pr
 - `save.run()` is truthy when the save went through, whether the gateway
   answered with a body or with a bare 204 (see `useAsync`).
 - `issues.at('a.b[0].c')` matches `a.b.0.c` too. Call `at`/`under` in the
-  same render function as `FormError`.
+  same render function as `FormError`. Claims last only that render: when
+  an edited or removed field stops asking for an issue, the notice lists it
+  again. Issue paths already quoted in the gateway message are not repeated.
 - `Form` does not call `onSubmit` while a control shows text it could not
   take as its value: a `NumberInput` holding `5000` where `max` is 1000 keeps
   reporting the last good number, marks itself invalid with the reason, and
-  gets the focus when the user presses Enter. What is saved is always what
+  gets the focus when the user presses Enter or clicks the form's submit
+  button. A submit-button blur does not clamp and save an unseen value in
+  the same click; other blurs still settle the number. What is saved is always what
   is on screen. Nothing to do in the page; do not work around it with your
   own Enter handling.
 - Secrets: the API masks them in responses, and a secret field sent back
@@ -411,14 +448,22 @@ html`<${Form} onSubmit=${async () => { if (await save.run()) { toast.success('Pr
   will be, with a caveat the user should see ("Keys this short are easy to
   guess"): the caution colour, no `aria-invalid`, and the form still submits.
   It takes the hint's place while it shows; an error takes both.
+  Labels, hints and messages can appear or disappear without rebuilding
+  the control: focus, caret and partially typed numbers stay in place.
 - `FormError` prints the gateway's message as a sentence (capital first word,
   full stop) before its own "Check the highlighted field." Do the same where
   you put a gateway message in front of other text: `sentence(error.message)`
   from `lib/format.js`.
+  `ErrorState` and failed `ConfirmDialog` actions apply this themselves;
+  confirmations also list the API issues using `FormError`.
 - A button that is `loading` keeps the keyboard focus (it is `aria-disabled`,
   not `disabled`) and ignores clicks, including the Enter that would submit
   its form again. Nothing to do in the page; do not move focus yourself when
   a save starts or ends.
+- `aria-disabled=${true}` gives `Button` the same focus-preserving disabled
+  behavior without a spinner. It looks disabled and ignores clicks and
+  implicit submit clicks. Use it when a control turns off under the user's
+  focus, as Previous/Next do at the ends of `Pagination`.
 - Keep the form on screen when saving fails. Never clear what was typed.
 - Guard unsaved changes when leaving a drawer or page: the next section.
 
@@ -512,7 +557,7 @@ the component; this is the summary. Shared conventions:
 
 | Component | Props | Example |
 |---|---|---|
-| `Button` | `variant` secondary · primary · ghost · danger · danger-quiet; `size`; `icon`, `iconRight`; `loading` (spinner; clicks ignored; stays focusable); `disabled`; `href`; `block`; `type` | `<${Button} variant="primary" icon="plus" onClick=${add}>Add provider<//>` |
+| `Button` | `variant` secondary · primary · ghost · danger · danger-quiet; `size`; `icon`, `iconRight`; `loading` (spinner; clicks ignored; stays focusable); `aria-disabled` (same behavior without spinner); `disabled`; `href`; `block`; `type` | `<${Button} variant="primary" icon="plus" onClick=${add}>Add provider<//>` |
 | `IconButton` | `icon`, `label` (required: name and tooltip), `variant` (ghost), `size`, `tooltip`, `tooltipSide` | `<${IconButton} icon="refresh" label="Refresh" onClick=${refresh} />` |
 | `CopyButton` | `value` (string or function, may be async), `label`, `size`, `variant`, children for a labelled button | `<${CopyButton} value=${id} label="Copy request id" />` |
 | `Spinner` | `size`, `label` | `<${Spinner} label="Loading" />` |
@@ -539,7 +584,7 @@ drawing an SVG in a page.
 | `StatusLamp` | `tone`, `label`, `detail`, `pulse`, `size`, `title`; other props (`data-*`, `id`) go to its root element | `<${StatusLamp} tone="caution" label="Cooling down" detail="41s left" />` |
 | `Badge` | `tone`, `mono`, `outline`, `lamp`, `title`; other props go to its element | `<${Badge} mono tone=${toneForStatus(r.status)}>${r.status}<//>` |
 | `Kbd` | children | `<${Kbd}>Esc<//>` |
-| `toneForStatus(status)` | HTTP status to tone | 2xx clear, 3xx and 429 caution, other 4xx/5xx stop |
+| `toneForStatus(status)` | HTTP status to tone | 1xx info (a 101 is a WebSocket switched to), 2xx clear, 3xx and 429 caution, other 4xx/5xx stop, none off. A caller holding a record's `ok` lets it decide: `r.ok === false ? 'stop' : toneForStatus(r.status)` (a stream that broke after its 200 failed) |
 | `toneWord(tone)` | a tone in a word a person would say | `Healthy`, `Warning`, `Critical`, `In progress`, `Inactive` |
 
 A lamp always has words next to it (or a `title` when the column header says
@@ -555,16 +600,16 @@ else.
 | `Page` | `title`, `description`, `actions` | see "Adding a page" |
 | `Panel` (`Card`) | `title`, `description`, `actions`, `footer`, `flush`; other props go to the `<section>` | `<${Panel} title="Credentials" flush>…<//>` |
 | `Notice` | `tone`, `title`, `icon`, `action`, children | `<${Notice} tone="caution" title="Restart needed">…<//>` |
-| `StatGroup` | `label`, children (`Stat`s); other props (`data-*`, `id`) go to the group's element | `<${StatGroup} label="Traffic" data-stale=${stale ? '' : undefined}>…<//>` |
-| `Stat` | `label`, `value` (formatted), `unit`, `delta` (ratio), `goodWhen` up · down · none, `deltaLabel`, `hint`, `trend`, `lamp`, `lampLabel` (words, or `false`), `loading` | `<${Stat} label="Error rate" value="1.8" unit="%" delta=${0.31} goodWhen="down" deltaLabel="vs previous hour" />` |
+| `StatGroup` | `label`, children (`Stat`s); other props (`data-*`, `id`) go to the group's element. `data-stale` dims every value and trend in it (labels stay) | `<${StatGroup} label="Traffic" data-stale=${stale ? '' : undefined}>…<//>` |
+| `Stat` | `label`, `value` (formatted), `unit`, `delta` (ratio), `goodWhen` up · down · none, `deltaLabel`, `hint`, `trend`, `lamp`, `lampLabel` (words, or `false`), `loading`. In a narrow cell the `trend` narrows before the value does | `<${Stat} label="Error rate" value="1.8" unit="%" delta=${0.31} goodWhen="down" deltaLabel="vs previous hour" />` |
 | `KeyValue` | `items` `[{ label, value, mono, copy, hidden }]` | `<${KeyValue} items=${[{ label: 'Request id', value: id, mono: true, copy: true }]} />` |
-| `CodeBlock` | `value` (string or object), `language` auto · json · text, `title` (text or markup), `label`, `wrap`, `copy`, `maxHeight`, `note`, `actions` | `<${CodeBlock} title="Upstream request" value=${body} />` |
+| `CodeBlock` | `value` (string or object), `language` auto · json · text, `title` (text or markup; without one the bar holds only the tools: they never sit over the code), `label`, `wrap`, `copy`, `maxHeight`, `note`, `actions` | `<${CodeBlock} title="Upstream request" value=${body} />` |
 | `Timeline` | `items` `[{ tone, toneLabel, title, badges, time, description }]`; `toneLabel` names the lamp ("Failed"), default `toneWord(tone)` | attempts of a request, see the kit |
 | `Skeleton` | `width`, `height`, `lines` | `<${Skeleton} lines=${4} />` |
 | `EmptyState` | `icon`, `title`, `description`, `action`, `compact` | `<${EmptyState} icon="key" title="No client keys yet" description="…" action=${button} />` |
 | `ErrorState` | `error` (ApiError), `title`, `description`, `onRetry`, `retrying`, `compact` | `<${ErrorState} title="Could not load providers" error=${res.error} onRetry=${res.refresh} />` |
 | `Pagination` | `page`, `pageSize`, `total`, `onPage`, `noun` | known totals |
-| `LoadMore` | `hasMore`, `loading`, `onLoad`, `shown`, `noun` | cursor paging (`before=`) |
+| `LoadMore` | `hasMore`, `loading`, `onLoad`, `shown`, `noun` (a pair `['request', 'requests']`, or a plural ending in "s" whose singular drops it) | cursor paging (`before=`); the end reads "All 12 requests shown", or "The only request is shown" |
 
 Do not nest panels. Inside a panel separate with `<hr>` or space. Stats go
 in a `StatGroup`, not in separate cards. An empty state says what will appear
@@ -594,7 +639,10 @@ parsed and re-serialised, so a 64-bit `seed`, `1.0` versus `1`, key order,
 duplicate keys and escapes are shown, and copied, exactly as they were on
 the wire. An object you pass has already been through `JSON.parse` and can
 only be shown as JavaScript sees it. Text that is not valid JSON (a truncated
-capture, SSE lines) is shown unchanged.
+capture, SSE lines) is shown unchanged and uncoloured, even with
+`language="json"`. Formatting is bounded to 200,000 input characters,
+64 nesting levels and 1,000,000 output characters; documents exceeding a
+budget retain their original text. Colouring also skips oversized text.
 
 ### Table
 
@@ -622,7 +670,9 @@ Column: `key`, `header`, `label`, `render(row, index)`, `align`, `num`,
   the menu in its CSS: `.my-table .table-sortbar { display: none }`).
 - Put the table in `<Panel flush>`. Loading, empty and error states are built
   in; pass `loading`, `error`, `empty`, and `errorTitle` to name what could
-  not be loaded ("Could not load the providers").
+  not be loaded ("Could not load the providers"). During a retry, keep the
+  error alongside `loading`: its button stays focused and shows progress.
+  When rows replace it, `ErrorState` hands focus to the new content.
 - `dense` (32px rows) is for streams: requests, logs.
 - Each row carries its key in the DOM as `data-row-key`
   (`tbody.querySelector('[data-row-key="…"]')`): for moving focus to the
@@ -793,7 +843,7 @@ drawer say, set `--surface-bg` on the diagram's container to that colour.
 ```js
 html`<${LineChart}
   x=${buckets.map((b) => b.at)}                    // epoch ms, or category labels
-  series=${[{ key: 'gpt-4o', label: 'gpt-4o', values: [...] }, ...]}
+  series=${[{ key: 'gpt-4o', label: 'gpt-4o', values: [...] }, ...]}   // optional title: the full name
   yFormat=${formatCompact} valueFormat=${formatNumber}
   stale=${res.refreshing}
   label="Requests per minute by model, last hour" />`
@@ -821,8 +871,12 @@ columns always stack from zero).
 - The tooltip lists every series. From five series on it leaves out the ones
   whose value in that bucket is zero or missing, so a quiet minute reads as
   one or two lines; with nothing left it says "Nothing in this bucket".
-- A long series name in the legend is cut with an ellipsis (the full name is
-  its `title`). Keep names short all the same: the tooltip has less room.
+- A long series name in the legend, and in a column heading of the table
+  view, is cut with an ellipsis; the full name is its `title`. That is the
+  series' own `title` when you give one, so a page that shortens names for
+  the chart keeps the full one reachable:
+  `{ key: id, label: shortName(id), title: id, values }`. Keep names short
+  all the same: the tooltip has less room.
 
 | Component | Props | Example |
 |---|---|---|
@@ -830,7 +884,7 @@ columns always stack from zero).
 | `BarList` | `items` `[{ key, label, value, hint, href, color }]`, `format`, `share`, `rank`, `limit` (folds the rest into "N others"), `sort`, `mono`, `emptyText` | `<${BarList} items=${byModel} format=${formatTokens} share limit=${8} />` |
 | `LatencyBars` | `items` `[{ label, value (ms), tone }]`, `max`, `format` | `<${LatencyBars} items=${[{ label: 'p50', value: 420 }, { label: 'p99', value: 3100, tone: 'caution' }]} />` |
 | `Meter` | `value`, `max` (default 1), `tone` clear · caution · stop, `text` (default the percentage; `false` hides it), `label` | `<${Meter} value=${468} max=${600} text="468 / 600 rpm" label="Rate limit use" />` |
-| `HealthStrip` | `buckets` `[{ ok, failed, label }]` oldest first, `slots` (default 20), `label`, `noun` (what the buckets count, plural, for the spoken summary; default "requests") | `<${HealthStrip} buckets=${p.attempts} label=${p.name} noun="upstream attempts" />` |
+| `HealthStrip` | `buckets` `[{ ok, failed, label }]` oldest first, `slots` (default 20), `label`, `noun` (what the buckets count, for the spoken summary: a pair `[one, many]`, or a plural ending in "s" whose singular drops it; default "requests"). One attempt reads "0% of 1 recent upstream attempt succeeded" | `<${HealthStrip} buckets=${p.attempts} label=${p.name} noun=${['upstream attempt', 'upstream attempts']} />` |
 | `seriesColor(series, i)`, `foldSeries(series, keep)`, `niceScale(min, max, target, { integer })` | helpers for custom SVG in a page | `foldSeries(series, 5)` keeps the five largest and sums the rest into "Other" |
 
 Pick the form by the question:
@@ -975,18 +1029,37 @@ Tokens: `--dur-press` 110ms, `--dur-fast` 150ms, `--dur-base` 200ms,
   `inLayer: true`: it then fires for keys pressed inside the topmost layer.
 - Do not remove the focus ring. Do not add `outline: none` without a
   replacement.
-- Focus is never dropped on `<body>`. Overlays hand it back (see Overlays);
-  when your own control removes itself (a dismiss button, "Show 12 new"),
-  move focus to what took its place. The shell does it for the page: on a
+- Focus is never dropped on `<body>`. Overlays hand it back (see Overlays).
+  `ErrorState` and `Notice` hand focus to replacement content or the next
+  control when their own focused action removes them; `LoadMore` hands it
+  to the end-of-list summary. A dismissed toast hands focus to the next
+  toast, the previously focused element, or `<main>`. For another control
+  that removes itself ("Show 12 new"), move focus to its replacement, or
+  use `useFocusHandOff(ref, { to })`. Explicit page focus choices win.
+  The shell does it for the page: on a
   change of page, and when it replaces the sign-in form after signing in,
   the focus goes to `<main>`. A plain load of a remembered session leaves it
   where the browser put it, so the first Tab reaches "Skip to content".
+  A route change preserves focus placed inside the new content and keeps
+  accidental browser focus off the skip link; explicitly tabbing to that
+  link still works.
 - Colour is never the only signal: lamps have labels, charts have legends
   and tables, invalid fields have text.
 - Icon-only controls use `IconButton` (it requires `label`).
 - Live regions: `Notice tone="stop"` and error toasts are announced; do not
   add `role="alert"` to things that are on screen from the start.
-- Touch targets are 44px on coarse pointers; the control tokens already grow.
+- **Touch targets.** On coarse pointers (touch screens) the control tokens
+  grow: buttons, inputs and selects are 34px (`sm`), 40px (`md`) and 46px
+  (`lg`) tall, and menu items 44px. Controls drawn smaller than that (icon
+  buttons, switches, checkboxes, a tag's remove button, a sort header) get
+  an invisible hit area of 44px (`--tap-min`) centred on them, a segmented
+  option 44px of height; a text field's input fills its whole outline. So
+  no shared control a finger has to hit is under 24px, and the small ones
+  reach 44px. Inline text links are the exception, as in any text. A control
+  of your own that is drawn small (a chip in a log line) is yours to size:
+  give it the same hit area, a `::before` of `max(100%, var(--tap-min))`
+  inside `@media (pointer: coarse)` on an element with `position: relative`
+  (see `.icon-btn::before` in `components.css`).
 - Test at 360px wide, at 200% zoom, in both themes, with reduced motion.
 
 ## Copy
@@ -1046,11 +1119,17 @@ Plain, specific, no marketing. Write what an operator at 3 a.m. needs.
 | `formatDuration`, `formatTokens`, `formatCurrency` | `toFixed` and string concatenation |
 | Inline SVG icons from `icons.js` | Emoji or symbol characters as icons |
 | Hairlines and space to separate | Nested panels, coloured side stripes |
-| Mask secrets; reveal on request | Secrets in the URL, in logs, or in `localStorage` |
+| Mask secrets; reveal on request | Secrets in the URL or logs; provider/client secrets in `localStorage` |
 | `useLeaveGuard(dirty, …)` for unsaved changes | Your own `hashchange`, `popstate` or `beforeunload` listeners |
-| `useLiveGap(res.refresh)` after reconnects and lag | Watching `liveState` for transitions by hand |
+| `useLiveGap(res.refresh)` after reconnects and lag, `{ onDown }` for the moment it drops | Watching `liveState` for transitions by hand |
 | `useResource(key, { keepPrevious: true })` across a range switch | Keeping the last data in a ref of your own |
 | Scripts in files | Inline `<script>` or `onclick=` (the CSP refuses them) |
+
+The admin sign-in is an explicit storage exception: the admin master
+credential stays in memory and `sessionStorage`, and "Remember on this
+device" additionally keeps it in `localStorage`. Use a trusted browser
+profile; same-origin scripts and anyone with access to that profile can
+read it. See [Security model](../docs/SECURITY-MODEL.md).
 
 ## htm and Preact notes
 

@@ -8,7 +8,7 @@ use crate::logging::{self, LogControl};
 use crate::out;
 use crate::starter::{self, STARTER_HOST, absolute};
 use crate::urls;
-use std::io::ErrorKind;
+use std::io::{ErrorKind, IsTerminal};
 use std::path::Path;
 use std::time::Duration;
 use switchyard_admin::AdminOptions;
@@ -27,7 +27,14 @@ pub fn run(args: &ServeArgs) -> Result<(), CliError> {
 
     // First run: write a starter configuration and say what is in it.
     if !path.exists() {
-        let created = starter::create(&path, false)?;
+        // The file says which flags this run used, so the address in its
+        // comments is the one in use, and the values in it are not taken
+        // for it.
+        let flags = starter::Flags {
+            host: args.host.clone(),
+            port: args.port,
+        };
+        let created = starter::create_for(&path, false, &flags)?;
         let host = args.host.as_deref().unwrap_or(STARTER_HOST);
         let dashboard = match args.port.unwrap_or(DEFAULT_PORT) {
             // The port is only known once the listener is bound; the start
@@ -37,7 +44,8 @@ pub fn run(args: &ServeArgs) -> Result<(), CliError> {
         };
         out::stderr_line(&format!(
             "First run: {}\n",
-            created.announcement(dashboard.as_deref())
+            created
+                .announcement_with_secrets(dashboard.as_deref(), std::io::stderr().is_terminal())
         ));
     }
 

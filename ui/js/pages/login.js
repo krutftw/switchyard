@@ -10,6 +10,15 @@
 // Two failures never reach the gateway's verdict: it cannot be reached
 // (status 0), or the secret contains a control character and cannot be sent
 // at all (code "invalid", shown on the field).
+//
+// The lockout lives in the gateway's memory, so only the gateway knows
+// whether it still holds: a restart clears it at once. What this tab
+// remembers of it (sessionStorage `sy.login.lockedUntil`, so a reload keeps
+// the countdown) is a hint, never a reason to refuse input: the form stays
+// usable, the countdown says when the gateway should accept a secret again,
+// and the next answer decides. A 429 renews the hint from Retry-After; any
+// other answer (accepted, wrong, refused) clears it. No answer at all (the
+// gateway is unreachable, or nothing was sent) leaves it as it was.
 
 import { html, useEffect, useState } from '../../vendor/preact-htm.js';
 import { Button } from '../components/button.js';
@@ -44,6 +53,13 @@ function writeLock(until) {
   } catch {
     /* storage unavailable: the countdown lasts for this page load */
   }
+}
+
+/** Seconds left, in words that change once a minute (for screen readers). */
+function lockWords(seconds) {
+  if (seconds < 60) return 'less than a minute';
+  const minutes = Math.round(seconds / 60);
+  return minutes === 1 ? 'about 1 minute' : `about ${minutes} minutes`;
 }
 
 // htm drops the space at a line break inside running text, so prose with
@@ -154,7 +170,7 @@ function Yard() {
 }
 
 export default function Login() {
-  const { reason } = useStore(auth);
+  const { reason, elsewhere } = useStore(auth);
   const [secret, setSecret] = useState('');
   const [remember, setRemember] = useState(isRemembered());
   const [busy, setBusy] = useState(false);
@@ -171,10 +187,11 @@ export default function Login() {
     document.getElementById('login-secret')?.focus();
   }, []);
 
+  // A hint only (see the top of this file): it never disables the form.
   const lockSeconds = lockedUntil ? Math.ceil((lockedUntil - now) / 1000) : 0;
   const locked = lockSeconds > 0;
 
-  // The lockout is over: clear it so the form works again.
+  // The countdown has run out: forget it.
   useEffect(() => {
     if (lockedUntil && !locked) {
       setLockedUntil(null);
@@ -183,7 +200,7 @@ export default function Login() {
   }, [lockedUntil, locked]);
 
   const submit = async () => {
-    if (busy || locked) return;
+    if (busy) return;
     const value = secret.trim();
     if (!value) {
       setFieldError('Enter the admin secret.');
@@ -194,19 +211,30 @@ export default function Login() {
     setFieldError(null);
     try {
       await api.login(value, { remember });
-      // The auth store is now "authenticated"; app.js swaps in the shell.
+      // Accepted: whatever this tab remembered of a lockout is over. The
+      // auth store is now "authenticated"; app.js swaps in the shell.
+      writeLock(null);
     } catch (cause) {
       if (cause.status === 429) {
+        // Still locked out: the gateway says for how long.
         const until = Date.now() + (cause.retryAfter ?? DEFAULT_LOCK_SECONDS) * 1000;
         setLockedUntil(until);
         writeLock(until);
-        setSecret('');
-      } else if (cause.code === 'invalid') {
-        // Nothing was sent: the problem is in the field, so say it there.
-        setFieldError(cause.message);
       } else {
-        setOdd(oddCharacter(value));
-        setError(cause);
+        // Any other answer means the gateway is no longer locking this
+        // address out (a restart, or the time is up). No answer (status 0:
+        // unreachable, or nothing sent) tells nothing either way.
+        if (cause.status > 0) {
+          setLockedUntil(null);
+          writeLock(null);
+        }
+        if (cause.code === 'invalid') {
+          // Nothing was sent: the problem is in the field, so say it there.
+          setFieldError(cause.message);
+        } else {
+          setOdd(oddCharacter(value));
+          setError(cause);
+        }
       }
       setBusy(false);
       // Ready for the next try: cursor in the field, old value selected.
@@ -239,15 +267,18 @@ export default function Login() {
           !error &&
           !locked &&
           html`<${Notice} tone="caution" title="Your session ended">The gateway no longer accepts the stored secret. It may have been changed. Sign in again.<//>`}
-          ${reason === 'signed-out' && !error && !locked && html`<${Notice} tone="info" title="Signed out">The secret was removed from this browser.<//>`}
+          ${reason === 'signed-out' &&
+          !error &&
+          !locked &&
+          html`<${Notice} tone="info" title=${elsewhere ? 'Signed out in another tab' : 'Signed out'}>The secret was removed from this browser.<//>`}
 
           ${locked &&
           html`
             <${Notice} tone="caution" title="Too many wrong secrets" icon="lock">
-              The gateway has locked this address out. You can try again in ${html`<strong class="num" style="color:var(--text)">${formatCountdown(lockSeconds)}</strong>`}. Restarting the gateway also clears the lockout.
+              The gateway locked this address out after five wrong secrets in a row. It accepts a secret again in <strong class="num login-countdown" aria-hidden="true">${formatCountdown(lockSeconds)}</strong><span class="sr-only">${lockWords(lockSeconds)}</span>, or as soon as it restarts: a restart clears the lockout, so you can try again at any time.
             <//>
           `}
-          ${problem && !locked && html`<${Notice} tone=${problem.tone} title=${problem.title}>${problem.body}<//>`}
+          ${problem && html`<${Notice} tone=${problem.tone} title=${problem.title}>${problem.body}<//>`}
 
           <${Form} onSubmit=${submit}>
             <input type="text" name="username" autocomplete="username" value="switchyard-admin" readonly hidden />
@@ -264,22 +295,19 @@ export default function Login() {
               autocomplete="current-password"
               id="login-secret"
               readOnly=${busy}
-              disabled=${locked}
             />
             <${Checkbox}
               label="Remember on this device"
               hint="Stores the secret in this browser so the next visit skips this page. Leave it off on a shared computer."
               checked=${remember}
               onChange=${setRemember}
-              disabled=${busy || locked}
+              disabled=${busy}
             />
-            <${Button} type="submit" variant="primary" size="lg" block loading=${busy} disabled=${locked}>
-              ${locked ? `Locked for ${formatCountdown(lockSeconds)}` : 'Sign in'}
-            <//>
+            <${Button} type="submit" variant="primary" size="lg" block loading=${busy}>Sign in<//>
           <//>
 
           <p class="login-help">
-            The secret is printed once when the gateway creates its config. You can also read it from ${code('admin.secret')} in ${code('switchyard.toml')}.
+            Read the secret from ${code('admin.secret')} in ${code('switchyard.toml')}. When the gateway first creates that file in an interactive terminal, it also prints the secret there once.
           </p>
         </div>
       </main>

@@ -2,11 +2,11 @@
 //! OpenAI-compatible providers.
 
 use super::values::{
-    boolean, clamp_i32, clamp_u32, clamp_u64, dedupe_models, integer, is_empty_reference,
+    boolean, clamp_i32, clamp_u32, clamp_u64, dedupe_models, integer, is_environment_reference,
     is_http_url, is_valid_alias_name, normalize_prefix, sanitize_name, string_list, text, thinking,
     unique_name,
 };
-use super::{EMPTY_REFERENCE, Importer, Layer};
+use super::{ENVIRONMENT_REFERENCE, Importer, Layer};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
 use std::collections::{HashMap, HashSet};
@@ -287,9 +287,10 @@ impl<'a> Importer<'a> {
                 .push(format!("{location}: no api-key; skipped"));
             return None;
         }
-        if is_empty_reference(&api_key) {
-            self.not_imported
-                .push(format!("{location}: the api-key is {EMPTY_REFERENCE}"));
+        if is_environment_reference(&api_key) {
+            self.not_imported.push(format!(
+                "{location}: the api-key is {ENVIRONMENT_REFERENCE}"
+            ));
             return None;
         }
         if base_url.is_empty() {
@@ -602,7 +603,7 @@ impl<'a> Importer<'a> {
         let mut credentials: Vec<CredentialConfig> = Vec::new();
         let mut seen = HashSet::new();
         let mut duplicates = 0usize;
-        let mut unnamed = 0usize;
+        let mut references = 0usize;
         for list_key in ["keys", "api-key-entries"] {
             for field in ["api-key", "weight", "proxy-url"] {
                 self.consumed
@@ -629,8 +630,8 @@ impl<'a> Importer<'a> {
                 if api_key.is_empty() {
                     continue;
                 }
-                if is_empty_reference(&api_key) {
-                    unnamed += 1;
+                if is_environment_reference(&api_key) {
+                    references += 1;
                     continue;
                 }
                 if !seen.insert(api_key.clone()) {
@@ -651,8 +652,8 @@ impl<'a> Importer<'a> {
         }
         if let Some(old) = self.field(layers, "api-keys") {
             for api_key in string_list(old) {
-                if is_empty_reference(&api_key) {
-                    unnamed += 1;
+                if is_environment_reference(&api_key) {
+                    references += 1;
                 } else if seen.insert(api_key.clone()) {
                     api_keys.push(api_key);
                 } else {
@@ -688,9 +689,9 @@ impl<'a> Importer<'a> {
         provider.api_keys = api_keys;
         provider.credentials = credentials;
         provider.models = self.pool_models(models, &provider, config);
-        if unnamed > 0 {
+        if references > 0 {
             self.not_imported.push(format!(
-                "provider `{}`: {unnamed} of the keys are {EMPTY_REFERENCE}",
+                "provider `{}`: {references} of the keys are {ENVIRONMENT_REFERENCE}",
                 provider.name
             ));
         }

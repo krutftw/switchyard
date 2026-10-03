@@ -10,25 +10,19 @@ import { described } from './stale.js';
 const LIMIT = 6;
 
 // A row that stands for several names is not one to filter by. ("unknown",
-// the row of requests that had no model, is: GET /requests?model=unknown
+// the row of requests that had no model, is: GET /requests?client_model=unknown
 // selects them.)
 const PLACEHOLDERS = new Set(['other']);
 
-// A row counts the requests under one client-facing model, but the list it
-// opens is GET /requests?model=, which also matches the requested and the
-// upstream model: requests that another name (lab/mock-echo) sent upstream
-// as mock-echo are in the list of mock-echo and not in its count. No filter
-// selects the client-facing model alone, so the footer says what the list
-// holds.
-const MODEL_FOOTNOTE = 'Select a model to see its requests, plus any routed upstream to a model of that name';
+const MODEL_FOOTNOTE = 'Select a model to see its requests';
 
-function toItems(entries, param) {
+function toItems(entries, param, since) {
   return (entries ?? []).map((entry) => ({
     key: entry.name,
     label: entry.name,
     value: entry.requests,
     hint: entry.errors > 0 ? `${formatPercent(entry.errors / entry.requests, 0)} failed` : undefined,
-    href: PLACEHOLDERS.has(entry.name) ? undefined : href('/requests', { [param]: entry.name }),
+    href: PLACEHOLDERS.has(entry.name) ? undefined : href('/requests', { [param]: entry.name, since }),
   }));
 }
 
@@ -52,7 +46,7 @@ export default function TopLists({ summary }) {
       <${TopPanel}
         title="Top models"
         summary=${summary}
-        items=${toItems(data?.by_model, 'model')}
+        items=${toItems(data?.by_model, 'client_model', data?.from)}
         errorTitle="Could not load the top models"
         emptyText="No requests in the last 24 hours"
         footnote=${MODEL_FOOTNOTE}
@@ -60,7 +54,7 @@ export default function TopLists({ summary }) {
       <${TopPanel}
         title="Top client keys"
         summary=${summary}
-        items=${toItems(data?.by_key, 'key')}
+        items=${toItems(data?.by_key, 'key', data?.from)}
         errorTitle="Could not load the top client keys"
         emptyText="No requests in the last 24 hours"
         footnote="Select a key to see its requests"

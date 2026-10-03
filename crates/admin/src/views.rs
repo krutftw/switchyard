@@ -135,7 +135,38 @@ pub(crate) fn provider_config_json(masked: &ProviderConfig) -> Map<String, Value
     }
     // Fields a later schema adds are passed through rather than lost.
     full.extend(sparse);
+    if let Some(Value::Array(credentials)) = full.get_mut("credentials") {
+        for credential in credentials {
+            spell_out_missing_key(credential);
+        }
+    }
     full
+}
+
+/// A credential entry without a key says so with `"api_key": null`, the
+/// way `POST /providers` and `PUT /providers/{name}` read it: left out (or
+/// `""`) would mean "keep the key stored at this place", which a keyless
+/// credential moved onto the row of one with a key would inherit. So the
+/// entry sent back as it was shown stays keyless.
+fn spell_out_missing_key(credential: &mut Value) {
+    let Value::Object(fields) = credential else {
+        return;
+    };
+    let keyless = fields
+        .get("api_key")
+        .is_none_or(|key| key.as_str().is_some_and(|key| key.trim().is_empty()));
+    if !keyless {
+        return;
+    }
+    // First, where the field stands in an entry that has a key.
+    let mut spelled = Map::with_capacity(fields.len() + 1);
+    spelled.insert("api_key".to_string(), Value::Null);
+    for (name, value) in std::mem::take(fields) {
+        if name != "api_key" {
+            spelled.insert(name, value);
+        }
+    }
+    *fields = spelled;
 }
 
 /// Where a runtime credential comes from in the configuration.
@@ -314,7 +345,13 @@ pub(crate) fn provider_view(
             credential_view(masked, *source, snapshot)
         })
         .collect();
-    let model_count = runtime.map_or(names.len(), |r| r.models);
+    // A disabled provider serves nothing: the scheduler still knows its
+    // model list (for when it is switched on again), but no name routes to
+    // it, so its count is that of its (empty) `models`.
+    let model_count = match runtime {
+        Some(runtime) if masked.enabled => runtime.models,
+        _ => names.len(),
+    };
 
     view.insert("credentials".to_string(), Value::Array(credentials));
     view.insert("models".to_string(), json!(names));
@@ -449,14 +486,19 @@ pub(crate) struct KeyUsage {
 }
 
 /// Model patterns as the gateway reads them: trimmed, without blanks, each
-/// one once (the first place it appears in). This is how `POST /keys` and
-/// `PATCH /keys/{id}` store a list, and how a list written by hand into the
-/// file is shown.
+/// one once (the first place it appears in, in the spelling it has there).
+/// Patterns match model names ignoring case, so `GPT-*` repeats `gpt-*`.
+/// This is how `POST /keys` and `PATCH /keys/{id}` store a list, and how a
+/// list written by hand into the file is shown.
 pub(crate) fn clean_models<S: AsRef<str>>(models: &[S]) -> Vec<String> {
     let mut clean: Vec<String> = Vec::with_capacity(models.len());
+    // Lower-cased the way `wildcard_match` compares.
+    let mut seen: Vec<String> = Vec::with_capacity(models.len());
     for pattern in models {
         let pattern = pattern.as_ref().trim();
-        if !pattern.is_empty() && !clean.iter().any(|kept| kept == pattern) {
+        let folded: String = pattern.chars().flat_map(char::to_lowercase).collect();
+        if !pattern.is_empty() && !seen.contains(&folded) {
+            seen.push(folded);
             clean.push(pattern.to_string());
         }
     }
@@ -587,6 +629,56 @@ mod tests {
         // The full shape is accepted back as a provider entry.
         let back: ProviderConfig = serde_json::from_value(Value::Object(json)).unwrap();
         assert_eq!(back, provider);
+    }
+
+    /// Regression: `config.credentials[]` left `api_key` out for a keyless
+    /// credential, which `PUT /providers/{name}` reads as "keep the key
+    /// stored here" — the object did not round-trip.
+    #[test]
+    fn a_keyless_credential_spells_out_its_missing_key() {
+        let mut provider = ProviderConfig::new("p", ProviderKind::OpenaiCompat);
+        provider.credentials = vec![
+            CredentialConfig {
+                api_key: "sk-a…wxyz".into(),
+                label: "with key".into(),
+                ..CredentialConfig::default()
+            },
+            CredentialConfig {
+                label: "keyless".into(),
+                proxy: "http://127.0.0.1:3128".into(),
+                ..CredentialConfig::default()
+            },
+            CredentialConfig::default(),
+        ];
+        let json = provider_config_json(&provider);
+        assert_eq!(
+            json["credentials"],
+            json!([
+                {"api_key": "sk-a…wxyz", "label": "with key"},
+                {"api_key": null, "label": "keyless", "proxy": "http://127.0.0.1:3128"},
+                {"api_key": null},
+            ])
+        );
+        // The key comes first, as in an entry that has one.
+        let keys: Vec<&str> = json["credentials"][1]
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, ["api_key", "label", "proxy"]);
+    }
+
+    /// Patterns match ignoring case, so a pattern that differs from an
+    /// earlier one only in case is a repeat; the first spelling stays.
+    #[test]
+    fn model_patterns_repeat_ignoring_case() {
+        assert_eq!(
+            clean_models(&["GPT-*", " gpt-* ", "Claude-*", "claude-*", "", "mock-ECHO"]),
+            ["GPT-*", "Claude-*", "mock-ECHO"]
+        );
+        assert_eq!(clean_models(&["ΣIGMA", "σigma"]), ["ΣIGMA"]);
+        assert!(clean_models::<&str>(&[]).is_empty());
     }
 
     #[test]

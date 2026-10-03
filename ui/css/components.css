@@ -76,7 +76,7 @@
 }
 
 @media (hover: hover) {
-  .btn:hover:not(:disabled) {
+  .btn:hover:not(:disabled):not([aria-disabled="true"]) {
     background: var(--bg-hover);
     border-color: var(--control-border);
     color: var(--text);
@@ -115,7 +115,7 @@
 }
 
 @media (hover: hover) {
-  .btn[data-variant="primary"]:hover:not(:disabled) {
+  .btn[data-variant="primary"]:hover:not(:disabled):not([aria-disabled="true"]) {
     background: var(--accent-hi);
     border-color: transparent;
     color: var(--on-accent);
@@ -129,7 +129,7 @@
 }
 
 @media (hover: hover) {
-  .btn[data-variant="ghost"]:hover:not(:disabled) {
+  .btn[data-variant="ghost"]:hover:not(:disabled):not([aria-disabled="true"]) {
     background: var(--bg-hover);
     border-color: transparent;
   }
@@ -144,7 +144,7 @@
 }
 
 @media (hover: hover) {
-  .btn[data-variant="danger"]:hover:not(:disabled) {
+  .btn[data-variant="danger"]:hover:not(:disabled):not([aria-disabled="true"]) {
     background: color-mix(in srgb, var(--stop-solid) 86%, var(--text));
     border-color: transparent;
     color: var(--on-stop);
@@ -158,7 +158,7 @@
 }
 
 @media (hover: hover) {
-  .btn[data-variant="danger-quiet"]:hover:not(:disabled) {
+  .btn[data-variant="danger-quiet"]:hover:not(:disabled):not([aria-disabled="true"]) {
     background: var(--wash-stop);
     border-color: var(--lamp-stop);
     color: var(--stop-ink);
@@ -206,15 +206,39 @@
   padding: 0;
 }
 
-/* Touch targets: a small icon button still gets a 44px hit area. */
+/* Touch targets. On coarse pointers the control tokens grow (sm 34px, md
+   40px, lg 46px: tokens.css), and every control drawn smaller than --tap-min
+   (44px) that cannot simply grow gets an invisible hit area of 44px centred
+   on it: icon buttons, switches, checkboxes, a tag's remove button, a sort
+   header. A segmented option keeps its width (its neighbours touch it) and
+   gets the 44px in height. The hit areas are ::before; the switch's thumb
+   and the checkbox's tick are ::after. */
 @media (pointer: coarse) {
-  .icon-btn::before {
+  .icon-btn::before,
+  .switch::before,
+  .check::before,
+  .tag-x::before,
+  .th-sort::before {
     content: "";
     position: absolute;
     inset: 50% auto auto 50%;
     width: max(100%, var(--tap-min));
     height: max(100%, var(--tap-min));
     transform: translate(-50%, -50%);
+  }
+
+  .seg-opt::before {
+    content: "";
+    position: absolute;
+    inset: 50% 0 auto;
+    height: max(100%, var(--tap-min));
+    transform: translateY(-50%);
+  }
+
+  .tag-x,
+  .th-sort,
+  .seg-opt {
+    position: relative;
   }
 }
 
@@ -641,9 +665,31 @@
   color: var(--text-3);
 }
 
-.stat-trend {
+/* The trend (a Sparkline, 96px by default) gives way before the value does:
+   in a cell near the grid's minimum width it narrows instead of pushing past
+   the cell. The value never shrinks. */
+.stat-value {
   flex: none;
+}
+
+.stat-trend {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
   padding-bottom: 3px;
+}
+
+.stat-trend > svg {
+  display: block;
+  max-width: 100%;
+}
+
+/* A group whose numbers are being refreshed (or are out of date) dims its
+   readings, not its labels: <StatGroup data-stale=${stale ? '' : undefined}>. */
+.stat-group[data-stale] .stat-value,
+.stat-group[data-stale] .stat-trend {
+  opacity: 0.55;
+  transition: opacity var(--dur-base) ease;
 }
 
 .stat-foot {
@@ -1128,6 +1174,13 @@
   min-width: 0;
 }
 
+/* A control with no label, hint or message around it still sits in its
+   field (so gaining a message does not rebuild it, form.js wrap): the
+   wrapper draws no box, and the control lays out as if it stood alone. */
+.field[data-bare] {
+  display: contents;
+}
+
 .field-label {
   display: flex;
   align-items: baseline;
@@ -1253,11 +1306,14 @@
   color: var(--text-3);
 }
 
+/* The text box fills the field's height, so a tap anywhere in the outline
+   lands in it (a line of text alone is 17px tall). */
 .input-el {
   flex: 1 1 0;
+  align-self: stretch;
   min-width: 0;
   width: 100%;
-  height: 100%;
+  height: auto;
   padding: 0;
   border: 0;
   background: transparent;
@@ -2149,17 +2205,12 @@ select.input-el option {
   overflow-wrap: anywhere;
 }
 
-.code-floating {
-  position: relative;
-}
-
-.code-floating .code-tools {
-  position: absolute;
-  top: var(--space-1);
-  right: var(--space-1);
-  padding: 2px;
-  border-radius: var(--radius-sm);
-  background: var(--bg-sunken);
+/* Without a title the bar holds only the tools, at its right end, and is a
+   step lower. It is still a bar: tools floated over the code would cover the
+   end of a long first line, or a line scrolled sideways under them. */
+.code-bar[data-untitled] {
+  justify-content: flex-end;
+  min-height: 32px;
 }
 
 .tok-key {
@@ -2367,6 +2418,16 @@ select.input-el option {
   padding: var(--space-3);
   font-size: var(--text-xs);
   color: var(--text-3);
+}
+
+/* The button's own wrapper (it hands the focus on when it goes): no box. */
+.loadmore-action {
+  display: contents;
+}
+
+/* The end-of-list line takes the focus from the button it replaced. */
+.loadmore-end {
+  border-radius: var(--radius-xs);
 }
 
 /* ======================================================================== */
@@ -2636,6 +2697,16 @@ select.input-el option {
   overflow: auto;
   border: var(--hairline) solid var(--rule);
   border-radius: var(--radius-sm);
+}
+
+/* A long series name in a column heading is cut, not let run past the
+   column: the full name is the heading's title. */
+.chart-table-head {
+  display: inline-block;
+  max-width: 18ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  vertical-align: bottom;
 }
 
 .chart[data-stale] .chart-plot {

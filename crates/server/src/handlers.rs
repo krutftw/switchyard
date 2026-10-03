@@ -8,7 +8,7 @@ use crate::route::{GeminiMethod, RawEndpoint, Route};
 use axum::body::Body;
 use axum::response::Response;
 use bytes::Bytes;
-use http::header::{CONTENT_LENGTH, CONTENT_TYPE};
+use http::header::{CACHE_CONTROL, CONTENT_LENGTH, CONTENT_TYPE};
 use http::{HeaderMap, HeaderValue, Method};
 use serde_json::{Value, json};
 use std::time::Duration;
@@ -39,12 +39,38 @@ pub(crate) fn banner() -> Response {
             "POST /v1beta/models/{model}:streamGenerateContent",
             "POST /v1beta/models/{model}:countTokens",
             "GET /v1/realtime (WebSocket)",
+            "POST /v1/ws-ticket",
             "POST /v1/embeddings",
             "POST /v1/images/generations",
             "POST /v1/moderations",
             "POST /v1/audio/speech",
         ],
     }))
+}
+
+/// `POST /v1/ws-ticket`: a single-use ticket, valid 30 seconds, that opens
+/// one WebSocket (`?ticket=`) as the client key the request authenticated
+/// with — or as an anonymous client, when `auth.required` is off and no key
+/// matched. Any body is read away and ignored. Not a generation request:
+/// no record, no usage, no rate-limit hit.
+pub(crate) async fn ws_ticket(context: &Context, body: Body) -> Response {
+    let limit = body::limit_bytes(context.gateway().config().server.body_limit_mb);
+    body::discard(body, &context.headers, limit).await;
+    match context.gateway().issue_ws_ticket(&context.identity) {
+        Ok(ticket) => {
+            let mut response = respond::json(&json!({
+                "ticket": ticket.ticket,
+                "expires_in": ticket.expires_in,
+            }));
+            *response.status_mut() = http::StatusCode::CREATED;
+            // A credential, however short-lived: never kept by a cache.
+            response
+                .headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            response
+        }
+        Err(error) => context.error(&error),
+    }
 }
 
 /// `GET`, `HEAD /healthz`.
@@ -159,7 +185,8 @@ pub(crate) async fn with_body(context: Context, route: Route, body: Body) -> Res
         | Route::GeminiModels
         | Route::GeminiModel(_)
         | Route::ResponsesWebSocket
-        | Route::Realtime => context.error(&ApiError::not_found("no such route")),
+        | Route::Realtime
+        | Route::WsTicket => context.error(&ApiError::not_found("no such route")),
     }
 }
 
@@ -349,16 +376,15 @@ async fn gemini(
 /// The side endpoints proxied as raw JSON to an OpenAI-style upstream
 /// chosen by the body's `model`.
 async fn raw(context: Context, endpoint: RawEndpoint, body: Bytes) -> Response {
-    let model = serde_json::from_slice::<Value>(&body)
-        .ok()
-        .and_then(|value| {
-            value
-                .get("model")
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|model| !model.is_empty())
-                .map(str::to_string)
-        });
+    let json = serde_json::from_slice::<Value>(&body).ok();
+    let model = json.as_ref().and_then(|value| {
+        value
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|model| !model.is_empty())
+            .map(str::to_string)
+    });
     let Some(model) = model else {
         return context.error(
             &ApiError::invalid_request(
@@ -367,6 +393,13 @@ async fn raw(context: Context, endpoint: RawEndpoint, body: Bytes) -> Response {
             .with_param("model"),
         );
     };
+    // This endpoint always interprets its body as JSON, even if a client
+    // labels it text/plain. Forward that same parsed representation so
+    // duplicate fields never give an upstream a different model selection.
+    let body = Bytes::from(
+        serde_json::to_vec(json.as_ref().expect("a model requires a JSON body"))
+            .expect("JSON values serialize"),
+    );
     let cancel = CancellationToken::new();
     // Fires if this future is dropped while the upstream is still working.
     let cancel_on_drop = cancel.clone().drop_guard();

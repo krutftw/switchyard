@@ -51,6 +51,26 @@ impl ApiFailure {
         }
     }
 
+    /// 400 for a query parameter that is repeated or holds a value the route
+    /// refuses. The message names the parameter, and so does the issue's
+    /// path (`since`), the way a body field is named.
+    pub fn bad_query(issue: ConfigIssue) -> Self {
+        let message = if issue.path.is_empty() {
+            format!("invalid query string: {}", issue.message)
+        } else {
+            format!(
+                "invalid query parameter `{}`: {}",
+                issue.path, issue.message
+            )
+        };
+        ApiFailure {
+            status: StatusCode::BAD_REQUEST,
+            message,
+            issues: vec![issue],
+            retry_after_secs: None,
+        }
+    }
+
     /// 400 naming several fields of the request body. The message leads
     /// with `lead` and quotes the first issues, so it says what is wrong on
     /// its own.

@@ -59,7 +59,7 @@ const BLANK = {
 };
 
 /**
- * @param {{status: string, model: string, provider: string, key: string, q: string}} filters
+ * @param {{status: string, model: string, client_model: string, since: string, provider: string, key: string, q: string}} filters
  * @param {{ live: boolean, atTop: () => boolean }} options
  *   live   show arrivals as they come; false queues them
  *   atTop  whether the top of the list is on screen. Arrivals are queued
@@ -98,7 +98,7 @@ export default function useRequestLog(filters, { live, atTop }) {
 
   const query = (extra) => {
     const f = filtersRef.current;
-    return { ...extra, status: f.status, model: f.model, provider: f.provider, key: f.key, q: f.q };
+    return { ...extra, status: f.status, model: f.model, client_model: f.client_model, since: f.since, provider: f.provider, key: f.key, q: f.q };
   };
 
   const inFlightList = () => {

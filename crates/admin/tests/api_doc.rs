@@ -568,6 +568,15 @@ async fn scenario() -> Recorder {
     )
     .await;
     r.call(
+        "config_validate_lockout",
+        Method::POST,
+        "/config/validate",
+        Some(json!({"text": "[admin]\nsecret = \"env:DASHBOARD_SECRET\"\n"})),
+        ok,
+        Trim::NONE,
+    )
+    .await;
+    r.call(
         "config_raw_put_invalid",
         Method::PUT,
         "/config/raw",
@@ -615,6 +624,15 @@ async fn scenario() -> Recorder {
         Some(json!({"logging": {"level": "loud"}})),
         StatusCode::UNPROCESSABLE_ENTITY,
         Trim::NONE,
+    )
+    .await;
+    r.call(
+        "settings_patch_null",
+        Method::PATCH,
+        "/settings",
+        Some(json!({"routing": {"cooldown": {"transient_secs": null}}})),
+        ok,
+        Trim::arrays(1),
     )
     .await;
     {
@@ -874,6 +892,18 @@ async fn scenario() -> Recorder {
     )
     .await;
     r.call(
+        "payload_put_bad_path",
+        Method::PUT,
+        "/payload",
+        Some(json!({
+            "default": [{"models": ["mock-*"], "set": {"reasoning..effort": "low"}}],
+            "filter": [{"models": ["*"], "remove": ["metadata.trace_id", "user "]}],
+        })),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Trim::NONE,
+    )
+    .await;
+    r.call(
         "pricing_put",
         Method::PUT,
         "/pricing",
@@ -886,6 +916,18 @@ async fn scenario() -> Recorder {
     )
     .await;
     r.get("pricing_get", "/pricing", Trim::NONE).await;
+    r.call(
+        "pricing_put_invalid",
+        Method::PUT,
+        "/pricing",
+        Some(json!([
+            {"model": "mock-*", "input": 0.5, "output": 1.5},
+            {"model": "vendor-large", "input": 3, "output": -15},
+        ])),
+        StatusCode::UNPROCESSABLE_ENTITY,
+        Trim::NONE,
+    )
+    .await;
     r.get("models", "/models", Trim::outer(3)).await;
     r.get("catalog", "/catalog", Trim::outer(2)).await;
 
@@ -1058,6 +1100,34 @@ async fn scenario() -> Recorder {
     let page = r
         .get("requests_list", "/requests?limit=2&status=ok", Trim::NONE)
         .await;
+    {
+        // The requests a `by_model` row counts, over the last 24 hours.
+        let since = now_unix_ms() - 24 * 3_600_000;
+        let row = r
+            .get(
+                "requests_client_model",
+                &format!("/requests?client_model=mock-echo&since={since}&limit=1"),
+                Trim::NONE,
+            )
+            .await;
+        let summary = r.app.get_ok("/usage/summary?range=24h").await;
+        let counted = summary["by_model"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["name"] == "mock-echo")
+            .map(|g| g["requests"].clone());
+        assert_eq!(Some(row["total"].clone()), counted, "{row}");
+        r.call(
+            "requests_bad_query",
+            Method::GET,
+            "/requests?since=yesterday",
+            None,
+            StatusCode::BAD_REQUEST,
+            Trim::NONE,
+        )
+        .await;
+    }
     let failed = r
         .app
         .get_ok("/requests?status=error&model=mock-error-500")

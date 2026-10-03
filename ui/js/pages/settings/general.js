@@ -3,7 +3,7 @@
 
 import { html, useMemo } from '../../../vendor/preact-htm.js';
 import { Button, Notice, Panel, SecretInput } from '../../components/index.js';
-import { NumberRow, Rows, SettingRow, SettingsForm, SwitchRow, TextRow, expectSecret, fieldId, forgetSecret, isSecretReference, useEdits, useSettingsSave } from './common.js';
+import { NumberRow, OVERRIDE_FLAGS, Rows, SettingRow, SettingsForm, SwitchRow, TextRow, expectSecret, fieldId, forgetSecret, isSecretReference, useEdits, useSettingsSave, valueInUse } from './common.js';
 
 /** 32 URL-safe characters from the browser's random source. */
 function generateSecret() {
@@ -29,6 +29,14 @@ export function GeneralTab({ config, status, onDiskInvalid }) {
 
   const listen = status?.listen ?? null;
   const viaRemote = status?.admin?.remote === true;
+  // --host / --port on the command line: the file's value is saved but not
+  // used, and a restart with the same command line does not change that.
+  const overrides = config.data.command_line_overrides ?? status?.command_line_overrides ?? [];
+  const overrideHint = (path) => {
+    if (!overrides.includes(path)) return undefined;
+    const inUse = valueInUse(path, listen);
+    return `Set on the command line: ${OVERRIDE_FLAGS[path]}${inUse == null ? '' : ` ${inUse}`} is in effect, also after a restart with the same command line. This value applies when the gateway starts without ${OVERRIDE_FLAGS[path]}.`;
+  };
   const cert = String(form.value('server.tls.cert') ?? '').trim();
   const key = String(form.value('server.tls.key') ?? '').trim();
   const newSecret = form.value('admin.secret') ?? '';
@@ -40,6 +48,7 @@ export function GeneralTab({ config, status, onDiskInvalid }) {
     config,
     name: 'General',
     onDiskInvalid,
+    listen,
     check: () => {
       const problems = [];
       if (cert && !key) problems.push({ path: 'server.tls.key', message: 'Enter the key file too, or clear the certificate to serve plain HTTP.' });
@@ -101,12 +110,23 @@ export function GeneralTab({ config, status, onDiskInvalid }) {
             issues=${issues}
             path="server.host"
             label="Host"
-            restart
+            restart=${!overrides.includes('server.host')}
+            hint=${overrideHint('server.host')}
             mono
             placeholder="127.0.0.1"
             description=${html`The address to bind. <span class="mono">127.0.0.1</span> accepts connections from this machine only; <span class="mono">0.0.0.0</span> accepts them from other machines too.${listen ? html` Listening on <span class="mono">${listen}</span> now.` : null}`}
           />
-          <${NumberRow} form=${form} issues=${issues} path="server.port" label="Port" restart min=${1} max=${65535} description="The TCP port for the client API and this dashboard. A port given on the command line wins over this value." />
+          <${NumberRow}
+            form=${form}
+            issues=${issues}
+            path="server.port"
+            label="Port"
+            restart=${!overrides.includes('server.port')}
+            hint=${overrideHint('server.port')}
+            min=${1}
+            max=${65535}
+            description="The TCP port for the client API and this dashboard. A port given on the command line wins over this value."
+          />
           <${TextRow}
             form=${form}
             issues=${issues}

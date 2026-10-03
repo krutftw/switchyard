@@ -2,10 +2,10 @@
 // Page, Panel (alias Card), Notice, Stat, StatGroup, KeyValue, Skeleton,
 // EmptyState, ErrorState, Pagination, LoadMore, Timeline.
 
-import { html, useEffect } from '../../vendor/preact-htm.js';
+import { html, useEffect, useRef } from '../../vendor/preact-htm.js';
 import { cx } from '../lib/dom.js';
-import { DASH, formatDelta, formatNumber } from '../lib/format.js';
-import { useUid } from '../lib/hooks.js';
+import { DASH, formatDelta, formatNumber, sentence } from '../lib/format.js';
+import { useFocusHandOff, useUid } from '../lib/hooks.js';
 import { Button, CopyButton, IconButton } from './button.js';
 import { Icon } from './icons.js';
 import { StatusLamp, toneWord } from './status.js';
@@ -104,10 +104,16 @@ const NOTICE_ICON = { stop: 'alert-circle', caution: 'alert', clear: 'check-circ
  * title   short statement of what happened
  * action  a button or link on the right
  * Errors use role="alert" so they are announced when they appear.
+ *
+ * A notice the page takes away while its own action has the focus (a "Try
+ * again" that worked) hands the focus on to what follows it instead of
+ * dropping it on <body> (useFocusHandOff in lib/hooks.js).
  */
 export function Notice({ tone = 'neutral', title, icon, action, class: className, children }) {
+  const root = useRef(null);
+  useFocusHandOff(root);
   return html`
-    <div class=${cx('notice', className)} data-tone=${tone === 'neutral' ? undefined : tone} role=${tone === 'stop' ? 'alert' : 'status'}>
+    <div ref=${root} class=${cx('notice', className)} data-tone=${tone === 'neutral' ? undefined : tone} role=${tone === 'stop' ? 'alert' : 'status'}>
       <${Icon} name=${icon || NOTICE_ICON[tone] || 'info'} />
       <div class="notice-body">
         ${title && html`<div class="notice-title">${title}</div>`}
@@ -291,12 +297,23 @@ export function EmptyState({ icon = 'buffer', title, description, action, compac
  *
  * title defaults to "Could not load this". Name the thing when you can:
  * title="Could not load providers".
+ *
+ * The message (`description`, else the gateway's) is printed as a sentence
+ * (lib/format.js, sentence). Keep the error state on screen while the retry
+ * runs and pass `retrying`: the button shows a spinner and keeps the focus.
+ * When the retry works and the page swaps the error state for the content,
+ * the focus goes to the first control of what took its place (else what
+ * follows), not to <body> (useFocusHandOff in lib/hooks.js).
  */
 export function ErrorState({ error, title = 'Could not load this', description, onRetry, retrying = false, compact = false, class: className }) {
-  const message = description ?? error?.message ?? 'The gateway did not give a reason.';
+  // Markup passed as the description is shown as it is.
+  const said = description ?? error?.message;
+  const message = said != null && typeof said === 'object' ? said : sentence(said) || 'The gateway did not give a reason.';
   const status = error?.status;
+  const root = useRef(null);
+  useFocusHandOff(root);
   return html`
-    <div class=${cx('empty', className)} data-tone="stop" data-compact=${compact ? '' : undefined} role="alert">
+    <div ref=${root} class=${cx('empty', className)} data-tone="stop" data-compact=${compact ? '' : undefined} role="alert">
       <div class="empty-icon"><${Icon} name="alert" size=${20} /></div>
       <h3 class="empty-title">${title}</h3>
       <p class="empty-desc">${message}</p>
@@ -321,19 +338,25 @@ export function ErrorState({ error, title = 'Could not load this', description, 
  * total      total rows
  * onPage     (page) => void
  * noun       what is being counted, for the summary ("keys")
+ *
+ * Previous on the first page and Next on the last are aria-disabled, not
+ * disabled: they look off and ignore clicks but keep the focus, so pressing
+ * Next onto the last page leaves the keyboard where it was.
  */
 export function Pagination({ page, pageSize, total, onPage, noun = 'rows', class: className }) {
   const pageCount = Math.max(1, Math.ceil((total || 0) / pageSize));
   const current = Math.min(Math.max(1, page), pageCount);
   const from = total === 0 ? 0 : (current - 1) * pageSize + 1;
   const to = Math.min(total, current * pageSize);
+  const first = current <= 1;
+  const last = current >= pageCount;
   return html`
     <nav class=${cx('pager', className)} aria-label="Pagination">
       <span><span class="num">${formatNumber(from)}–${formatNumber(to)}</span> of <span class="num">${formatNumber(total)}</span> ${noun}</span>
       <div class="pager-nav">
-        <${IconButton} icon="chevron-left" label="Previous page" size="sm" disabled=${current <= 1} onClick=${() => onPage(current - 1)} />
+        <${IconButton} icon="chevron-left" label="Previous page" size="sm" aria-disabled=${first ? 'true' : undefined} onClick=${() => !first && onPage(current - 1)} />
         <span class="pager-page" aria-current="page">${current} / ${pageCount}</span>
-        <${IconButton} icon="chevron-right" label="Next page" size="sm" disabled=${current >= pageCount} onClick=${() => onPage(current + 1)} />
+        <${IconButton} icon="chevron-right" label="Next page" size="sm" aria-disabled=${last ? 'true' : undefined} onClick=${() => !last && onPage(current + 1)} />
       </div>
     </nav>
   `;
@@ -347,15 +370,36 @@ export function Pagination({ page, pageSize, total, onPage, noun = 'rows', class
  * loading  a fetch is in flight
  * onLoad   () => void
  * shown    rows on screen, for the summary line; optional
+ * noun     what the rows are: a pair [one, many] (['request', 'requests']),
+ *          or a plural word ending in "s" ("requests"; default "rows")
+ *          whose singular is that word without the "s". The end-of-list
+ *          line reads "All 12 requests shown", or "The only request is
+ *          shown" for one.
+ *
+ * When the last batch has come in while the button had the focus, the
+ * button gives way to the end-of-list line and the focus goes to that line,
+ * not to <body>; unless the page has placed it meanwhile (on the first of
+ * the rows that arrived, say), which wins.
  */
 export function LoadMore({ hasMore, loading = false, onLoad, shown, noun = 'rows', class: className }) {
+  const many = Array.isArray(noun) ? (noun[1] ?? `${noun[0]}s`) : String(noun);
+  const one = Array.isArray(noun) ? noun[0] : many.endsWith('s') && !many.endsWith('ss') ? many.slice(0, -1) : many;
+  const end = shown == null ? `No more ${many}` : shown === 1 ? `The only ${one} is shown` : `All ${formatNumber(shown)} ${many} shown`;
+  const endLine = useRef(null);
   return html`
     <div class=${cx('loadmore', className)}>
       ${hasMore
-        ? html`<${Button} size="sm" loading=${loading} onClick=${() => onLoad()}>Load older ${noun}<//>`
-        : html`<span>${shown != null ? `All ${formatNumber(shown)} ${noun} shown` : `No more ${noun}`}</span>`}
+        ? html`<${LoadMoreButton} loading=${loading} onLoad=${onLoad} endLine=${endLine}>Load older ${many}<//>`
+        : html`<span class="loadmore-end" tabindex="-1" ref=${endLine}>${end}</span>`}
     </div>
   `;
+}
+
+/** The button of LoadMore: its own component, so it can hand the focus on when it goes. */
+function LoadMoreButton({ loading, onLoad, endLine, children }) {
+  const root = useRef(null);
+  useFocusHandOff(root, { to: () => endLine.current });
+  return html`<span class="loadmore-action" ref=${root}><${Button} size="sm" loading=${loading} onClick=${() => onLoad()}>${children}<//></span>`;
 }
 
 // ---------------------------------------------------------------------------

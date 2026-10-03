@@ -241,9 +241,10 @@ port = 9000
 #[test]
 fn keys_that_need_quoting_are_quoted() {
     // Header names are HTTP tokens, some of which a bare TOML key cannot
-    // hold; the fields a payload rule sets may be named anything.
+    // hold; the fields a payload rule sets may be named almost anything (no
+    // spaces, no empty parts).
     let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { \"X~Y\" = \"1\" }\n\n\
-                [[payload.override]]\nmodels = [\"*\"]\nset = { \"X Y\" = \"1\" }\n";
+                [[payload.override]]\nmodels = [\"*\"]\nset = { \"X~Y!\" = \"1\" }\n";
     let out = edit(text, |c| {
         let headers = &mut c.providers[0].headers;
         headers.insert("dotted.name".into(), "a \"quoted\" value".into());
@@ -262,7 +263,10 @@ fn keys_that_need_quoting_are_quoted() {
     assert_eq!(set["ключ"], "значение");
     assert_eq!(set["plain-name_1"], "back\\slash");
     assert!(out.contains("\"X~Y\" = \"1\", \"dotted.name\" = "), "{out}");
-    assert!(out.contains("\"X Y\" = \"1\", \"dotted.name\" = "), "{out}");
+    assert!(
+        out.contains("\"X~Y!\" = \"1\", \"dotted.name\" = "),
+        "{out}"
+    );
     assert!(out.contains("plain-name_1 = "), "{out}");
 }
 
@@ -407,9 +411,10 @@ fn awkward_strings_round_trip() {
         "\"\"\"",
         "trailing newline\n",
     ];
-    // Payload rules take any text (header values and alias targets do not:
-    // no control characters, no padding), so they carry the awkward values;
-    // a header gets the ones it may hold.
+    // The values a payload rule sets and its model patterns take any text
+    // (header values, alias targets and rule paths do not: no control
+    // characters, no padding), so they carry the awkward values; a header
+    // gets the ones it may hold.
     let text = "[[providers]]\nname = \"p\"\nkind = \"mock\"\nheaders = { First = 'literal' }\n\n\
                 [[payload.default]]\nmodels = ['*']\nset = { First = 'literal' }\n\n\
                 [[payload.filter]]\nmodels = ['*']\nremove = ['one']\n";
@@ -432,8 +437,8 @@ fn awkward_strings_round_trip() {
             let set = &mut c.payload.default[0].set;
             set.insert("X-New".into(), value.into());
             set.insert("First".into(), value.into());
-            c.payload.filter[0].remove[0] = format!("{value}!");
-            c.payload.filter[0].remove.push(format!("{value}?"));
+            c.payload.filter[0].models[0] = format!("{value}!");
+            c.payload.filter[0].models.push(format!("{value}?"));
         });
         let config = validate_text(&out).unwrap();
         if as_header {
@@ -444,7 +449,7 @@ fn awkward_strings_round_trip() {
         assert_eq!(config.payload.default[0].set["First"], value, "{out}");
         assert_eq!(config.providers[0].credentials[0].label, value, "{out}");
         assert_eq!(
-            config.payload.filter[0].remove,
+            config.payload.filter[0].models,
             vec![format!("{value}!"), format!("{value}?")]
         );
     }

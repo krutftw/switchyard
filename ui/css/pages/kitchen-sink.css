@@ -168,10 +168,19 @@
   white-space: nowrap;
 }
 
-/* The live connection is down: the numbers are the last ones heard. They
-   stay readable, and step back. */
-.kit-live-stats[data-stale] .stat-value {
-  opacity: 0.55;
+/* (The live statistics step back while the connection is down through the
+   shared .stat-group[data-stale] rule in components.css.) */
+
+/* A sentence under an example that says what to look at. */
+.kit-note {
+  margin: 0;
+  font-size: var(--text-xs);
+}
+
+/* Starts a new line inside an example's row of controls. */
+.kit-break {
+  flex-basis: 100%;
+  height: 0;
 }
 
 .kit-inline {

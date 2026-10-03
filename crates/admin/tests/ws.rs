@@ -387,6 +387,7 @@ async fn a_client_that_closes_is_forgotten() {
 async fn changing_the_secret_ends_live_sessions() {
     let app = App::start().await;
     let (mut socket, _) = app.live().await;
+    let old_ticket = app.ticket().await;
 
     let (status, body) = app
         .send(
@@ -405,6 +406,7 @@ async fn changing_the_secret_ends_live_sessions() {
     // A ticket bought with the old secret is not to be had any more.
     let (status, _) = app.post("/ws-ticket", json!({})).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    assert_eq!(app.upgrade_status(&app.ws_url(&old_ticket), &[]).await, 401);
 }
 
 #[tokio::test]

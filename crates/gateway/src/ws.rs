@@ -287,9 +287,13 @@ impl Inner {
         };
 
         let resolution = self.scheduler.resolve(&request.model);
-        if let Err(error) =
-            check_identity(&request.identity, &request.model, resolution.as_ref().ok())
-        {
+        if let Err(error) = check_identity(
+            &self.keys.load(),
+            &request.identity,
+            &request.model,
+            resolution.as_ref().ok(),
+            None,
+        ) {
             return refuse(recorder, error);
         }
         let mut resolved = match resolution {

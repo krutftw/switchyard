@@ -1,8 +1,10 @@
 // Requests (#/requests): the request log and the detail of one request.
 //
-//   ?status=&model=&provider=&key=&q=   filters, the same names GET /requests takes
+//   ?status=&model=&client_model=&since=&provider=&key=&q=
+//                                      filters, the same names GET /requests takes
 //   ?live=off                           hold live updates back
-//   ?id=<request id>&tab=<body tab>     the open detail drawer
+//   ?id=<request id>&tab=<body tab>     the open detail drawer; picking a body
+//                                       tab is a step in the history
 //
 // The pieces live in ./requests/: log.js (the list and its live updates),
 // cells.js (columns), filters.js (the filter bar), detail.js (the drawer),
@@ -15,7 +17,7 @@ import { loadStyles, prefersReducedMotion } from '../lib/dom.js';
 import { formatNumber, formatTime, plural, sentence } from '../lib/format.js';
 import { usePresence, useResource } from '../lib/hooks.js';
 import { useLive } from '../lib/live.js';
-import { navigate } from '../lib/router.js';
+import { navigate, routeStore } from '../lib/router.js';
 import { COLUMNS, HoverTips, memo } from './requests/cells.js';
 import RequestDrawer from './requests/detail.js';
 import FilterBar from './requests/filters.js';
@@ -50,6 +52,19 @@ function useWidth(ref) {
   return width;
 }
 
+/**
+ * The mark on the history entries of a drawer opened from the list:
+ * `{ key, steps }`, the Navigation API key of the list entry it was opened
+ * from (null without that API) and how many entries the drawer has added
+ * since it opened (one per body tab picked).
+ */
+const FROM_LIST = 'requestFromList';
+
+function mark(value) {
+  const state = history.state && typeof history.state === 'object' ? history.state : {};
+  history.replaceState({ ...state, [FROM_LIST]: value }, '');
+}
+
 /** Panel widths, in px, from which each way of drawing the list fits. */
 const FIT_FULL = 960;
 const FIT_TIGHT = 880;
@@ -82,10 +97,12 @@ export default function Requests({ route }) {
   const query = route.query;
   const status = query.status ?? '';
   const model = query.model ?? '';
+  const client_model = query.client_model ?? '';
+  const since = query.since ?? '';
   const provider = query.provider ?? '';
   const key = query.key ?? '';
   const q = query.q ?? '';
-  const filters = useMemo(() => ({ status, model, provider, key, q }), [status, model, provider, key, q]);
+  const filters = useMemo(() => ({ status, model, client_model, since, provider, key, q }), [status, model, client_model, since, provider, key, q]);
   const filtered = FILTER_KEYS.some((name) => filters[name]);
   const live = query.live !== 'off';
   const id = query.id ?? '';
@@ -214,23 +231,63 @@ export default function Requests({ route }) {
 
   // ---- The drawer ---------------------------------------------------------
 
-  // Opening from the list adds a history entry, so Back closes the drawer.
-  // That entry is marked: closing a marked entry goes back to the list entry
-  // before it instead of stacking another one. An entry that was not opened
-  // from the list (a link, a typed address) has nothing to go back to, so
-  // closing it only drops the id.
+  // Opening from the list adds a history entry, so Back closes the drawer,
+  // and each body tab picked in it adds one more, so Back returns to the
+  // previous tab. Those entries are marked (FROM_LIST): closing the drawer
+  // from a marked entry goes back to the list entry it was opened from
+  // instead of stacking another copy of the list. An entry that was not
+  // opened from the list (a link, a typed address) has nothing to go back
+  // to, so closing it only drops the id and the tab.
   const open = useCallback(
     (row) => {
       const already = !!queryRef.current.id;
+      const list = window.navigation?.currentEntry?.key ?? null;
       go({ id: row.id }, { replace: already });
-      if (!already) history.replaceState({ ...(history.state ?? {}), requestOpenedFromList: true }, '');
+      if (!already) mark({ key: list, steps: 0 });
+    },
+    [go],
+  );
+
+  const setTab = useCallback(
+    (tab) => {
+      const next = tab || null;
+      if ((queryRef.current.tab || null) === next) return;
+      const from = history.state?.[FROM_LIST];
+      const before = location.hash;
+      go({ tab: next }, { replace: false });
+      // The new entry is one more step away from the list.
+      if (from && location.hash !== before) mark({ key: from.key, steps: from.steps + 1 });
     },
     [go],
   );
 
   const close = useCallback(() => {
-    if (history.state?.requestOpenedFromList) history.back();
-    else go({ id: null, tab: null });
+    const from = history.state?.[FROM_LIST];
+    if (!from) {
+      go({ id: null, tab: null });
+      return;
+    }
+    // Should the step back not happen, the drawer still closes: take the
+    // mark off this entry and rewrite its address.
+    const openId = queryRef.current.id;
+    const rewrite = () => {
+      const route = routeStore.get();
+      if (route.path !== '/requests' || route.query.id !== openId) return;
+      const { [FROM_LIST]: _mark, ...state } = history.state ?? {};
+      history.replaceState(state, '');
+      go({ id: null, tab: null });
+    };
+    // By its key where the Navigation API has one: Chromium can ignore a
+    // script's history.back() over an entry it counts as skippable.
+    const nav = window.navigation;
+    if (from.key && nav?.entries?.().some((entry) => entry.key === from.key)) {
+      const step = nav.traverseTo(from.key);
+      step.committed?.catch(rewrite);
+      step.finished?.catch(() => {});
+    } else {
+      history.go(-(from.steps + 1));
+    }
+    setTimeout(rewrite, 400);
   }, [go]);
 
   const index = id ? rows.findIndex((row) => row.id === id) : -1;
@@ -330,7 +387,7 @@ export default function Requests({ route }) {
         `}
       <//>
 
-      <${RequestDrawer} id=${id} seed=${seed} onClose=${close} onNewer=${newer ? () => go({ id: newer.id }) : null} onOlder=${older ? () => go({ id: older.id }) : null} />
+      <${RequestDrawer} id=${id} seed=${seed} tab=${query.tab ?? ''} onTab=${setTab} onClose=${close} onNewer=${newer ? () => go({ id: newer.id }) : null} onOlder=${older ? () => go({ id: older.id }) : null} />
     <//>
   `;
 }

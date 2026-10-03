@@ -1007,16 +1007,16 @@ async fn with_cors_off_requests_from_other_sites_pages_are_refused() {
         .await
         .unwrap();
     assert_eq!(response.status(), 200);
-    // … also behind a proxy that rewrote `Host`, when the browser vouches
-    // for it …
+    // An unconfigured proxy origin needs a client key even when the browser
+    // considers its request same-origin.
     let response = from_page("/v1/chat/completions", &chat_body("mock-echo", false))
         .header("origin", "https://gateway.example")
         .header("sec-fetch-site", "same-origin")
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    // … and the model listings, which run nothing, are not guarded (the
+    assert_eq!(response.status(), 403);
+    // The model listings, which run nothing, are not guarded (the
     // page cannot read them without CORS headers anyway).
     let response = client
         .get(server.url("/v1/models"))
@@ -1027,7 +1027,7 @@ async fn with_cors_off_requests_from_other_sites_pages_are_refused() {
     assert_eq!(response.status(), 200);
     assert!(header(&response, "access-control-allow-origin").is_none());
 
-    // With CORS on, every origin is welcome: that is what the switch is for.
+    // With CORS on, other origins still need a configured client key.
     let open = TestServer::with(Settings {
         cors: true,
         auth_required: false,
@@ -1042,8 +1042,17 @@ async fn with_cors_off_requests_from_other_sites_pages_are_refused() {
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    assert_eq!(response.status(), 403);
     assert_eq!(header(&response, "access-control-allow-origin"), Some("*"));
+    let response = client
+        .post(open.url("/v1/chat/completions"))
+        .bearer_auth(KEY)
+        .header("origin", "https://app.example")
+        .json(&chat_body("mock-echo", false))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
 }
 
 // ---------------------------------------------------------------------------

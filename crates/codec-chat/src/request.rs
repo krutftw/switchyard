@@ -11,7 +11,7 @@ use crate::names::{UpstreamIds, UpstreamNames, fnv1a64};
 use crate::reasoning;
 use crate::schema::{normalize_parameters, normalize_schema};
 use serde_json::{Map, Value, json};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use switchyard_core::codec::{MaxTokensField, RequestMeta, RequestPath, UpstreamCtx};
 use switchyard_core::error::CodecError;
 use switchyard_core::ir::{
@@ -249,7 +249,7 @@ pub(crate) fn decode_request(body: &Value, path: &RequestPath<'_>) -> Result<Req
         // `allowed_tools` narrows the tool set without rewriting `tools`.
         // The IR has no such notion, so the list itself is narrowed.
         req.tools.retain(|t| match t.name() {
-            Some(name) => allowed.iter().any(|a| a == name),
+            Some(name) => allowed.contains(name),
             None => true,
         });
         if !req.tools.iter().any(|t| t.name().is_some()) {
@@ -298,9 +298,10 @@ fn decode_messages(messages: &[Value], req: &mut Request) -> Result<(), CodecErr
     let mut last_was_tool = false;
     // Ids of the calls in the latest assistant turn that have no result yet,
     // used to pair tool messages that omit `tool_call_id`.
-    let mut pending_calls: Vec<String> = Vec::new();
+    let mut pending_calls: VecDeque<String> = VecDeque::new();
+    let mut pending_counts: HashMap<String, usize> = HashMap::new();
     // Legacy `function_call`s have no id; results are paired by name.
-    let mut legacy_calls: VecDeque<(String, String)> = VecDeque::new();
+    let mut legacy_calls: HashMap<String, VecDeque<String>> = HashMap::new();
 
     for (i, m) in messages.iter().enumerate() {
         if !m.is_object() {
@@ -335,7 +336,11 @@ fn decode_messages(messages: &[Value], req: &mut Request) -> Result<(), CodecErr
                 seen_conversation = true;
                 last_was_tool = false;
                 pending_calls.clear();
+                pending_counts.clear();
                 let parts = assistant_parts(m, &mut pending_calls, &mut legacy_calls);
+                for id in &pending_calls {
+                    *pending_counts.entry(id.clone()).or_default() += 1;
+                }
                 req.messages.push(Message {
                     role: Role::Assistant,
                     parts,
@@ -346,11 +351,16 @@ fn decode_messages(messages: &[Value], req: &mut Request) -> Result<(), CodecErr
                 seen_conversation = true;
                 let mut call_id = str_of(m, "tool_call_id").unwrap_or("").to_string();
                 if call_id.is_empty() {
-                    if !pending_calls.is_empty() {
-                        call_id = pending_calls.remove(0);
+                    // Explicit answers leave queue entries behind; skip each
+                    // at most once while retaining the order of unanswered ids.
+                    while let Some(id) = pending_calls.pop_front() {
+                        if consume_call(&mut pending_counts, &id) {
+                            call_id = id;
+                            break;
+                        }
                     }
                 } else {
-                    pending_calls.retain(|p| p != &call_id);
+                    pending_counts.remove(&call_id);
                 }
                 let result = tool_result(m, call_id, name);
                 push_tool_result(req, &mut last_was_tool, result);
@@ -358,13 +368,13 @@ fn decode_messages(messages: &[Value], req: &mut Request) -> Result<(), CodecErr
             "function" => {
                 seen_conversation = true;
                 let fn_name = name.clone().unwrap_or_default();
-                let call_id = match legacy_calls.iter().position(|(n, _)| *n == fn_name) {
-                    Some(pos) => legacy_calls
-                        .remove(pos)
-                        .map(|(_, id)| id)
-                        .unwrap_or_else(new_call_id),
-                    None => new_call_id(),
-                };
+                let call_id = legacy_calls
+                    .get_mut(&fn_name)
+                    .and_then(VecDeque::pop_front)
+                    .unwrap_or_else(new_call_id);
+                if legacy_calls.get(&fn_name).is_some_and(VecDeque::is_empty) {
+                    legacy_calls.remove(&fn_name);
+                }
                 let result = tool_result(m, call_id, name);
                 push_tool_result(req, &mut last_was_tool, result);
             }
@@ -389,8 +399,8 @@ fn decode_messages(messages: &[Value], req: &mut Request) -> Result<(), CodecErr
 
 fn assistant_parts(
     m: &Value,
-    pending_calls: &mut Vec<String>,
-    legacy_calls: &mut VecDeque<(String, String)>,
+    pending_calls: &mut VecDeque<String>,
+    legacy_calls: &mut HashMap<String, VecDeque<String>>,
 ) -> Vec<Part> {
     let mut parts: Vec<Part> = reasoning_from_message(m, Side::Client)
         .into_iter()
@@ -405,7 +415,7 @@ fn assistant_parts(
     if let Some(Value::Array(calls)) = m.get("tool_calls") {
         for tc in calls {
             if let Some(call) = tool_call_from_wire(tc, Side::Client) {
-                pending_calls.push(call.id.clone());
+                pending_calls.push_back(call.id.clone());
                 parts.push(Part::ToolCall(call));
             }
         }
@@ -414,7 +424,10 @@ fn assistant_parts(
         && let Some(name) = str_of(fc, "name")
     {
         let id = new_call_id();
-        legacy_calls.push_back((name.to_string(), id.clone()));
+        legacy_calls
+            .entry(name.to_string())
+            .or_default()
+            .push_back(id.clone());
         parts.push(Part::tool_call(
             id,
             name,
@@ -559,7 +572,7 @@ fn decode_tools(obj: &Map<String, Value>) -> Vec<Tool> {
 }
 
 /// Returns the tool choice and, for `allowed_tools`, the allowed names.
-fn decode_tool_choice(obj: &Map<String, Value>) -> (Option<ToolChoice>, Option<Vec<String>>) {
+fn decode_tool_choice(obj: &Map<String, Value>) -> (Option<ToolChoice>, Option<HashSet<String>>) {
     let simple = |kind: &str| match kind.trim().to_ascii_lowercase().as_str() {
         "none" => Some(ToolChoice::None),
         "auto" => Some(ToolChoice::Auto),
@@ -599,7 +612,7 @@ fn decode_tool_choice(obj: &Map<String, Value>) -> (Option<ToolChoice>, Option<V
                     let names = spec
                         .get("tools")
                         .and_then(Value::as_array)
-                        .map(|tools| tools.iter().filter_map(named).collect::<Vec<_>>())
+                        .map(|tools| tools.iter().filter_map(named).collect::<HashSet<_>>())
                         .unwrap_or_default();
                     let mode = spec.get("mode").and_then(Value::as_str).unwrap_or("auto");
                     let choice = match simple(mode) {
@@ -655,14 +668,16 @@ pub(crate) fn encode_request(
     }
     // Ids of the tool calls emitted so far that no tool message has answered
     // yet. Only these may be answered by a `tool` message.
-    let mut awaiting: Vec<String> = Vec::new();
+    let mut awaiting: HashMap<String, usize> = HashMap::new();
     for msg in &request.messages {
         match msg.role {
             Role::System => messages.extend(system_message(&msg.parts, msg.name.as_deref())),
             Role::User => encode_user(msg, openai_source, &spelling, &mut awaiting, &mut messages),
             Role::Assistant => {
                 if let Some(message) = encode_assistant(msg, &spelling) {
-                    awaiting.extend(call_ids(&message).into_iter().map(str::to_string));
+                    for id in call_ids(&message) {
+                        *awaiting.entry(id.to_string()).or_default() += 1;
+                    }
                     messages.push(message);
                 }
             }
@@ -843,6 +858,18 @@ fn system_message(parts: &[Part], name: Option<&str>) -> Option<Value> {
     Some(Value::Object(m))
 }
 
+/// Consume one occurrence without rescanning the outstanding calls.
+fn consume_call(counts: &mut HashMap<String, usize>, id: &str) -> bool {
+    let Some(count) = counts.get_mut(id) else {
+        return false;
+    };
+    *count -= 1;
+    if *count == 0 {
+        counts.remove(id);
+    }
+    true
+}
+
 /// A user message becomes: one `tool` message per tool result (in order),
 /// then one user message per result that answers nothing (see below), then
 /// a user message holding media the tools returned (Chat tool messages are
@@ -859,7 +886,7 @@ fn encode_user(
     msg: &Message,
     openai_source: bool,
     spelling: &Spelling,
-    awaiting: &mut Vec<String>,
+    awaiting: &mut HashMap<String, usize>,
     out: &mut Vec<Value>,
 ) {
     let mut relayed: Vec<Value> = Vec::new();
@@ -889,23 +916,16 @@ fn encode_user(
             texts.join("\n\n")
         };
         let call_id = spelling.ids.wire(&result.call_id);
-        let answers = (!call_id.is_empty())
-            .then(|| awaiting.iter().position(|id| *id == call_id))
-            .flatten();
-        match answers {
-            Some(position) => {
-                awaiting.remove(position);
-                out.push(json!({
-                    "role": "tool",
-                    "tool_call_id": call_id,
-                    "content": text
-                }));
-            }
+        let answers = !call_id.is_empty() && consume_call(awaiting, &call_id);
+        if answers {
+            out.push(json!({
+                "role": "tool",
+                "tool_call_id": call_id,
+                "content": text
+            }));
+        } else if !text.trim().is_empty() {
             // An orphan: the output is still worth showing to the model.
-            None if !text.trim().is_empty() => {
-                orphans.push(json!({"role": "user", "content": text}));
-            }
-            None => {}
+            orphans.push(json!({"role": "user", "content": text}));
         }
         relayed.extend(media);
     }

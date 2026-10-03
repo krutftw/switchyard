@@ -3,6 +3,8 @@
 //   helpers        getPath, deepEqual, nestPatch, durationHint, wildcardMatch,
 //                  focusSoon (a place for the keyboard when its control has
 //                  gone)
+//   overrides      OVERRIDE_FLAGS, valueInUse, overrideNote: settings the
+//                  command line fixes (--host, --port)
 //   guard          useUnsavedGuard, confirmDiscard: the open tab asks before
 //                  it is left with unsaved edits
 //   expectSecret   keeps this browser signed in after the admin secret changed
@@ -176,6 +178,52 @@ export function focusAfterNotice(find = selectedTab) {
 
 /** A secret written as a reference to an environment variable ("env:NAME", "${NAME}"), not as the secret itself. */
 export const isSecretReference = (secret) => /^env:/.test(secret) || /^\$\{[^}]*\}$/.test(secret);
+
+// ---------------------------------------------------------------------------
+// Settings the command line fixes
+// ---------------------------------------------------------------------------
+
+/**
+ * The flag behind each setting GET /config and GET /status can name in
+ * `command_line_overrides`. The file's value of such a setting is saved but
+ * not used, now or after a restart with the same command line.
+ */
+export const OVERRIDE_FLAGS = { 'server.host': '--host', 'server.port': '--port' };
+
+/** "127.0.0.1:8317" or "[::1]:8317" (GET /status listen) -> { host, port }; null when it cannot be read. */
+export function listenParts(listen) {
+  const match = /^\[?(.*?)\]?:(\d+)$/.exec(String(listen ?? ''));
+  return match ? { host: match[1], port: Number(match[2]) } : null;
+}
+
+/** The value in use of an overridden setting, read from GET /status listen; null when unknown. */
+export function valueInUse(path, listen) {
+  const parts = listenParts(listen);
+  if (!parts) return null;
+  if (path === 'server.port') return parts.port;
+  if (path === 'server.host') return parts.host;
+  return null;
+}
+
+/** The overridden settings among `paths`, in the order the gateway names them. */
+export function overriddenAmong(overrides, paths) {
+  return (overrides ?? []).filter((setting) => paths.some((path) => path === setting || path.startsWith(`${setting}.`)));
+}
+
+/**
+ * What a save of overridden settings means, as a sentence for the toast:
+ * the command line's value stays in effect, a restart does not change that.
+ */
+export function overrideNote(settings, listen) {
+  if (settings.length === 0) return null;
+  const parts = settings.map((setting) => {
+    const flag = OVERRIDE_FLAGS[setting] ?? 'a command-line flag';
+    const inUse = valueInUse(setting, listen);
+    return inUse == null ? `${setting} (${flag})` : `${setting} (${flag} ${inUse})`;
+  });
+  const flags = settings.map((setting) => OVERRIDE_FLAGS[setting] ?? 'the flag').join(' and ');
+  return `The command line keeps ${parts.join(' and ')} in effect, also after a restart with the same command line. The saved ${settings.length === 1 ? 'value applies' : 'values apply'} when the gateway starts without ${flags}.`;
+}
 
 // ---------------------------------------------------------------------------
 // Unsaved-changes guard
@@ -361,6 +409,8 @@ export function useEdits(base) {
  *            `failed()` runs when the save was refused
  *   onDiskInvalid  (error) => void: the save was refused because the file
  *            on disk is not valid (see isDiskInvalid)
+ *   listen   GET /status listen, to name the value in use of a setting the
+ *            command line fixes (command_line_overrides)
  *
  * Returns { submit, saving, error, issues, refused, clear }:
  *
@@ -369,7 +419,7 @@ export function useEdits(base) {
  *            its field is edited, the whole error once nothing is unsaved
  *   clear()  forget the error (Discard)
  */
-export function useSettingsSave({ form, config, name, toPatch, check, risks, prepare, onDiskInvalid }) {
+export function useSettingsSave({ form, config, name, toPatch, check, risks, prepare, onDiskInvalid, listen = null }) {
   const [clientError, setClientError] = useState(null);
   const save = useAsync((patch) => api.patch('/settings', patch));
   // The form as it was when the last save was checked and sent: what the
@@ -428,8 +478,14 @@ export function useSettingsSave({ form, config, name, toPatch, check, risks, pre
     // its way stays an unsaved edit.
     form.settle(sent);
     const notes = [];
-    const restart = (result.restart_required ?? []).filter((setting) => touched.some((path) => path === setting || path.startsWith(`${setting}.`)));
+    // A setting the command line fixes is saved, and a restart with the same
+    // command line does not apply it: no promise of a restart for it.
+    const overrides = result.command_line_overrides ?? [];
+    const overridden = overriddenAmong(overrides, touched);
+    const restart = overriddenAmong(result.restart_required ?? [], touched).filter((setting) => !overrides.includes(setting));
     if (restart.length > 0) notes.push(`Restart the gateway to apply ${restart.join(', ')}.`);
+    const fixed = overrideNote(overridden, listen);
+    if (fixed) notes.push(fixed);
     // A field that was emptied went out as null, which the gateway reads as
     // "back to the default": say which value that turned out to be.
     for (const path of touched) {
@@ -439,7 +495,7 @@ export function useSettingsSave({ form, config, name, toPatch, check, risks, pre
     }
     if (extra) notes.push(extra);
     const options = notes.length > 0 ? { description: notes.join(' ') } : undefined;
-    if (restart.length > 0) toast.warning(`${name} settings saved`, options);
+    if (restart.length > 0 || overridden.length > 0) toast.warning(`${name} settings saved`, options);
     else toast.success(`${name} settings saved`, options);
   };
 
@@ -542,7 +598,7 @@ export function SaveError({ error, issues, title }) {
   if (!isDiskInvalid(error)) return html`<${FormError} error=${error} issues=${issues} title=${title} />`;
   if (lifted === error) return null;
   return html`
-    <${Notice} tone="stop" title=${title} action=${html`<${Button} size="sm" onClick=${() => setQuery({ tab: 'raw' })}>Open the raw file<//>`}>
+    <${Notice} tone="stop" title=${title} action=${html`<${Button} size="sm" onClick=${() => setQuery({ tab: 'raw' }, { replace: false })}>Open the raw file<//>`}>
       <span>switchyard.toml on disk is not valid, and saving would overwrite it, so nothing was written. Your changes are still here. Fix or restore the file, on the Raw file tab or in an editor, then save again.</span>
       ${error.issues.length > 0 &&
       html`<ul class="issue-list" aria-label="Problems in the file">

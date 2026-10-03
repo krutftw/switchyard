@@ -113,17 +113,26 @@ async fn clients_without_an_origin_and_same_origin_pages_are_not_affected() {
         "a page of the gateway's own origin"
     );
 
-    // With CORS on, every origin is welcome — on sockets as over HTTP.
+    // With CORS on, a different origin still needs a client key.
     let open = TestServer::with(Settings {
         cors: true,
         auth_required: false,
         ..Settings::default()
     })
     .await;
-    assert!(
+    assert!(matches!(
         ws_connect(
             &open.ws_url("/v1/responses"),
             &[("origin", "https://app.example")]
+        )
+        .await,
+        Err(WsError::Http(response)) if response.status() == 403
+    ));
+    let auth = format!("Bearer {}", support::KEY);
+    assert!(
+        ws_connect(
+            &open.ws_url("/v1/responses"),
+            &[("origin", "https://app.example"), ("authorization", &auth)]
         )
         .await
         .is_ok()

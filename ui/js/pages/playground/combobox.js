@@ -8,6 +8,8 @@
 // Keyboard: typing filters; ArrowDown / ArrowUp open the list and move;
 // Enter takes the highlighted suggestion; Escape or Tab closes. Focus never
 // leaves the field (the WAI-ARIA combobox pattern with a listbox popup).
+// The list is only in the document while it is open, so the field names it
+// in aria-controls only then: no reference to an element that is not there.
 
 import { html, useEffect, useLayoutEffect, useMemo, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Button, Field, Icon, Portal, Skeleton, StatusLamp } from '../../components/index.js';
@@ -199,7 +201,7 @@ export default function Combobox({
           role="combobox"
           aria-autocomplete="list"
           aria-expanded=${open ? 'true' : 'false'}
-          aria-controls=${`${id}-list`}
+          aria-controls=${open ? `${id}-list` : undefined}
           aria-activedescendant=${open && active >= 0 ? `${id}-opt-${active}` : undefined}
           aria-invalid=${error ? 'true' : undefined}
           aria-describedby=${describedBy}

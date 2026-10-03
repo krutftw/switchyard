@@ -137,7 +137,8 @@ fn set_key(rng: &mut Rng) -> String {
         "temperature",
         "reasoning.summary",
         "generationConfig.thinkingConfig.includeThoughts",
-        "two words",
+        // Needs quoting in TOML; a rule path may not hold a space.
+        "plus+sign",
         "quo\"te",
         "ключ",
         "metadata.user_id",

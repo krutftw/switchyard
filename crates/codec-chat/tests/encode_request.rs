@@ -810,6 +810,40 @@ fn multi_turn_tool_conversation() {
 }
 
 #[test]
+fn awaiting_call_counts_preserve_duplicate_ids_and_orphan_extra_results() {
+    let mut req = request(Protocol::Anthropic);
+    req.messages = vec![
+        Message::new(
+            Role::Assistant,
+            vec![
+                Part::tool_call("same", "f", "{}"),
+                Part::tool_call("same", "f", "{}"),
+                Part::tool_call("other", "g", "{}"),
+            ],
+        ),
+        Message::new(
+            Role::User,
+            vec![
+                result("other", vec![Part::text("other")]),
+                result("same", vec![Part::text("first")]),
+                result("same", vec![Part::text("second")]),
+                result("same", vec![Part::text("extra")]),
+            ],
+        ),
+    ];
+    let messages = encoded_messages(&req);
+    assert_eq!(
+        &messages.as_array().unwrap()[1..],
+        &[
+            json!({"role": "tool", "tool_call_id": "other", "content": "other"}),
+            json!({"role": "tool", "tool_call_id": "same", "content": "first"}),
+            json!({"role": "tool", "tool_call_id": "same", "content": "second"}),
+            json!({"role": "user", "content": "extra"}),
+        ]
+    );
+}
+
+#[test]
 fn user_message_with_only_tool_results_adds_no_empty_user_message() {
     let mut req = request(Protocol::Gemini);
     req.messages = vec![

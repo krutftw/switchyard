@@ -20,7 +20,7 @@ import { placeFloating } from '../../lib/dom.js';
 import { DASH, formatCurrency, formatDuration, formatRelativeTime, formatTime, formatTimestamp, formatTokens, plural } from '../../lib/format.js';
 import { useNow } from '../../lib/hooks.js';
 import { shallowEqual } from '../../lib/store.js';
-import { MODES, NO_MODEL, durationTip, modelTip, providerTip, routeTip, statusTip, usageCounted, usageTip } from './record.js';
+import { MODES, NO_MODEL, NO_PROVIDER, durationTip, modelTip, providerTip, routeTip, statusTip, usageCounted, usageTip } from './record.js';
 
 // ---------------------------------------------------------------------------
 // Pieces
@@ -74,7 +74,7 @@ export function Elapsed({ since }) {
 export function statusTone(record) {
   if (record.ok) return 'clear';
   const tone = toneForStatus(record.status);
-  return tone === 'clear' ? 'stop' : tone;
+  return tone === 'caution' ? 'caution' : 'stop';
 }
 
 export function ModeBadge({ mode }) {
@@ -169,7 +169,7 @@ export const COLUMNS = [
     header: 'Provider',
     render: (r) => {
       if (r.in_flight) return html`<span class="req-two"><span class="req-l1 faint">Routing</span></span>`;
-      if (!r.provider) return html`<span class="req-two" data-tip=${providerTip(r)}><span class="req-l1 faint">Not routed</span></span>`;
+      if (!r.provider) return html`<span class="req-two" data-tip=${providerTip(r)}><span class="req-l1 faint">${NO_PROVIDER}</span></span>`;
       const credential = r.credential_label && r.credential_label !== r.provider ? r.credential_label : null;
       return html`
         <span class="req-two req-provider" data-tip=${providerTip(r)}>

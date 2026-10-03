@@ -265,11 +265,11 @@ fn write_atomic(
         drop(file);
         return Err(discard(AtomicFailure::Write(error)));
     }
-    drop(file);
     if keep_owner {
-        copy_owner(target, tmp).map_err(|e| discard(AtomicFailure::KeepOwner(e)))?;
+        copy_owner(target, &file).map_err(|e| discard(AtomicFailure::KeepOwner(e)))?;
     }
-    copy_permissions(target, tmp).map_err(|e| discard(AtomicFailure::Replace(e)))?;
+    copy_permissions(target, &file).map_err(|e| discard(AtomicFailure::Replace(e)))?;
+    drop(file);
     fs::rename(tmp, target).map_err(|e| discard(AtomicFailure::Replace(e)))?;
     sync_parent(target);
     Ok(())
@@ -329,37 +329,37 @@ fn write_in_place(target: &Path, bytes: &[u8], fill: Fill<'_>) -> io::Result<()>
 /// when they differ from its own. A gateway run as root must not turn a
 /// file that belongs to the service user into one only root can read.
 #[cfg(unix)]
-fn copy_owner(target: &Path, tmp: &Path) -> io::Result<()> {
+fn copy_owner(target: &Path, file: &File) -> io::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let Ok(original) = fs::metadata(target) else {
         // No original (it was deleted meanwhile): nothing to keep.
         return Ok(());
     };
-    let created = fs::metadata(tmp)?;
+    let created = file.metadata()?;
     if created.uid() == original.uid() && created.gid() == original.gid() {
         return Ok(());
     }
-    std::os::unix::fs::chown(tmp, Some(original.uid()), Some(original.gid()))
+    std::os::unix::fs::fchown(file, Some(original.uid()), Some(original.gid()))
 }
 
 #[cfg(not(unix))]
-fn copy_owner(_target: &Path, _tmp: &Path) -> io::Result<()> {
+fn copy_owner(_target: &Path, _file: &File) -> io::Result<()> {
     Ok(())
 }
 
 /// Gives the replacement file the mode of the file it replaces. (Elsewhere a
 /// replacement only ever stands in for a file that did not exist.)
 #[cfg(unix)]
-fn copy_permissions(target: &Path, tmp: &Path) -> io::Result<()> {
+fn copy_permissions(target: &Path, file: &File) -> io::Result<()> {
     match fs::metadata(target) {
-        Ok(meta) => fs::set_permissions(tmp, meta.permissions()),
+        Ok(meta) => file.set_permissions(meta.permissions()),
         // No original (it was deleted meanwhile): keep the owner-only mode.
         Err(_) => Ok(()),
     }
 }
 
 #[cfg(not(unix))]
-fn copy_permissions(_target: &Path, _tmp: &Path) -> io::Result<()> {
+fn copy_permissions(_target: &Path, _file: &File) -> io::Result<()> {
     Ok(())
 }
 
@@ -403,6 +403,28 @@ mod tests {
         write_new(&path, "").unwrap();
         let mode = fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacement_metadata_is_applied_to_the_open_file() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("config.toml");
+        fs::write(&target, "old").unwrap();
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o640)).unwrap();
+        let temp = dir.path().join("temporary");
+        let file = File::create(&temp).unwrap();
+        let renamed = dir.path().join("renamed");
+        fs::rename(&temp, &renamed).unwrap();
+        copy_owner(&target, &file).unwrap();
+        copy_permissions(&target, &file).unwrap();
+        assert_eq!(file.metadata().unwrap().permissions().mode() & 0o777, 0o640);
+        assert_eq!(
+            fs::metadata(renamed).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!temp.exists());
     }
 
     /// How an existing file is replaced when nothing stands in the way.

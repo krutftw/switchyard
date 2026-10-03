@@ -56,6 +56,8 @@ const MAX_EXPIRES_IN_SECS: u64 = 12 * 3600;
 
 /// Total time allowed for one token exchange.
 const EXCHANGE_TIMEOUT: Duration = Duration::from_secs(30);
+/// OAuth responses are small JSON documents, including on failure.
+const MAX_TOKEN_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// A service-account key file could not be used.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
@@ -469,7 +471,7 @@ async fn exchange(
     let form = format!(
         "grant_type=urn%3Aietf%3Aparams%3Aoauth%3Agrant-type%3Ajwt-bearer&assertion={assertion}"
     );
-    let response = http
+    let mut response = http
         .post(endpoint)
         .header(
             http::header::CONTENT_TYPE,
@@ -491,7 +493,8 @@ async fn exchange(
             )
         })?;
     let status = response.status();
-    let body = response.bytes().await.map_err(|e| {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| {
         token_error(
             FailureClass::Transport,
             format!(
@@ -499,7 +502,15 @@ async fn exchange(
                 crate::client::describe_transport(&e)
             ),
         )
-    })?;
+    })? {
+        if chunk.len() > MAX_TOKEN_RESPONSE_BYTES.saturating_sub(body.len()) {
+            return Err(token_error(
+                FailureClass::Transport,
+                "token exchange response exceeds the byte limit".to_string(),
+            ));
+        }
+        body.extend_from_slice(&chunk);
+    }
     let parsed: Option<Value> = serde_json::from_slice(&body).ok();
 
     if !status.is_success() {

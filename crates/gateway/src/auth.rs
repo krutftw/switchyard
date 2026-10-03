@@ -1,6 +1,7 @@
 //! Client authentication: the key table built from `[auth]`, the identity a
 //! request runs under, and the per-key rate limit.
 
+use crate::ticket::Holder;
 use crate::types::PresentedCredentials;
 use parking_lot::Mutex;
 use sha2::{Digest, Sha256};
@@ -131,6 +132,14 @@ impl ClientIdentity {
         self.rpm
     }
 
+    pub(crate) fn has_model_restrictions(&self) -> bool {
+        !self.models.is_empty()
+    }
+
+    pub(crate) fn same_permissions(&self, other: &Self) -> bool {
+        self.models == other.models && self.rpm == other.rpm
+    }
+
     /// Counts one request against the key's rate limit.
     pub(crate) fn check_rate(&self, now: Instant) -> Result<(), ApiError> {
         let (Some(limit), Some(window)) = (self.rpm, &self.window) else {
@@ -143,6 +152,16 @@ impl ClientIdentity {
             .with_code("rate_limit_exceeded")
             .with_retry_after(ceil_secs(wait))
         })
+    }
+
+    /// Who a WebSocket ticket bought by this identity stands for. `None`
+    /// for the gateway's built-in clients, which never need one.
+    pub(crate) fn ticket_holder(&self) -> Option<Holder> {
+        match (&self.key_id, self.internal) {
+            (_, true) => None,
+            (Some(id), false) => Some(Holder::Key(id.clone())),
+            (None, false) => Some(Holder::Anonymous),
+        }
     }
 
     /// The key under which per-client state (remembered reasoning, session
@@ -268,10 +287,63 @@ impl KeyTable {
         found
     }
 
-    /// Identifies the client. See [`crate::Gateway::authenticate`].
+    /// The identity of a matched key.
+    fn identity(entry: &KeyEntry) -> ClientIdentity {
+        ClientIdentity {
+            key_id: Some(entry.id.clone()),
+            key_name: entry.name.clone(),
+            anonymous: false,
+            internal: false,
+            models: Arc::clone(&entry.models),
+            rpm: entry.rpm,
+            window: Some(Arc::clone(&entry.window)),
+        }
+    }
+
+    /// The identity a WebSocket ticket stands for, under this table: the
+    /// key that bought it, if that key is (still) enabled; the anonymous
+    /// identity, if anonymous clients are (still) admitted.
+    fn ticket_identity(&self, holder: &Holder) -> Option<ClientIdentity> {
+        match holder {
+            Holder::Key(id) => self
+                .entries
+                .iter()
+                .find(|entry| entry.id == *id)
+                .map(KeyTable::identity),
+            Holder::Anonymous => (!self.required).then(ClientIdentity::anonymous),
+        }
+    }
+
+    /// Re-checks a previously issued identity against the current key table.
+    /// Long-lived clients must not retain removed keys or old restrictions.
+    pub(crate) fn refresh(&self, identity: &ClientIdentity) -> Result<ClientIdentity, ApiError> {
+        if identity.internal {
+            return Ok(ClientIdentity::dashboard());
+        }
+        identity
+            .ticket_holder()
+            .and_then(|holder| self.ticket_identity(&holder))
+            .ok_or_else(|| {
+                ApiError::authentication("client access was revoked").with_code("invalid_api_key")
+            })
+    }
+
+    /// Identifies the client without looking at tickets. Tests only.
+    #[cfg(test)]
     pub(crate) fn authenticate(
         &self,
         presented: &PresentedCredentials,
+    ) -> Result<ClientIdentity, ApiError> {
+        self.authenticate_with(presented, |_| None)
+    }
+
+    /// Identifies the client. See [`crate::Gateway::authenticate`].
+    /// `redeem` uses up a presented WebSocket ticket and says who bought
+    /// it; it is called only when no key matched.
+    pub(crate) fn authenticate_with(
+        &self,
+        presented: &PresentedCredentials,
+        redeem: impl FnOnce(&str) -> Option<Holder>,
     ) -> Result<ClientIdentity, ApiError> {
         let candidates = [
             presented.authorization.as_deref().map(bearer_token),
@@ -286,15 +358,19 @@ impl KeyTable {
             }
             any = true;
             if let Some(entry) = self.find(candidate) {
-                return Ok(ClientIdentity {
-                    key_id: Some(entry.id.clone()),
-                    key_name: entry.name.clone(),
-                    anonymous: false,
-                    internal: false,
-                    models: Arc::clone(&entry.models),
-                    rpm: entry.rpm,
-                    window: Some(Arc::clone(&entry.window)),
-                });
+                return Ok(KeyTable::identity(entry));
+            }
+        }
+        if let Some(ticket) = presented
+            .ws_ticket
+            .as_deref()
+            .map(str::trim)
+            .filter(|ticket| !ticket.is_empty())
+        {
+            any = true;
+            if let Some(identity) = redeem(ticket).and_then(|holder| self.ticket_identity(&holder))
+            {
+                return Ok(identity);
             }
         }
         if !self.required {
@@ -321,6 +397,7 @@ fn bearer_token(header: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ticket::Tickets;
     use switchyard_core::ErrorKind;
     use switchyard_core::config::ClientKey;
 
@@ -352,7 +429,105 @@ mod tests {
             x_api_key: x_api_key.map(str::to_string),
             x_goog_api_key: x_goog.map(str::to_string),
             query_key: query.map(str::to_string),
+            ws_ticket: None,
         }
+    }
+
+    fn ticket(value: &str) -> PresentedCredentials {
+        PresentedCredentials {
+            ws_ticket: Some(value.to_string()),
+            ..PresentedCredentials::default()
+        }
+    }
+
+    #[test]
+    fn a_ticket_stands_for_the_key_that_bought_it() {
+        let mut limited = key("k", "limited");
+        limited.models = vec!["gpt-*".into()];
+        limited.rate_limit_rpm = Some(1);
+        let t = table(vec![limited, key("other-key", "other")], true);
+        let bought = t
+            .authenticate(&presented(None, Some("k"), None, None))
+            .unwrap();
+        let holder = bought.ticket_holder().unwrap();
+
+        let tickets = Tickets::default();
+        let now = Instant::now();
+        let issued = tickets.issue(holder, now);
+        let redeem = |value: &str| tickets.redeem(value, now);
+        let identity = t.authenticate_with(&ticket(&issued), redeem).unwrap();
+        assert_eq!(identity.key_name.as_deref(), Some("limited"));
+        assert_eq!(identity.key_id, bought.key_id);
+        // The key's allow-list and its rate-limit window come along.
+        assert!(identity.allows_model("gpt-5"));
+        assert!(!identity.allows_model("claude-opus-4-5"));
+        bought.check_rate(now).unwrap();
+        assert!(identity.check_rate(now).is_err(), "one window per key");
+
+        // Used up: the second use is a wrong key.
+        let again = t
+            .authenticate_with(&ticket(&issued), |value| tickets.redeem(value, now))
+            .unwrap_err();
+        assert_eq!(again.status, 401);
+        assert_eq!(again.message, "invalid API key");
+        assert_eq!(again.code.as_deref(), Some("invalid_api_key"));
+    }
+
+    #[test]
+    fn a_ticket_is_looked_at_only_when_no_key_matched() {
+        let t = table(vec![key("k", "named")], true);
+        let mut both = presented(None, Some("k"), None, None);
+        both.ws_ticket = Some("some-ticket".into());
+        let identity = t
+            .authenticate_with(&both, |_| panic!("a matching key does not use the ticket"))
+            .unwrap();
+        assert_eq!(identity.key_name.as_deref(), Some("named"));
+        // Blank tickets are not presented at all.
+        let err = t
+            .authenticate_with(&ticket("  "), |_| panic!("not looked at"))
+            .unwrap_err();
+        assert_eq!(err.message, "missing API key");
+    }
+
+    #[test]
+    fn a_ticket_dies_with_its_key_or_with_anonymous_access() {
+        let mut config = Config::default();
+        config.auth.keys = vec![key("k", "named")];
+        let before = KeyTable::build(&config, None, |k| format!("id-{k}"));
+        let holder = before
+            .authenticate(&presented(None, Some("k"), None, None))
+            .unwrap()
+            .ticket_holder()
+            .unwrap();
+        // The key is disabled before the ticket is used.
+        config.auth.keys[0].enabled = false;
+        let after = KeyTable::build(&config, Some(&before), |k| format!("id-{k}"));
+        let err = after
+            .authenticate_with(&ticket("t"), |_| Some(holder.clone()))
+            .unwrap_err();
+        assert_eq!(err.message, "invalid API key");
+
+        // Bought anonymously; then keys became required.
+        let open = table(vec![], false);
+        let anonymous = open
+            .authenticate(&PresentedCredentials::default())
+            .unwrap()
+            .ticket_holder()
+            .unwrap();
+        assert_eq!(anonymous, Holder::Anonymous);
+        assert!(
+            open.authenticate_with(&ticket("t"), |_| Some(Holder::Anonymous))
+                .unwrap()
+                .anonymous
+        );
+        let closed = table(vec![key("k", "named")], true);
+        let err = closed
+            .authenticate_with(&ticket("t"), |_| Some(Holder::Anonymous))
+            .unwrap_err();
+        assert_eq!(err.status, 401);
+
+        // The playground's built-in client never holds tickets.
+        assert_eq!(ClientIdentity::dashboard().ticket_holder(), None);
     }
 
     #[test]
@@ -608,5 +783,51 @@ mod tests {
         assert!(!format!("{p:?}").contains("super-secret"));
         let identity = t.authenticate(&p).unwrap();
         assert!(!format!("{identity:?}").contains("super-secret"));
+    }
+
+    #[test]
+    fn issued_identities_take_current_permissions_and_do_not_survive_revocation() {
+        let mut config = Config::default();
+        config.auth.keys = vec![key("k", "named")];
+        let before = KeyTable::build(&config, None, str::to_owned);
+        let issued = before
+            .authenticate(&presented(None, Some("k"), None, None))
+            .unwrap();
+        config.auth.keys[0].models = vec!["safe".into()];
+        config.auth.keys[0].rate_limit_rpm = Some(1);
+        let after = KeyTable::build(&config, Some(&before), str::to_owned);
+        let current = after.refresh(&issued).unwrap();
+        assert!(current.allows_model("safe"));
+        assert!(!current.allows_model("other"));
+        assert_eq!(current.rate_limit_rpm(), Some(1));
+        assert!(!issued.same_permissions(&current));
+        current.check_rate(Instant::now()).unwrap();
+        assert!(
+            after
+                .refresh(&issued)
+                .unwrap()
+                .check_rate(Instant::now())
+                .is_err()
+        );
+
+        config.auth.keys[0].enabled = false;
+        let disabled = KeyTable::build(&config, Some(&after), str::to_owned);
+        assert_eq!(disabled.refresh(&issued).unwrap_err().status, 401);
+        config.auth.keys.clear();
+        let removed = KeyTable::build(&config, Some(&disabled), str::to_owned);
+        assert_eq!(removed.refresh(&issued).unwrap_err().status, 401);
+        assert_eq!(
+            removed
+                .refresh(&ClientIdentity::anonymous())
+                .unwrap_err()
+                .status,
+            401
+        );
+        assert!(
+            removed
+                .refresh(&ClientIdentity::dashboard())
+                .unwrap()
+                .internal
+        );
     }
 }

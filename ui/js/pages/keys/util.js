@@ -160,9 +160,9 @@ export function shQuote(value) {
   return `'${text.replace(/'/g, `'\\''`)}'`;
 }
 
-/** A value as a PowerShell single-quoted string. */
+/** A value as a PowerShell single-quoted string, including its smart-quote delimiters. */
 export function psQuote(value) {
-  return `'${String(value).replace(/'/g, "''")}'`;
+  return `'${String(value).replace(/['\u2018\u2019\u201a\u201b]/g, (quote) => quote + quote)}'`;
 }
 
 function envBlock(shell, pairs) {

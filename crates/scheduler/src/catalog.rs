@@ -130,20 +130,28 @@ impl Catalog {
     /// 5. a catalog id that equals `id` once *its* suffix is removed, so the
     ///    undated alias `claude-sonnet-4-5` finds `claude-sonnet-4-5-20250929`.
     pub fn lookup_entry(&self, id: &str) -> Option<&CatalogEntry> {
-        let id = id.trim();
-        if id.is_empty() {
+        let mut id = id.trim();
+        // Provider listings are untrusted. Resource names beyond this bound
+        // are not useful model identifiers and must not drive repeated work.
+        if id.is_empty() || id.len() > 1024 {
             return None;
         }
-        self.find(id)
-            .or_else(|| strip_version_suffix(id).and_then(|base| self.find(base)))
-            .or_else(|| {
-                let rest = strip_models_prefix(id)?;
-                self.lookup_entry(rest)
-            })
-            .or_else(|| {
-                let index = *self.undated.get(&id.to_lowercase())?;
-                self.entries.get(index)
-            })
+        let mut undated = None;
+        loop {
+            if let Some(entry) = self
+                .find(id)
+                .or_else(|| strip_version_suffix(id).and_then(|base| self.find(base)))
+            {
+                return Some(entry);
+            }
+            if let Some(index) = self.undated.get(&id.to_lowercase()) {
+                undated = self.entries.get(*index);
+            }
+            match strip_models_prefix(id) {
+                Some(rest) if !rest.trim().is_empty() => id = rest.trim(),
+                _ => return undated,
+            }
+        }
     }
 
     fn find(&self, id: &str) -> Option<&CatalogEntry> {
@@ -523,6 +531,11 @@ mod tests {
             "gemini-2.5-flash"
         );
         assert!(c.lookup("models/").is_none());
+        assert_eq!(
+            c.lookup("models/models/gemini-2.5-pro").unwrap().id,
+            "gemini-2.5-pro"
+        );
+        assert!(c.lookup(&"x".repeat(1025)).is_none());
     }
 
     #[test]

@@ -118,15 +118,18 @@ struct Preceding {
     part: Arc<Reasoning>,
     /// Place of this part in the response.
     place: usize,
-    /// Number of parts that are neither reasoning nor tool calls (text,
-    /// mostly) that sat between this part and the tool call.
-    texts_between: usize,
+    /// Number of text-like parts before this reasoning part.
+    texts_before: usize,
 }
 
 /// What is remembered for one tool call.
 #[derive(Clone, Debug)]
 struct Remembered {
-    reasoning: Vec<Preceding>,
+    /// Shared once per response, with each call retaining only its prefix.
+    reasoning: Arc<[Preceding]>,
+    reasoning_len: usize,
+    reasoning_cost: usize,
+    texts_before: usize,
     signature: Option<Signature>,
     /// Place of the call itself in the response.
     place: usize,
@@ -134,6 +137,7 @@ struct Remembered {
     /// a later request sat between a reasoning part and this call. Shared
     /// between the entries of one response.
     calls: Arc<HashMap<String, usize>>,
+    calls_cost: usize,
 }
 
 impl Remembered {
@@ -152,19 +156,8 @@ impl Remembered {
         // Struct, map slot and allocator overhead per entry and per part.
         const OVERHEAD: usize = 96;
         let blob = |signature: &Option<Signature>| signature.as_ref().map_or(0, |s| s.data.len());
-        let parts: usize = self
-            .reasoning
-            .iter()
-            .map(|p| {
-                OVERHEAD
-                    + p.part.text.len()
-                    + p.part.id.as_ref().map_or(0, String::len)
-                    + blob(&p.part.signature)
-            })
-            .sum();
-        let ids: usize = self.calls.keys().map(|id| id.len() + 32).sum();
         // The key is held twice: by the map and by the slot.
-        OVERHEAD + 2 * key.len() + blob(&self.signature) + parts + ids
+        OVERHEAD + 2 * key.len() + blob(&self.signature) + self.reasoning_cost + self.calls_cost
     }
 }
 
@@ -495,20 +488,23 @@ impl ReasoningStore {
         if self.disabled() {
             return 0;
         }
-        struct Seen {
-            part: Arc<Reasoning>,
+        struct Seen<'a> {
+            part: &'a Reasoning,
             place: usize,
             texts_before: usize,
+            cost: usize,
         }
         struct Pending<'a> {
             call: &'a ToolCall,
             place: usize,
-            reasoning: Vec<Preceding>,
+            reasoning_len: usize,
+            texts_before: usize,
         }
 
         let mut pending: Vec<Pending<'_>> = Vec::new();
-        let mut seen: Vec<Seen> = Vec::new();
+        let mut seen: Vec<Seen<'_>> = Vec::new();
         let mut places: HashMap<String, usize> = HashMap::new();
+        let mut reasoning_cost = 0usize;
         // Non-reasoning parts so far, and how many of them were not calls.
         let mut place = 0usize;
         let mut texts = 0usize;
@@ -516,10 +512,16 @@ impl ReasoningStore {
             match part {
                 Part::Reasoning(reasoning) => {
                     if reasoning.signature.is_some() {
+                        reasoning_cost = reasoning_cost.saturating_add(
+                            96 + reasoning.text.len()
+                                + reasoning.id.as_ref().map_or(0, String::len)
+                                + reasoning.signature.as_ref().map_or(0, |s| s.data.len()),
+                        );
                         seen.push(Seen {
-                            part: Arc::new(reasoning.clone()),
+                            part: reasoning,
                             place,
                             texts_before: texts,
+                            cost: reasoning_cost,
                         });
                     }
                 }
@@ -530,14 +532,8 @@ impl ReasoningStore {
                             pending.push(Pending {
                                 call,
                                 place,
-                                reasoning: seen
-                                    .iter()
-                                    .map(|seen| Preceding {
-                                        part: Arc::clone(&seen.part),
-                                        place: seen.place,
-                                        texts_between: texts - seen.texts_before,
-                                    })
-                                    .collect(),
+                                reasoning_len: seen.len(),
+                                texts_before: texts,
                             });
                         }
                     }
@@ -553,24 +549,77 @@ impl ReasoningStore {
             return 0;
         }
         let stored = pending.len();
+        let calls_cost: usize = places.keys().map(|id| id.len() + 32).sum();
+        // Refuse entries before cloning signed payloads. All calls share one
+        // prefix array, so pending metadata and construction are linear in
+        // response parts instead of calls times reasoning parts.
+        let key_prefix_bytes = scope.len().to_string().len() + 1 + scope.len();
+        let entry_cost = |item: &Pending<'_>, parts_cost: usize| {
+            96usize
+                .saturating_add(2usize.saturating_mul(key_prefix_bytes + item.call.id.len()))
+                .saturating_add(item.call.signature.as_ref().map_or(0, |s| s.data.len()))
+                .saturating_add(parts_cost)
+                .saturating_add(calls_cost)
+        };
+        // An unaffordable later prefix must not prevent an earlier,
+        // affordable call from being retained.
+        let kept = pending
+            .iter()
+            .filter(|item| {
+                let cost = item
+                    .reasoning_len
+                    .checked_sub(1)
+                    .map_or(0, |last| seen[last].cost);
+                entry_cost(item, cost) <= self.max_bytes
+            })
+            .map(|item| item.reasoning_len)
+            .max()
+            .unwrap_or(0);
+        let shared_reasoning_cost = kept.checked_sub(1).map_or(0, |last| seen[last].cost);
+        let reasoning: Arc<[Preceding]> = seen
+            .into_iter()
+            .take(kept)
+            .map(|seen| Preceding {
+                part: Arc::new(seen.part.clone()),
+                place: seen.place,
+                texts_before: seen.texts_before,
+            })
+            .collect();
         let places = Arc::new(places);
         let now = self.clock.now();
         let mut inner = self.inner.lock();
         inner.evict_expired(now, self.ttl);
         for item in pending {
+            let key = entry_key(scope, &item.call.id);
+            if item.reasoning_len > reasoning.len() {
+                inner.remove(&key);
+                continue;
+            }
+            let parts_cost = if item.reasoning_len == 0 {
+                0
+            } else {
+                shared_reasoning_cost
+            };
+            if entry_cost(&item, parts_cost) > self.max_bytes {
+                inner.remove(&key);
+                continue;
+            }
             let entry = Remembered {
-                reasoning: item.reasoning,
+                reasoning: if item.reasoning_len == 0 {
+                    Arc::from([])
+                } else {
+                    Arc::clone(&reasoning)
+                },
+                reasoning_len: item.reasoning_len,
+                // Every entry holds the whole shared allocation alive.
+                reasoning_cost: parts_cost,
+                texts_before: item.texts_before,
                 signature: item.call.signature.clone(),
                 place: item.place,
                 calls: Arc::clone(&places),
+                calls_cost,
             };
-            inner.insert(
-                entry_key(scope, &item.call.id),
-                entry,
-                now,
-                self.capacity,
-                self.max_bytes,
-            );
+            inner.insert(key, entry, now, self.capacity, self.max_bytes);
         }
         stored
     }
@@ -798,7 +847,7 @@ fn restore_message(
         if !eligible.get(ordinal).copied().unwrap_or(false) {
             continue;
         }
-        for preceding in &entry.reasoning {
+        for preceding in entry.reasoning.iter().take(entry.reasoning_len) {
             if !valid_for(&preceding.part.signature, target) {
                 continue;
             }
@@ -812,9 +861,12 @@ fn restore_message(
             let Some(call_at) = nth_call(&message.parts, ordinal) else {
                 break;
             };
-            let at = insertion_point(&message.parts, call_at, preceding.texts_between, |call| {
-                entry.had_between(preceding, call)
-            });
+            let at = insertion_point(
+                &message.parts,
+                call_at,
+                entry.texts_before - preceding.texts_before,
+                |call| entry.had_between(preceding, call),
+            );
             message
                 .parts
                 .insert(at, Part::Reasoning(preceding.part.as_ref().clone()));
@@ -841,6 +893,51 @@ mod tests {
     use switchyard_core::stream::response_to_events;
 
     const HOUR: Duration = Duration::from_secs(3600);
+
+    #[test]
+    fn oversized_later_reasoning_keeps_affordable_earlier_calls() {
+        let (store, _) = store(10);
+        let store = store.with_max_bytes(1000);
+        let result = response(vec![
+            call_signed("signature-only", Protocol::Anthropic, "call-sig"),
+            signed("first", Protocol::Anthropic, "sig-1"),
+            call("a"),
+            signed(&"x".repeat(700), Protocol::Anthropic, "sig-2"),
+            call("b"),
+        ]);
+        assert_eq!(store.remember(&result, "key"), 3);
+        let inner = store.inner.lock();
+        assert!(inner.map.contains_key(&entry_key("key", "signature-only")));
+        assert!(inner.map.contains_key(&entry_key("key", "a")));
+        assert!(!inner.map.contains_key(&entry_key("key", "b")));
+        let signature_only = &inner
+            .slot(inner.map[&entry_key("key", "signature-only")])
+            .unwrap()
+            .entry;
+        assert!(signature_only.reasoning.is_empty());
+        assert!(inner.bytes <= 1000);
+    }
+
+    #[test]
+    fn calls_share_reasoning_storage_but_keep_their_own_prefix() {
+        let (store, _) = store(10);
+        let result = response(vec![
+            signed("first", Protocol::Anthropic, "sig-1"),
+            call("a"),
+            Part::text("between"),
+            signed("second", Protocol::Anthropic, "sig-2"),
+            call("b"),
+        ]);
+        assert_eq!(store.remember(&result, "key"), 2);
+        let inner = store.inner.lock();
+        let a = &inner.slot(inner.map[&entry_key("key", "a")]).unwrap().entry;
+        let b = &inner.slot(inner.map[&entry_key("key", "b")]).unwrap().entry;
+        assert!(Arc::ptr_eq(&a.reasoning, &b.reasoning));
+        assert_eq!((a.reasoning_len, b.reasoning_len), (1, 2));
+        assert_eq!((a.texts_before, b.texts_before), (0, 1));
+        // A prefix still retains the complete shared allocation.
+        assert_eq!(a.reasoning_cost, b.reasoning_cost);
+    }
 
     fn store(capacity: usize) -> (ReasoningStore, Arc<ManualClock>) {
         let clock = Arc::new(ManualClock::new());

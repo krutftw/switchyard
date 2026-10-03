@@ -39,10 +39,10 @@ import { Notice } from './surface.js';
  *     <${Segmented} ... />
  *   <//>`
  */
-export function Field({ label, hint, error, warning, optional = false, htmlFor, id, class: className, children }) {
+export function Field({ label, hint, error, warning, optional = false, htmlFor, id, class: className, bare = false, children }) {
   const base = id || htmlFor;
   return html`
-    <div class=${cx('field', className)}>
+    <div class=${cx('field', className)} data-bare=${bare ? '' : undefined}>
       ${label != null &&
       html`<label class="field-label" for=${htmlFor}>
         <span>${label}</span>
@@ -70,9 +70,17 @@ function describe(id, { hint, error, warning }) {
   };
 }
 
+/**
+ * The control in its Field. Always the same tree, whether or not there is a
+ * label, hint, error or warning to show: a control that gained a warning
+ * with the first character typed must not be rebuilt (the new <input> would
+ * not have the focus, the caret or a half-typed number). With nothing to
+ * show around it the Field is `bare`: `display: contents` (components.css),
+ * so the control lays out as if it stood on its own.
+ */
 function wrap(control, id, { label, hint, error, warning, optional, class: className }) {
-  if (label == null && hint == null && !error && !warning) return control;
-  return html`<${Field} label=${label} hint=${hint} error=${error} warning=${warning} optional=${optional} htmlFor=${id} class=${label != null ? className : undefined}>${control}<//>`;
+  const bare = label == null && hint == null && !error && !warning;
+  return html`<${Field} label=${label} hint=${hint} error=${error} warning=${warning} optional=${optional} htmlFor=${id} class=${label != null ? className : undefined} bare=${bare}>${control}<//>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -406,6 +414,53 @@ export function Checkbox({ label, hint, error, warning, id: idProp, class: class
 // NumberInput
 // ---------------------------------------------------------------------------
 
+// A blur that comes from pressing a submit button. Settling the field then
+// (clamping 0 up to the minimum of 1) would hand the form a number the user
+// never saw, submitted by the same click. Left unsettled, the field keeps
+// its mark and <Form> refuses the submit and gives it the focus, as it does
+// for Enter.
+
+/** The last pointer press anywhere, noted once a NumberInput has mounted. */
+let lastPress = { target: null, at: 0 };
+let watchingPresses = false;
+function watchPresses() {
+  if (watchingPresses || typeof document === 'undefined') return;
+  watchingPresses = true;
+  document.addEventListener(
+    'pointerdown',
+    (event) => {
+      lastPress = { target: event.target, at: Date.now() };
+    },
+    true,
+  );
+}
+
+/** The form an element belongs to, honouring a form="id" attribute. */
+function formOf(el) {
+  if (!el || el.nodeType !== 1) return null;
+  if (el.form !== undefined) return el.form;
+  const named = el.getAttribute('form');
+  return named ? document.getElementById(named) : el.closest('form');
+}
+
+/** The submit button `el` is in or is, when it would submit (not off, not busy). */
+function submitterOf(el) {
+  const button = el && el.nodeType === 1 ? el.closest('button, input[type="submit"]') : null;
+  if (!button || button.disabled || button.getAttribute('aria-disabled') === 'true') return null;
+  return (button.getAttribute('type') || 'submit').toLowerCase() === 'submit' ? button : null;
+}
+
+/** Is this blur the press of a submit button of the field's own form? */
+function blurBySubmit(event) {
+  const form = formOf(event.target);
+  if (!form) return false;
+  const pressed = Date.now() - lastPress.at < 1000 ? lastPress.target : null;
+  return [event.relatedTarget, pressed].some((candidate) => {
+    const button = submitterOf(candidate);
+    return button != null && formOf(button) === form;
+  });
+}
+
 function parseNumber(text) {
   const t = String(text).trim().replace(/,/g, '');
   if (t === '') return null;
@@ -450,7 +505,10 @@ export function numberProblem(text, { min, max, whole = false } = {}) {
  * good number, the field turns invalid and says what it wants, and a
  * surrounding <Form> refuses to submit, so the form can never save a number
  * other than the one on screen. Leaving the field settles it: out-of-range
- * numbers are clamped, fractions rounded, anything else reverts.
+ * numbers are clamped, fractions rounded, anything else reverts. Except
+ * when it is left by pressing a submit button of its form: the text and
+ * its mark stay, and the form refuses that submit and focuses the field
+ * (typing 0 in a min-1 field and clicking Save does not save 1).
  */
 export function NumberInput({
   label,
@@ -474,6 +532,7 @@ export function NumberInput({
   const uid = useUid('num');
   const id = idProp || uid;
   const whole = Number.isInteger(step);
+  useEffect(watchPresses, []);
   const [textState, setText] = useState(value == null ? '' : String(value));
   // Why the text on screen is not (yet) the value, or null when it is.
   const [problemState, setProblem] = useState(null);
@@ -569,6 +628,9 @@ export function NumberInput({
           report(parseNumber(next));
         }}
         onBlur=${(event) => {
+          // Pressing Save with "0" in a min-1 field: leave the text and its
+          // mark; the form refuses the submit (see blurBySubmit).
+          if (numberProblem(event.target.value, { min, max, whole }) && blurBySubmit(event)) return;
           // From the element, not from state: a blur can follow the last
           // keystroke before the next render.
           const n = parseNumber(event.target.value);
@@ -924,33 +986,54 @@ function normalizePath(path) {
  * issues.at(path)     the message for exactly that path, or undefined
  * issues.under(path)  every issue at or below that path (for a list editor)
  * issues.rest()       issues no field has asked for; FormError lists these
+ * issues.all          every issue: { path (normalised), rawPath (as sent), message }
  *
  * Call at()/under() in the same render function that renders FormError so it
  * knows which issues already have a home.
+ *
+ * Claims last one render: the object is new on every render and remembers
+ * only the at()/under() calls made since. A field that stops asking for its
+ * issue (the user edited it, so the page stops showing the error; or the
+ * row went) gives it back, and FormError lists it again instead of pointing
+ * at a highlighted field that is no longer highlighted.
  */
 export function useIssues(error) {
-  return useMemo(() => {
-    const list = (error?.issues ?? []).map((issue) => ({ path: normalizePath(issue.path), message: issue.message }));
-    const claimed = new Set();
-    return {
-      all: list,
-      at(path) {
-        const key = normalizePath(path);
-        const hits = list.filter((issue) => issue.path === key);
-        hits.forEach((issue) => claimed.add(issue));
-        return hits.length ? hits.map((issue) => issue.message).join(' ') : undefined;
-      },
-      under(path) {
-        const key = normalizePath(path);
-        const hits = list.filter((issue) => issue.path === key || issue.path.startsWith(`${key}.`));
-        hits.forEach((issue) => claimed.add(issue));
-        return hits;
-      },
-      rest() {
-        return list.filter((issue) => !claimed.has(issue));
-      },
-    };
-  }, [error]);
+  const list = useMemo(
+    () => (error?.issues ?? []).map((issue) => ({ path: normalizePath(issue.path), rawPath: String(issue.path ?? ''), message: issue.message })),
+    [error],
+  );
+  const claimed = new Set();
+  return {
+    all: list,
+    at(path) {
+      const key = normalizePath(path);
+      const hits = list.filter((issue) => issue.path === key);
+      hits.forEach((issue) => claimed.add(issue));
+      return hits.length ? hits.map((issue) => issue.message).join(' ') : undefined;
+    },
+    under(path) {
+      const key = normalizePath(path);
+      const hits = list.filter((issue) => issue.path === key || issue.path.startsWith(`${key}.`));
+      hits.forEach((issue) => claimed.add(issue));
+      return hits;
+    },
+    rest() {
+      return list.filter((issue) => !claimed.has(issue));
+    },
+  };
+}
+
+/**
+ * Is `issue` already spelled out in `message`? The gateway's 422 and 409
+ * messages quote their first issues ("the configuration is not valid:
+ * server.port: must be 1-65535; …"); listing them again under the message
+ * says everything twice.
+ */
+function quoted(message, issue) {
+  const said = String(issue.message ?? '');
+  if (!said) return false;
+  const path = issue.rawPath ?? issue.path ?? '';
+  return String(message ?? '').includes(path ? `${path}: ${said}` : said);
 }
 
 /**
@@ -965,18 +1048,34 @@ export function useIssues(error) {
  * capital first word, closing full stop. "Check the highlighted field."
  * follows it, and would otherwise run straight on from a message that has
  * no full stop of its own.
+ *
+ * Issues the message already quotes are not listed again under it: the
+ * gateway's 422 message names its first three issues with their paths, and
+ * a 409 for a broken configuration file quotes the file's issue. Paths are
+ * shown as the gateway wrote them (`providers[0].name`).
+ *
+ * Also the error notice of a dialog whose action failed (ConfirmDialog):
+ * `error` may then be any Error, or a string.
  */
 export function FormError({ error, issues, title = 'Could not save', class: className }) {
   if (!error || error.aborted) return null;
-  const rest = issues ? issues.rest() : (error.issues ?? []);
-  const fieldCount = (error.issues?.length ?? 0) - rest.length;
+  const sent = Array.isArray(error.issues) ? error.issues : [];
+  // The issues object of this very error (useIssues(error)), or none.
+  const own = issues && Array.isArray(issues.all) && issues.all.length === sent.length ? issues : null;
+  const rest = own ? own.rest() : sent.map((issue) => ({ path: issue.path, rawPath: issue.path, message: issue.message }));
+  const fieldCount = own ? own.all.length - rest.length : 0;
+  const text = typeof error === 'string' ? error : error.message || String(error);
+  const listed = rest.filter((issue) => !quoted(text, issue));
   return html`
     <${Notice} tone="stop" title=${title} class=${className}>
-      <span>${sentence(error.message)}</span>
+      <span>${sentence(text)}</span>
       ${fieldCount > 0 && html`<span> Check the highlighted ${fieldCount === 1 ? 'field' : 'fields'}.</span>`}
-      ${rest.length > 0 &&
+      ${listed.length > 0 &&
       html`<ul class="issue-list">
-        ${rest.map((issue, i) => html`<li key=${i}>${issue.path && html`<span class="issue-path">${issue.path}</span>`}<span>${issue.message}</span></li>`)}
+        ${listed.map((issue, i) => {
+          const path = issue.rawPath ?? issue.path;
+          return html`<li key=${i}>${path && html`<span class="issue-path">${path}</span>`}<span>${issue.message}</span></li>`;
+        })}
       </ul>`}
     <//>
   `;

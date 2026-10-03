@@ -3,21 +3,12 @@
 // frame in both directions, and continue a conversation on the same socket
 // with previous_response_id.
 //
-// This is the client API, not the admin API: it needs a client key, and a
-// browser can only present one in the socket's URL (?key=). The key lives in
-// this component's state and nowhere else: not in the page address, not in
-// storage. Leaving the page closes the socket and forgets the key; the turns
-// and frames (which never contain it) are kept in session.js, so they are
-// still there when the reader comes back.
-//
-// A browser prints the full address of a socket that fails to open in its
-// console, key included, and nothing the page does can stop it. So the page
-// gives it no failed socket to print: it asks the gateway over HTTP whether
-// the key is accepted (the key in a header, which the console never shows)
-// before it opens the socket, and a socket still connecting when the reader
-// cancels or leaves is closed once it is open instead of being abandoned. A
-// socket that is refused all the same (a proxy that blocks the upgrade) is
-// printed there; the notice above the key field says so.
+// This is the client API, not the admin API. POST /v1/ws-ticket exchanges
+// the client key in an Authorization header for a single-use, 30-second
+// ticket. Only that ticket reaches the socket URL; the key never does.
+// The key lives in this component's state, never storage. Leaving closes
+// the socket and forgets it. Turns and frames are kept in session.js, but
+// neither the client key nor the ticket is written to that history.
 
 import { html, useEffect, useLayoutEffect, useRef, useState } from '../../../vendor/preact-htm.js';
 import { Button, CodeBlock, EmptyState, IconButton, Notice, Panel, SecretInput, StatusLamp, Switch, Textarea, confirm } from '../../components/index.js';
@@ -38,10 +29,30 @@ const FRAME_CAP = 500;
 /** A frame as one line of text, for "copy all". */
 const frameText = (frame) => `${frame.dir === 'out' ? '>' : frame.dir === 'in' ? '<' : '#'} ${frame.data || frame.name}`;
 
+/** Exchange a header-only key for a short-lived socket credential. */
+async function mintTicket(origin, key, signal) {
+  try {
+    const res = await fetch(`${origin}/v1/ws-ticket`, {
+      method: 'POST',
+      headers: key ? { authorization: `Bearer ${key}` } : {},
+      cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error',
+      signal,
+    });
+    if (res.status === 401 || res.status === 403) return { refusal: 'key' };
+    if (res.status !== 201) return { refusal: `http-${res.status}` };
+    const body = await res.json();
+    if (typeof body?.ticket !== 'string' || !body.ticket) return { refusal: 'ticket' };
+    return { ticket: body.ticket };
+  } catch {
+    return { refusal: 'unreachable' };
+  }
+}
+
 /**
- * Whether the gateway takes this key, asked over HTTP: before a socket is
- * opened (a refused socket puts its address, key included, in the console),
- * and again for a socket that never opened, which browsers report as close
+ * Whether the gateway still takes this key, asked over HTTP for a socket
+ * that never opened, which browsers report as close
  * code 1006 with no reason. 'key' (refused), 'upgrade' (accepted: a socket
  * that fails now is blocked on its way), 'unreachable', 'http-<status>'.
  */
@@ -50,6 +61,8 @@ async function diagnose(origin, key, signal) {
     const res = await fetch(`${origin}/v1/models`, {
       headers: key ? { authorization: `Bearer ${key}` } : {},
       cache: 'no-store',
+      credentials: 'omit',
+      redirect: 'error',
       signal,
     });
     if (res.status === 401 || res.status === 403) return 'key';
@@ -79,8 +92,9 @@ function refusalText(reason, hasKey) {
       : 'The gateway requires a client key (HTTP 401). Paste one and connect again.';
   }
   if (reason === 'upgrade') {
-    return 'The key is accepted over HTTP, so the WebSocket upgrade itself is being blocked. A reverse proxy in front of the gateway must forward the Upgrade and Connection headers.';
+    return 'The key is accepted over HTTP, but the socket did not open. Connect again for a fresh ticket. If it still fails, check that your reverse proxy forwards the Upgrade and Connection headers.';
   }
+  if (reason === 'ticket') return 'The gateway did not return a usable WebSocket ticket. Check that the gateway and dashboard are the same version, then connect again.';
   if (reason === 'unreachable') return 'Switchyard did not answer this browser. Check that it is running and reachable from this device, then connect again.';
   if (reason?.startsWith('http-')) return `The gateway answers HTTP ${reason.slice(5)} on the client API. Check the gateway log for the reason.`;
   return 'Browsers do not say why a WebSocket was refused. Checking the key over HTTP.';
@@ -117,7 +131,7 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
   const reader = useRef(null);
   const active = useRef(null); // id of the assistant turn being received
   const raf = useRef(0);
-  const probe = useRef(null); // the HTTP key check in flight
+  const probe = useRef(null); // ticket minting or an HTTP key check in flight
   const pending = useRef(null); // { secret, fromField } from connect() until the socket opens or is refused
   const mounted = useRef(true);
   const keyId = useRef(null);
@@ -257,25 +271,25 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     pending.current = attempt;
     setState('connecting');
 
-    // The key is asked about over HTTP first: a socket the gateway refuses
-    // would put its address, key included, in the browser's console.
+    // The key is sent only in a header. A refused socket can expose its
+    // address in the console, so its URL carries only a single-use ticket.
     const controller = new AbortController();
     probe.current = controller;
-    diagnose(origin, secret, controller.signal).then((answer) => {
+    mintTicket(origin, secret, controller.signal).then((answer) => {
       if (controller.signal.aborted || pending.current !== attempt || !mounted.current) return;
       probe.current = null;
-      if (answer === 'key' || answer === 'unreachable') refuse(attempt, answer);
-      else open(attempt);
+      if (answer.refusal) refuse(attempt, answer.refusal);
+      else open(attempt, answer.ticket);
     });
   };
 
-  /** No socket is opened: the HTTP check says it would be refused. */
+  /** No socket is opened when ticket minting fails. */
   const refuse = (attempt, refusal, why) => {
     pending.current = null;
     setState('closed');
     record({
       name: 'not opened',
-      data: why ?? (refusal === 'key' ? 'The key was refused over HTTP. No socket was opened.' : 'No answer over HTTP. No socket was opened.'),
+      data: why ?? (refusal === 'key' ? 'The key was refused over HTTP. No socket was opened.' : 'A WebSocket ticket could not be obtained. No socket was opened.'),
       tone: 'stop',
     });
     setClosed({ code: 0, reason: '', opened: false, refusal, hadKey: !!attempt.secret });
@@ -286,11 +300,11 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
     }
   };
 
-  const open = (attempt) => {
+  const open = (attempt, ticket) => {
     const { secret } = attempt;
     let ws;
     try {
-      ws = new WebSocket(secret ? `${wsUrl}?key=${encodeURIComponent(secret)}` : wsUrl);
+      ws = new WebSocket(`${wsUrl}?ticket=${encodeURIComponent(ticket)}`);
     } catch {
       refuse(attempt, 'unreachable', 'The browser would not open a socket to this address.');
       return;
@@ -312,7 +326,7 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
           ? [...list, { id: nextId('ws-turn'), role: 'note', text: 'A new socket was opened here. It does not remember the turns above: the next turn starts a new conversation.' }]
           : list,
       );
-      record({ name: 'open', data: `${wsUrl}${secret ? '?key=(hidden)' : ''}`, tone: 'info' });
+      record({ name: 'open', data: `${wsUrl}?ticket=(hidden)`, tone: 'info' });
     };
 
     ws.onmessage = (event) => {
@@ -344,7 +358,7 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
         const error = { kind: started ? 'stream' : 'frame', via: 'socket', ...readError(json) };
         // The gateway does not have the response this page named: stop naming it.
         if (error.code === 'previous_response_not_found') setLastResponseId(null);
-        finishTurn({ status: 'error', error });
+        finishTurn({ status: 'error', error, requestId: typeof json.request_id === 'string' ? json.request_id : undefined });
       }
     };
 
@@ -470,8 +484,8 @@ export default function SocketPanel({ origin, model, onModel, modelOptions, mode
       <div class="play-col">
         <${Panel} title="Connection" description=${html`<span class="mono">${wsUrl}</span>`} actions=${lamp}>
           <div class="stack" style="--gap:var(--space-3)">
-            <${Notice} tone="caution" title="The key travels in the socket's address">
-              Browsers cannot set headers on a WebSocket, so the key is sent as ?key= in the socket URL. It is kept in this tab's memory only: never in the page address, never in storage. Developer tools, the browser's console when a socket is refused on its way to the gateway, and proxies that log URLs can still see it, so use a key you can revoke.
+            <${Notice} title="The key is exchanged for a short-lived ticket">
+              The client key is sent in an HTTP header and kept only in this page's memory. The socket address uses a single-use ticket that expires after 30 seconds. Connect again to get a fresh ticket.
             <//>
             <${SecretInput}
               id=${keyId.current}

@@ -88,9 +88,20 @@ export function Badge({ tone = 'neutral', mono = false, outline = false, lamp = 
   `;
 }
 
-/** Lamp tone for an HTTP status: 2xx clear, 429 and 3xx caution, other 4xx/5xx stop, 0 off. */
+/**
+ * Lamp tone for an HTTP status alone: 1xx info (a 101 is a WebSocket that was
+ * switched to, not a failure), 2xx clear, 429 and 3xx caution, other 4xx/5xx
+ * stop, 0 or missing off.
+ *
+ * The status is not the whole story. A request record also says whether it
+ * succeeded (`ok`): a stream that broke after its 200 is a failure with a
+ * 2xx status, and a relayed WebSocket that ended well is a success with a
+ * 101. A caller holding `ok` lets it decide, and uses this for the rest:
+ *   record.ok === false ? 'stop' : toneForStatus(record.status)
+ */
 export function toneForStatus(status) {
   if (!status) return 'off';
+  if (status >= 100 && status < 200) return 'info';
   if (status >= 200 && status < 300) return 'clear';
   if (status === 429 || (status >= 300 && status < 400)) return 'caution';
   return 'stop';

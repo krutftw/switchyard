@@ -251,6 +251,90 @@ async fn update_that_changes_nothing_writes_nothing() {
     assert!(events.try_recv().is_err());
 }
 
+/// Regression (A2-1): settings put back to their default leave the file,
+/// also when the file spelled the default out and nothing changes.
+#[tokio::test]
+async fn unset_settings_are_taken_out_of_the_file() {
+    let text = BASE.replace("port = 9000", "port = 8317");
+    let f = fixture(&text);
+    let mut events = f.store.events();
+
+    // Nothing changes, but the explicit default goes.
+    let applied = f
+        .store
+        .update_unsetting(|c| {
+            c.server.port = 8317;
+            Ok(vec!["server.port".to_string()])
+        })
+        .await
+        .unwrap();
+    assert_eq!(applied.server.port, 8317);
+    assert_eq!(
+        std::fs::read_to_string(&f.path).unwrap(),
+        text.replace("port = 8317\n", "")
+    );
+    assert!(matches!(
+        next_event(&mut events).await,
+        ConfigEvent::Applied { .. }
+    ));
+
+    // Asked again, there is nothing left to take out: no write.
+    let before = std::fs::read_to_string(&f.path).unwrap();
+    f.store
+        .update_unsetting(|_| Ok(vec!["server.port".to_string()]))
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read_to_string(&f.path).unwrap(), before);
+    assert!(events.try_recv().is_err());
+
+    // A value that is not the default is written, not dropped.
+    f.store
+        .update_unsetting(|c| {
+            c.server.host = "0.0.0.0".into();
+            Ok(vec!["server.host".to_string()])
+        })
+        .await
+        .unwrap();
+    assert!(
+        std::fs::read_to_string(&f.path)
+            .unwrap()
+            .contains("host = \"0.0.0.0\"")
+    );
+}
+
+/// Regression (A2-8): what an edit leaves live lists the fields of a
+/// payload rule as the file does, whatever order the edit gave them.
+#[tokio::test]
+async fn the_live_configuration_keeps_the_fields_of_payload_rules_in_file_order() {
+    let text = format!(
+        "{BASE}\n[[payload.override]]\nmodels = [\"*\"]\nset = {{ \"zeta\" = 1, \"alpha\" = 2 }}\n"
+    );
+    let f = fixture(&text);
+    let order = |config: &Config| -> Vec<String> {
+        config.payload.overrides[0].set.keys().cloned().collect()
+    };
+    assert_eq!(order(&f.store.current()), ["zeta", "alpha"]);
+
+    // The rule sent back sorted, with one field added in the middle.
+    let applied = f
+        .store
+        .update(|c| {
+            let rule = &mut c.payload.overrides[0];
+            rule.set.insert("beta".into(), serde_json::json!(3));
+            rule.set.sort_keys();
+            Ok(())
+        })
+        .await
+        .unwrap();
+    assert_eq!(order(&applied), ["zeta", "alpha", "beta"]);
+    assert_eq!(order(&f.store.current()), ["zeta", "alpha", "beta"]);
+    assert!(
+        std::fs::read_to_string(&f.path)
+            .unwrap()
+            .contains("set = { \"zeta\" = 1, \"alpha\" = 2, beta = 3 }")
+    );
+}
+
 #[tokio::test]
 async fn failed_edits_change_nothing() {
     let f = fixture(BASE);

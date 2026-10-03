@@ -99,6 +99,7 @@ fn presented(
         x_api_key: x_api_key.map(str::to_string),
         x_goog_api_key: x_goog.map(str::to_string),
         query_key: query.map(str::to_string),
+        ws_ticket: None,
     }
 }
 
@@ -169,6 +170,51 @@ async fn authentication_precedence_and_errors() {
         &ApiError::rate_limit("slow down").with_retry_after(Duration::from_secs(12)),
     );
     assert_eq!(reply.header("retry-after"), Some("12"));
+}
+
+#[tokio::test]
+async fn websocket_tickets_stand_for_their_key_once() {
+    let harness = Harness::start(&format!("{KEYS}\n{FOUR_PROVIDERS}")).await;
+    let gateway = &harness.gateway;
+    let with_ticket = |ticket: &str| PresentedCredentials {
+        ws_ticket: Some(ticket.to_string()),
+        ..PresentedCredentials::default()
+    };
+    let limited = harness.identity_of("sy-limited-key-000001");
+    let ticket = gateway.issue_ws_ticket(&limited).unwrap();
+    assert_eq!(ticket.expires_in, 30);
+    assert!(!format!("{ticket:?}").contains(&ticket.ticket));
+
+    let identity = gateway.authenticate(&with_ticket(&ticket.ticket)).unwrap();
+    assert_eq!(identity.key_name.as_deref(), Some("limited"));
+    assert_eq!(identity.key_id, limited.key_id);
+    assert_eq!(identity.rate_limit_rpm(), Some(2));
+    assert!(identity.allows_model("m-chat") && !identity.allows_model("m-resp"));
+
+    // Once only; and a ticket nobody minted is a wrong key.
+    for ticket in [ticket.ticket.as_str(), "made-up-ticket"] {
+        let refused = gateway.authenticate(&with_ticket(ticket)).unwrap_err();
+        assert_eq!(
+            (refused.status, refused.message.as_str()),
+            (401, "invalid API key")
+        );
+    }
+
+    // Minting is not a request: nothing was recorded.
+    assert!(
+        gateway
+            .telemetry()
+            .usage()
+            .requests(&switchyard_telemetry::RequestQuery::default())
+            .items
+            .is_empty()
+    );
+    // The playground's identity has its own way in.
+    assert!(
+        gateway
+            .issue_ws_ticket(&gateway.dashboard_identity())
+            .is_err()
+    );
 }
 
 #[tokio::test]

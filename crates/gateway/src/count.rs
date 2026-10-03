@@ -129,7 +129,13 @@ impl Inner {
         recorder.announce();
 
         let resolution = self.scheduler.resolve(&meta.model);
-        if let Err(error) = check_identity(&identity, &meta.model, resolution.as_ref().ok()) {
+        if let Err(error) = check_identity(
+            &self.keys.load(),
+            &identity,
+            &meta.model,
+            resolution.as_ref().ok(),
+            Some(&json),
+        ) {
             return self.reject(recorder, client, &error);
         }
         let resolved = match resolution {

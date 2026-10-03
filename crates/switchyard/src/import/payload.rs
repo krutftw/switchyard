@@ -6,7 +6,7 @@ use super::report::segment;
 use super::values::{is_simple_path, is_zero, string_list, text};
 use indexmap::IndexMap;
 use serde_json::{Map, Value};
-use switchyard_core::config::PayloadRule;
+use switchyard_core::config::{PayloadRule, payload_path_issue};
 use switchyard_core::{Config, Protocol};
 
 impl Importer<'_> {
@@ -80,18 +80,27 @@ impl Importer<'_> {
         let mut remove: Vec<String> = Vec::new();
         let mut complex = 0usize;
         let mut unusable = 0usize;
+        // Paths that can never name a field here (empty, spaces), which the
+        // configuration refuses.
+        let mut invalid = 0usize;
         if filter {
             for path in rule.get("params").map(string_list).unwrap_or_default() {
-                if is_simple_path(&path) {
-                    remove.push(path);
-                } else {
+                if !is_simple_path(&path) {
                     complex += 1;
+                } else if payload_path_issue(&path).is_some() {
+                    invalid += 1;
+                } else {
+                    remove.push(path);
                 }
             }
         } else if let Some(params) = rule.get("params").and_then(Value::as_object) {
             for (path, value) in params {
                 if !is_simple_path(path) {
                     complex += 1;
+                    continue;
+                }
+                if payload_path_issue(path).is_some() {
+                    invalid += 1;
                     continue;
                 }
                 // What is set is a JSON value: `1.50` is the number 1.5
@@ -134,8 +143,14 @@ impl Importer<'_> {
                  as TOML (null)"
             ));
         }
+        if invalid > 0 {
+            self.not_imported.push(format!(
+                "{location}: {invalid} of the paths can never name a field of a request body \
+                 (they are empty or hold spaces)"
+            ));
+        }
         if set.is_empty() && remove.is_empty() {
-            if complex == 0 && unusable == 0 {
+            if complex == 0 && unusable == 0 && invalid == 0 {
                 self.not_imported
                     .push(format!("{location}: no params; skipped"));
             }
