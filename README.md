@@ -52,6 +52,10 @@ log in to consumer subscriptions or impersonate vendor CLIs.
 
 ## Quick start
 
+The Windows x64 download requires the [Microsoft Visual C++ v14 x64
+Redistributable](https://learn.microsoft.com/en-us/cpp/windows/latest-supported-vc-redist?view=msvc-170).
+Install it if Windows reports that `VCRUNTIME140.dll` is missing.
+
 Download a binary from the [releases page](https://github.com/krutftw/switchyard/releases)
 (or build it: `cargo install --git https://github.com/krutftw/switchyard switchyard`), then:
 
