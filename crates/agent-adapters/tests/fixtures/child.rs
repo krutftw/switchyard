@@ -22,6 +22,10 @@ fn main() {
     assert!(args.iter().any(|a| a == "sandbox_mode=\"read-only\""));
     assert!(args.iter().any(|a| a == "approval_policy=\"on-request\""));
     assert!(args.iter().any(|a| a == "approvals_reviewer=\"user\""));
+    // Durable hosts ask Codex to save new threads; resume scenarios must never
+    // start one.
+    let durable = scenario.starts_with("durable");
+    let resuming = scenario.starts_with("resume");
     eprintln!("fixture-private-token-should-never-appear-in-events");
     for input in io::stdin().lock().lines() {
         let input = input.unwrap();
@@ -35,11 +39,31 @@ fn main() {
             } else {
                 send(r#"{"id":1,"result":{"userAgent":"fixture"}}"#);
             }
-        } else if input.contains("\"method\":\"thread/start\"") {
+        } else if input.contains("\"method\":\"thread/resume\"") {
+            assert!(resuming, "only resume scenarios may resume a thread");
+            assert!(input.contains("\"threadId\":\"thread-fixture\""));
+            assert!(input.contains("\"excludeTurns\":true"));
             assert!(input.contains("\"approvalPolicy\":\"on-request\""));
             assert!(input.contains("\"approvalsReviewer\":\"user\""));
             assert!(input.contains("\"sandbox\":\"read-only\""));
-            assert!(input.contains("\"ephemeral\":true"));
+            let thread = if scenario == "resume_wrong_thread" {
+                "thread-other"
+            } else {
+                "thread-fixture"
+            };
+            send(&format!(
+                r#"{{"id":2,"result":{{"thread":{{"id":"{thread}"}},"model":"fixture-model","approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":{{"type":"readOnly","networkAccess":false}}}}}}"#
+            ));
+        } else if input.contains("\"method\":\"thread/start\"") {
+            assert!(!resuming, "a continuation must resume the saved thread");
+            assert!(input.contains("\"approvalPolicy\":\"on-request\""));
+            assert!(input.contains("\"approvalsReviewer\":\"user\""));
+            assert!(input.contains("\"sandbox\":\"read-only\""));
+            assert!(input.contains(if durable {
+                "\"ephemeral\":false"
+            } else {
+                "\"ephemeral\":true"
+            }));
             if scenario == "policy_mismatch" {
                 send(
                     r#"{"id":2,"result":{"thread":{"id":"thread-fixture"},"model":"fixture-model","approvalPolicy":"never","approvalsReviewer":"auto_review","sandbox":{"type":"dangerFullAccess"}}}"#,
@@ -53,6 +77,10 @@ fn main() {
             assert_ne!(
                 scenario, "policy_mismatch",
                 "model turn must not start after rejected policy"
+            );
+            assert_ne!(
+                scenario, "resume_wrong_thread",
+                "model turn must not start on an unconfirmed conversation"
             );
             assert!(
                 input.contains("\"sandboxPolicy\":{\"type\":\"readOnly\",\"networkAccess\":false}")
@@ -72,6 +100,18 @@ fn main() {
                 r#"{"method":"account/updated","params":{"threadId":"thread-fixture","token":"fixture-private-account-token"}}"#,
             );
             match scenario {
+                "durable_complete" | "resume_complete" => {
+                    for part in ["Saved ", "fixture ", "reply."] {
+                        send(&format!(
+                            r#"{{"method":"item/agentMessage/delta","params":{{"threadId":"thread-fixture","turnId":"turn-fixture","itemId":"message-1","delta":"{part}"}}}}"#
+                        ));
+                    }
+                    send(
+                        r#"{"method":"item/completed","params":{"threadId":"thread-fixture","turnId":"turn-fixture","item":{"id":"message-1","type":"agentMessage","text":"Saved fixture reply."}}}"#,
+                    );
+                    completed("completed");
+                    return;
+                }
                 "malformed" => {
                     send("this is not JSON");
                     return;
@@ -80,7 +120,7 @@ fn main() {
                     send(&"x".repeat(300_000));
                     return;
                 }
-                "cancel" => continue,
+                "cancel" | "durable_cancel" => continue,
                 "descendant_parent" => {
                     let marker = args.get(2).unwrap();
                     let _child = std::process::Command::new(std::env::current_exe().unwrap())

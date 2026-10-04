@@ -87,7 +87,14 @@ pub async fn start_host(options: AppOptions) -> Result<RunningHost> {
         }
     };
     let launch = LaunchInfo::new(port);
-    let adapters = AdapterManager::new();
+    let adapters = match AdapterManager::open(&options.data_dir) {
+        Ok(adapters) => adapters,
+        Err(error) => {
+            accounts.shutdown().await;
+            let _ = runtime.shutdown().await;
+            return Err(AppError::from(error));
+        }
+    };
     let cancel = CancellationToken::new();
     let state = Arc::new(api::AppState {
         engine: runtime.engine.clone(),

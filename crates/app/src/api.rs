@@ -90,6 +90,10 @@ pub(crate) fn router(
         .route("/api/adapter-runs/{id}/events", get(adapter_events))
         .route("/api/adapter-runs/{id}/decisions", post(decide_adapter))
         .route("/api/adapter-runs/{id}/interrupt", post(interrupt_adapter))
+        .route(
+            "/api/adapter-runs/{id}/recovery",
+            post(acknowledge_adapter_recovery),
+        )
         .method_not_allowed_fallback(|| async {
             AppError::new(
                 StatusCode::METHOD_NOT_ALLOWED,
@@ -447,6 +451,9 @@ struct StartAdapterRun {
     prompt: String,
     command_id: String,
     profile_id: Option<String>,
+    /// Continue the saved conversation of this run instead of starting a new one.
+    #[serde(default)]
+    continue_run_id: Option<String>,
 }
 
 async fn start_adapter_run(
@@ -474,6 +481,7 @@ async fn start_adapter_run(
             project_path: PathBuf::from(project.root),
             prompt: input.prompt,
             command_id: input.command_id,
+            continue_run_id: input.continue_run_id,
             profile: None,
         },
         input.profile_id.as_deref(),
@@ -539,6 +547,17 @@ async fn interrupt_adapter(
     let _: Empty = body(request).await?;
     state.adapters.interrupt(&id).await?;
     Ok(Json(json!({"ok": true})))
+}
+
+async fn acknowledge_adapter_recovery(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    request: Request,
+) -> Result<Json<Value>> {
+    let _: Empty = body(request).await?;
+    Ok(Json(
+        json!({"run": state.adapters.acknowledge_recovery(&id)?}),
+    ))
 }
 
 #[cfg(test)]
@@ -767,6 +786,53 @@ mod tests {
             .await;
         assert_eq!(status, StatusCode::CONFLICT);
         assert_eq!(rejected["error"]["code"], "profile_not_signed_in");
+        let (_, runs) = harness.request("GET", "/api/adapter-runs", None).await;
+        assert!(runs["runs"].as_array().unwrap().is_empty());
+        harness.runtime.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn continuation_and_recovery_routes_reject_unknown_runs_without_spawning() {
+        let harness = Harness::new().await;
+        let project = harness
+            .runtime
+            .engine
+            .open_project(harness._temp.path())
+            .unwrap();
+        let (status, missing) = harness
+            .request(
+                "POST",
+                "/api/adapter-runs",
+                Some(json!({
+                    "adapter_id":"codex", "project_id":project.id,
+                    "prompt":"This fixture must not spawn a CLI.",
+                    "continue_run_id":"missing",
+                    "command_id":uuid::Uuid::new_v4().to_string()
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{missing}");
+        let (status, malformed) = harness
+            .request(
+                "POST",
+                "/api/adapter-runs",
+                Some(json!({
+                    "adapter_id":"codex", "project_id":project.id,
+                    "prompt":"test", "continue_run_id":5,
+                    "command_id":uuid::Uuid::new_v4().to_string()
+                })),
+            )
+            .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{malformed}");
+        let (status, recovery) = harness
+            .request(
+                "POST",
+                "/api/adapter-runs/missing/recovery",
+                Some(json!({})),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{recovery}");
+        assert!(recovery["error"]["code"].is_string());
         let (_, runs) = harness.request("GET", "/api/adapter-runs", None).await;
         assert!(runs["runs"].as_array().unwrap().is_empty());
         harness.runtime.shutdown().await.unwrap();

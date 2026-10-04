@@ -459,7 +459,37 @@ impl AccountManager {
             request.profile = adapters.retained_profile(&request.command_id);
             return adapters.start(request).map_err(AppError::from);
         }
-        let binding = self.resolve_locked(&state, &request.adapter_id, profile_id)?;
+        let binding = match request.continue_run_id.as_deref() {
+            // A conversation stays with the account that holds its Codex thread.
+            Some(previous) => {
+                let original = adapters.run_profile(previous)?.ok_or_else(|| {
+                    AppError::new(
+                        StatusCode::CONFLICT,
+                        "conflict",
+                        "This run has no recorded account and cannot be continued.",
+                    )
+                })?;
+                if profile_id.is_some_and(|id| id != original.id) {
+                    return Err(AppError::new(
+                        StatusCode::CONFLICT,
+                        "conflict",
+                        "Continue with the account that started this conversation.",
+                    ));
+                }
+                let current = self.binding(&state, &original.id).ok();
+                if current.as_ref().is_none_or(|current| {
+                    current.home != original.home || current.agent_id != original.agent_id
+                }) {
+                    return Err(AppError::new(
+                        StatusCode::CONFLICT,
+                        "profile_changed",
+                        "The account profile that started this conversation is no longer available. Start a new conversation.",
+                    ));
+                }
+                original
+            }
+            None => self.resolve_locked(&state, &request.adapter_id, profile_id)?,
+        };
         let cached = state
             .cache
             .get(&binding.id)
@@ -1249,6 +1279,7 @@ mod tests {
             project_path: temp.path().to_owned(),
             prompt: "fixture only".into(),
             command_id: uuid::Uuid::new_v4().to_string(),
+            continue_run_id: None,
             profile: None,
         };
         let error = manager

@@ -16,6 +16,7 @@ uuid.workspace = true
 thiserror.workspace = true
 parking_lot.workspace = true
 url.workspace = true
+rusqlite = { version = "0.40.2", features = ["bundled"] }
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"

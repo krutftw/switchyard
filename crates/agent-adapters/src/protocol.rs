@@ -43,6 +43,10 @@ pub(crate) struct RunInput {
     pub(crate) project: PathBuf,
     pub(crate) profile: Option<crate::ProfileBinding>,
     pub(crate) prompt: String,
+    /// Saved Codex thread to resume instead of starting a new one.
+    pub(crate) resume_thread: Option<String>,
+    /// Ask Codex not to save a new thread. Used when Switchya keeps no history.
+    pub(crate) ephemeral: bool,
 }
 
 pub(crate) async fn run(
@@ -57,6 +61,8 @@ pub(crate) async fn run(
         project,
         profile,
         prompt,
+        resume_thread,
+        ephemeral,
     } = input;
     let mut command = Command::new(executable);
     command
@@ -211,16 +217,22 @@ pub(crate) async fn run(
                             if !crate::profile::confirmed_home(result, profile.as_ref()) { fail(&state, "Codex did not confirm the selected account directory. No model turn was started.", false); break; }
                             if write(&mut stdin, &json!({"method":"initialized"})).await.is_err() { fail(&state, "Could not finish Codex initialization.", false); break; }
                             stage = Stage::Thread;
-                            json!({"id":2,"method":"thread/start","params":{"cwd":project,"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"read-only","ephemeral":true}})
+                            match &resume_thread {
+                                // Switchya keeps its own transcript; ask only for thread state.
+                                Some(thread) => json!({"id":2,"method":"thread/resume","params":{"threadId":thread,"cwd":project,"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"read-only","excludeTurns":true}}),
+                                None => json!({"id":2,"method":"thread/start","params":{"cwd":project,"approvalPolicy":"on-request","approvalsReviewer":"user","sandbox":"read-only","ephemeral":ephemeral}}),
+                            }
                         }
                         Stage::Thread => {
                             if !confirmed_policy(result) { fail(&state, "Codex did not confirm the required read-only sandbox, disabled shell network and human approval policy. No model turn was started.", false); break; }
                             let Some(thread) = result.pointer("/thread/id").and_then(Value::as_str).filter(|s| valid_id(s)) else { fail(&state, "Codex did not return a valid thread identifier.", false); break; };
+                            if resume_thread.as_deref().is_some_and(|expected| expected != thread) { fail(&state, "Codex resumed a different conversation than the one requested. No model turn was started.", false); break; }
                             {
                                 let mut run = state.lock();
                                 run.view.thread_id = Some(thread.into());
                                 run.view.model = result.get("model").and_then(Value::as_str).map(|s| s.chars().take(200).collect());
-                                run.event("notice", json!({"message":"Codex confirmed its read-only shell policy and human approval reviewer. The CLI-configured model will be used."}));
+                                let message = if resume_thread.is_some() { "Codex resumed the saved conversation and confirmed its read-only shell policy and human approval reviewer. Only your new message is sent." } else { "Codex confirmed its read-only shell policy and human approval reviewer. The CLI-configured model will be used." };
+                                run.event("notice", json!({"message":message}));
                             }
                             stage = Stage::Turn;
                             // No side-effecting model request is sent until policy read-back succeeds.

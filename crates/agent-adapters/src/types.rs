@@ -22,6 +22,10 @@ pub struct StartRequest {
     pub prompt: String,
     /// Caller UUID: retries return the same run only for the same complete request.
     pub command_id: String,
+    /// Continue the saved Codex thread of this earlier run. It must be the latest
+    /// finished run of its conversation, in the same project and account.
+    #[serde(default)]
+    pub continue_run_id: Option<String>,
     /// Resolved by the trusted account manager, never accepted from HTTP JSON.
     #[serde(skip)]
     pub profile: Option<ProfileBinding>,
@@ -58,11 +62,19 @@ impl RunState {
     }
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdapterRun {
     pub id: String,
     pub adapter_id: String,
     pub command_id: String,
+    /// Shared by every run that continues the same Codex thread. Equal to the
+    /// first run's id.
+    pub conversation_id: String,
+    /// The earlier run whose saved thread this run resumed.
+    pub continued_from: Option<String>,
+    /// First line of the task, at most 80 characters. Display as text.
+    #[serde(default)]
+    pub title: String,
     pub profile_id: Option<String>,
     pub profile_name: Option<String>,
     pub project_path: String,
@@ -75,12 +87,15 @@ pub struct AdapterRun {
     pub last_seq: u64,
     pub first_retained_seq: u64,
     pub pending_approvals: Vec<AdapterApproval>,
-    /// These runs are intentionally not restarted or replayed across host exits.
+    /// True when neither Switchya nor Codex keeps this run after the host exits.
     pub ephemeral: bool,
+    /// Set when this host could not save part of the run's history.
+    #[serde(default)]
+    pub history_error: Option<String>,
     pub permission_boundary: String,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdapterApproval {
     pub id: String,
     pub expected_hash: String,
@@ -98,7 +113,7 @@ pub enum ApprovalDecision {
     Deny,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct AdapterEvent {
     pub schema_version: u32,
     pub run_id: String,
@@ -139,7 +154,7 @@ impl AdapterError {
 
 pub type Result<T> = std::result::Result<T, AdapterError>;
 
-pub const PERMISSION_BOUNDARY: &str = "Codex uses its read-only shell sandbox with network disabled, on-request approvals and human review. Read-only operations may run without prompting; writes or elevation require CLI approval. Codex enforces that policy; Switchya does not add an OS security sandbox. Allow once may permit the displayed command or file change with your OS permissions. The selected profile stays bound to this run; configured integrations may have separate permissions. Runs exist only until this host exits.";
+pub const PERMISSION_BOUNDARY: &str = "Codex uses its read-only shell sandbox with network disabled, on-request approvals and human review. Read-only operations may run without prompting; writes or elevation require CLI approval. Codex enforces that policy; Switchya does not add an OS security sandbox. Allow once may permit the displayed command or file change with your OS permissions. The selected profile stays bound to this run and to any continuation of its conversation; configured integrations may have separate permissions. Saved history is never replayed: continuing sends only your new message, and interrupted work requires review first.";
 
 pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
