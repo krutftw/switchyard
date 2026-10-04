@@ -229,8 +229,20 @@ adapter runs an installed Codex CLI with that CLI's model, authentication and
 configuration. **Start new run** explicitly starts one task and may consume
 that account's usage. Review its exact approval requests in **Agent review**.
 
-These runs are kept only for the current local host's lifetime; they are not
-saved built-in Switchya sessions. Codex applies its own patch validation and
+Existing-agent conversations are saved on this computer and remain after
+Switchya restarts. They are separate from built-in Switchya sessions. Choose
+one under **Conversations in this project** and **Send** a message to continue
+it; it keeps the account that started it. Choose **New conversation** for
+separate work. Opening or refreshing a conversation never starts work.
+
+If Switchya stopped while a run was active, that run shows **Review the
+interrupted run**. Codex may already have applied an approved command or file
+change. Inspect the project, then choose **I reviewed the project** before
+continuing. Nothing is replayed. Continuing against a live, signed-in Codex
+installation has not been verified yet; it is covered by automated fixture
+tests.
+
+Codex applies its own patch validation and
 permission rules. Switchya requests and checks Codex's read-only shell policy
 with network disabled, but does not wrap the external CLI or its integrations
 in an additional OS sandbox. Read the permission boundary shown for the run

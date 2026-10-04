@@ -37,6 +37,23 @@ Interrupted operations with uncertain outcomes are marked `recovery_required`. T
 
 After inspecting the affected files or command results, a user can acknowledge recovery for the exact session revision. This records the review note and moves the session to `interrupted`, allowing a new turn with a new command ID. The uncertain operation stays `outcome_unknown`; acknowledgement never certifies success or repeats the operation. Stale and duplicate acknowledgements fail with a conflict.
 
+## Existing-agent runs
+
+These routes drive the separate Codex adapter described in [the adapter contract](AGENT-ADAPTERS.md). They use the same authentication, Origin and JSON body rules.
+
+| Method and path | Input | Response |
+|---|---|---|
+| `GET /api/adapters` | — | `{adapters: AdapterStatus[]}` |
+| `GET /api/adapter-runs` | — | `{runs: AdapterRun[]}`, newest first |
+| `POST /api/adapter-runs` | `{adapter_id, project_id, prompt, command_id, profile_id?, continue_run_id?}` | `202 {run: AdapterRun}` |
+| `GET /api/adapter-runs/:id` | — | `{run: AdapterRun}` |
+| `GET /api/adapter-runs/:id/events?after_seq=0&limit=200` | Strict bounded cursor and count | `{events: AdapterEvent[]}` |
+| `POST /api/adapter-runs/:id/decisions` | `{approval_id, expected_hash, decision: "allow_once" or "deny"}` | `{ok: true}` |
+| `POST /api/adapter-runs/:id/interrupt` | `{}` | `{ok: true}` |
+| `POST /api/adapter-runs/:id/recovery` | `{}` | `{run: AdapterRun}` |
+
+Runs are saved by the host and survive restarts. `continue_run_id` continues the saved Codex conversation of that run with only the new prompt; it must name the conversation's latest run that has a Codex thread, and the run keeps that conversation's account profile. A different `profile_id` is a conflict, and `profile_changed` means the original profile is no longer available unchanged. A run that was active when a host stopped is `recovery_required` and cannot be continued until `/recovery` records the human review; acknowledgement never replays or certifies the uncertain work. Each `AdapterRun` reports `conversation_id`, `continued_from`, `title`, `ephemeral` and, when saved history cannot be read or written, `history_error`.
+
 ## Product and platform boundaries
 
 The shared Rust engine backs the local HTTP app and terminal CLI. A Tauri desktop shell belongs outside the gateway workspace so headless gateway builds do not require GUI libraries. Cloudflare is the selected platform for the public website and future authenticated coordination; the local execution API is not exposed through a public tunnel by default.
