@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { adapterTranscript, mergeAdapterEvents } from '../adapters.js';
+import { adapterTranscript, mergeAdapterEvents, groupConversations, continuationTarget, continuationBlocker } from '../adapters.js';
 import { readAdapterJournal, writeAdapterJournal } from '../adapter-journal.js';
 const event=(seq,kind,payload={},run_id='r')=>({seq,kind,payload,run_id,at_ms:seq});
 test('external run keeps the actual human task and final assistant text once',()=>{
@@ -41,4 +41,32 @@ test('blocked storage retains uncertain starts in memory across workspace mode c
   assert.deepEqual(readAdapterJournal(storage,'blocked-host'),{p:request});
   writeAdapterJournal(storage,'blocked-host',{});
   assert.deepEqual(readAdapterJournal(storage,'blocked-host'),{});
+});
+
+const run=(id,started_at_ms,extra={})=>({id,conversation_id:'c1',started_at_ms,state:'completed',thread_id:'t1',ephemeral:false,title:'',...extra});
+test('conversations group continued runs oldest first and list the newest conversation first',()=>{
+  const groups=groupConversations([run('b',20),run('x',30,{conversation_id:'c2',title:' Other '}),run('a',10,{title:'First task'}),run('legacy',5,{conversation_id:undefined})]);
+  assert.deepEqual(groups.map(group=>group.id),['c2','c1','legacy']);
+  assert.deepEqual(groups[1].runs.map(item=>item.id),['a','b']);
+  assert.equal(groups[1].title,'First task');assert.equal(groups[1].latest.id,'b');assert.equal(groups[0].title,'Other');
+});
+test('a finished saved conversation continues from its latest run that attached a thread',()=>{
+  const [conversation]=groupConversations([run('a',10),run('b',20),run('c',30,{state:'failed',thread_id:null})]);
+  assert.equal(continuationTarget(conversation).id,'b');assert.equal(continuationBlocker(conversation),'');
+});
+test('active, interrupted-unreviewed and unsaved conversations cannot be continued',()=>{
+  const busy=groupConversations([run('a',10),run('b',20,{state:'awaiting_approval'})])[0];
+  assert.equal(continuationTarget(busy),null);assert.equal(continuationBlocker(busy),'');
+  const review=groupConversations([run('a',10,{state:'recovery_required'})])[0];
+  assert.equal(continuationTarget(review),null);assert.equal(continuationBlocker(review),'review');
+  const unsaved=groupConversations([run('a',10,{ephemeral:true})])[0];
+  assert.equal(continuationTarget(unsaved),null);assert.match(continuationBlocker(unsaved),/not saved/);
+  const threadless=groupConversations([run('a',10,{state:'failed',thread_id:null})])[0];
+  assert.equal(continuationTarget(threadless),null);assert.match(continuationBlocker(threadless),/did not create a conversation/);
+  assert.equal(continuationTarget(null),null);assert.equal(continuationBlocker(null),'');
+});
+test('pending continuation starts keep their continued run and reject an empty one',()=>{
+  const request={project_id:'p',adapter_id:'codex',prompt:'Next step',continue_run_id:'run-1',command_id:'4bd6cc30-30ef-4872-b8d7-6e5ef50cfd61'};
+  assert.deepEqual(readAdapterJournal({getItem:()=>JSON.stringify({host_id:'continue-host',requests:{p:request}})},'continue-host').p,request);
+  assert.deepEqual(readAdapterJournal({getItem:()=>JSON.stringify({host_id:'continue-empty',requests:{p:{...request,continue_run_id:''}}})},'continue-empty'),{});
 });

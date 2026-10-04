@@ -8,6 +8,7 @@ export function readAdapterJournal(storage,hostId){
     const requests=Object.fromEntries(Object.entries(value.requests).filter(([projectId,request])=>request?.project_id===projectId
       &&typeof request.adapter_id==='string'&&typeof request.prompt==='string'&&request.prompt.trim()
       &&(request.profile_id===undefined||typeof request.profile_id==='string'&&request.profile_id.length>0)
+      &&(request.continue_run_id===undefined||typeof request.continue_run_id==='string'&&request.continue_run_id.length>0)
       &&typeof request.command_id==='string'&&/^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(request.command_id)));
     inMemory.set(hostId,requests);return {...requests};
   }catch{return {};}
