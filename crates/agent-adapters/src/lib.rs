@@ -636,11 +636,13 @@ fn continuation(
             "Continue in the project folder that started this conversation.".into(),
         ));
     }
+    let mut reached_codex = false;
     for other in runs.values() {
         let other = other.run.lock();
         if other.view.conversation_id != earlier.conversation_id {
             continue;
         }
+        reached_codex |= other.view.turn_id.is_some();
         if other.view.state.is_active() {
             return Err(AdapterError::Conflict(
                 "Another run in this conversation is still active.".into(),
@@ -655,6 +657,15 @@ fn continuation(
                     .into(),
             ));
         }
+    }
+    // Codex 0.159.3 saves a thread only once a turn reaches it: resuming a
+    // thread with no turn fails with "no rollout found" (checked live). A
+    // confirmed turn is required, which conservatively also blocks a turn
+    // that was requested but never confirmed.
+    if !reached_codex {
+        return Err(AdapterError::Conflict(
+            "Codex never confirmed a message in this conversation, so it may not have saved it. Start a new conversation.".into(),
+        ));
     }
     Ok((earlier.conversation_id, thread))
 }

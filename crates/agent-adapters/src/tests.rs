@@ -784,6 +784,32 @@ async fn continuation_requires_the_same_project_account_and_a_saved_thread() {
     manager.shutdown().await;
 }
 
+#[tokio::test]
+async fn a_thread_without_a_confirmed_turn_cannot_be_continued() {
+    let data = tempfile::tempdir().unwrap();
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().canonicalize().unwrap();
+    let mut view = fixture_view("adapter_turnless", "adapter_turnless", 1);
+    view.state = RunState::Failed;
+    view.thread_id = Some("thread-fixture".into());
+    view.ephemeral = false;
+    view.project_path = project.to_string_lossy().into_owned();
+    {
+        let store = store::Store::open(data.path()).unwrap();
+        store.insert_run(&view, "hash", None, &[]).unwrap();
+    }
+    let manager = AdapterManager::open(data.path()).unwrap();
+    let result = launch(
+        &manager,
+        &durable_request(&project, Some("adapter_turnless")),
+        "resume_complete",
+    );
+    assert!(
+        matches!(&result, Err(AdapterError::Conflict(message)) if message.contains("never confirmed a message"))
+    );
+    assert_eq!(manager.list_runs().len(), 1);
+}
+
 #[test]
 fn a_second_host_cannot_open_live_run_history() {
     let data = tempfile::tempdir().unwrap();
@@ -880,4 +906,117 @@ fn removed_command_ids_stay_retired_after_restart() {
     let manager = AdapterManager::open(data.path()).unwrap();
     assert!(manager.list_runs().is_empty());
     assert!(manager.inner.retired.lock().contains(&command));
+}
+
+/// Opt-in live check of the real continuation path against an installed Codex CLI.
+///
+/// Set `SWITCHYA_LIVE_CODEX_EXE` to the native `codex` executable and
+/// `SWITCHYA_LIVE_CODEX_ROLLOUT` to an existing `rollout-*.jsonl`. The rollout is
+/// copied into a fresh, signed-out managed Codex home that uses file credential
+/// storage, so the turn cannot authenticate and no model usage is possible. The
+/// user's own Codex home is only read. Run with
+/// `cargo test -p switchyard-agent-adapters live_codex -- --ignored --nocapture`.
+#[tokio::test]
+#[ignore = "requires an installed Codex CLI and an existing rollout file"]
+async fn live_codex_resume_of_a_saved_thread_in_a_signed_out_home() {
+    let (Ok(exe), Ok(rollout)) = (
+        std::env::var("SWITCHYA_LIVE_CODEX_EXE"),
+        std::env::var("SWITCHYA_LIVE_CODEX_ROLLOUT"),
+    ) else {
+        panic!("set SWITCHYA_LIVE_CODEX_EXE and SWITCHYA_LIVE_CODEX_ROLLOUT");
+    };
+    let rollout = PathBuf::from(rollout);
+    let name = rollout.file_name().unwrap().to_string_lossy().into_owned();
+    let thread = name
+        .strip_suffix(".jsonl")
+        .and_then(|stem| stem.get(stem.len().saturating_sub(36)..))
+        .unwrap()
+        .to_owned();
+    assert!(
+        uuid::Uuid::parse_str(&thread).is_ok(),
+        "rollout name must end in a thread ID"
+    );
+
+    let home = tempfile::tempdir().unwrap();
+    let sessions = home
+        .path()
+        .join("sessions")
+        .join("2026")
+        .join("01")
+        .join("01");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let copied = sessions.join(&name);
+    std::fs::copy(&rollout, &copied).unwrap();
+    let before = std::fs::metadata(&copied).unwrap().len();
+    let directory = tempfile::tempdir().unwrap();
+    let project = directory.path().canonicalize().unwrap();
+    let profile = ProfileBinding {
+        id: "live-probe".into(),
+        name: "Signed-out live probe".into(),
+        agent_id: "codex".into(),
+        home: home.path().canonicalize().unwrap(),
+        managed: true,
+    };
+
+    let data = tempfile::tempdir().unwrap();
+    let mut earlier = fixture_view("adapter_live_earlier", "adapter_live_earlier", 1);
+    earlier.state = RunState::Completed;
+    earlier.thread_id = Some(thread.clone());
+    earlier.turn_id = Some("earlier-turn".into());
+    earlier.ephemeral = false;
+    earlier.project_path = project.to_string_lossy().into_owned();
+    earlier.profile_id = Some(profile.id.clone());
+    {
+        let store = store::Store::open(data.path()).unwrap();
+        store
+            .insert_run(&earlier, "hash", Some(&profile), &[])
+            .unwrap();
+    }
+    let manager = AdapterManager::open(data.path()).unwrap();
+    let mut request = durable_request(&project, Some("adapter_live_earlier"));
+    request.prompt = "Switchya live protocol check. Reply with OK.".into();
+    request.profile = Some(profile);
+    let run = manager
+        .start_process(request, project.clone(), PathBuf::from(exe), Vec::new())
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(120);
+    let mut run = manager.run(&run.id).unwrap();
+    while run.state.is_active() && std::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        run = manager.run(&run.id).unwrap();
+    }
+    let still_active = run.state.is_active();
+    if still_active {
+        let _ = manager.interrupt(&run.id).await;
+        tokio::time::sleep(Duration::from_secs(6)).await;
+        run = manager.run(&run.id).unwrap();
+    }
+    let events = all_events(&manager, &run.id);
+    println!("still_active_after_120s={still_active}");
+    println!(
+        "state={:?} thread={:?} turn={:?} model={:?}",
+        run.state, run.thread_id, run.turn_id, run.model
+    );
+    for event in &events {
+        let detail = event
+            .payload
+            .get("message")
+            .or_else(|| event.payload.get("state"))
+            .or_else(|| event.payload.get("status"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        println!("{} {} {}", event.seq, event.kind, detail);
+    }
+    let after = std::fs::metadata(&copied).unwrap().len();
+    println!("rollout bytes before={before} after={after}");
+    // Resume and the policy read-back succeeded: Switchya attaches the thread
+    // only after Codex returned the same ID with the confirmed policy.
+    assert_eq!(run.thread_id.as_deref(), Some(thread.as_str()));
+    assert!(events.iter().any(|e| {
+        e.kind == "notice"
+            && e.payload["message"]
+                .as_str()
+                .is_some_and(|m| m.contains("resumed the saved conversation"))
+    }));
+    manager.shutdown().await;
 }

@@ -43,7 +43,7 @@ test('blocked storage retains uncertain starts in memory across workspace mode c
   assert.deepEqual(readAdapterJournal(storage,'blocked-host'),{});
 });
 
-const run=(id,started_at_ms,extra={})=>({id,conversation_id:'c1',started_at_ms,state:'completed',thread_id:'t1',ephemeral:false,title:'',...extra});
+const run=(id,started_at_ms,extra={})=>({id,conversation_id:'c1',started_at_ms,state:'completed',thread_id:'t1',turn_id:'u1',ephemeral:false,title:'',...extra});
 test('conversations group continued runs oldest first and list the newest conversation first',()=>{
   const groups=groupConversations([run('b',20),run('x',30,{conversation_id:'c2',title:' Other '}),run('a',10,{title:'First task'}),run('legacy',5,{conversation_id:undefined})]);
   assert.deepEqual(groups.map(group=>group.id),['c2','c1','legacy']);
@@ -61,7 +61,11 @@ test('active, interrupted-unreviewed and unsaved conversations cannot be continu
   assert.equal(continuationTarget(review),null);assert.equal(continuationBlocker(review),'review');
   const unsaved=groupConversations([run('a',10,{ephemeral:true})])[0];
   assert.equal(continuationTarget(unsaved),null);assert.match(continuationBlocker(unsaved),/not saved/);
-  const threadless=groupConversations([run('a',10,{state:'failed',thread_id:null})])[0];
+  const turnless=groupConversations([run('a',10,{state:'failed',turn_id:null})])[0];
+  assert.equal(continuationTarget(turnless),null);assert.match(continuationBlocker(turnless),/never confirmed a message/);
+  const laterTurnless=groupConversations([run('a',10),run('b',20,{state:'failed',turn_id:null,continued_from:'a'})])[0];
+  assert.equal(continuationTarget(laterTurnless).id,'b');
+  const threadless=groupConversations([run('a',10,{state:'failed',thread_id:null,turn_id:null})])[0];
   assert.equal(continuationTarget(threadless),null);assert.match(continuationBlocker(threadless),/did not create a conversation/);
   assert.equal(continuationTarget(null),null);assert.equal(continuationBlocker(null),'');
 });

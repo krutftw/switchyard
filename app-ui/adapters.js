@@ -50,6 +50,8 @@ export function groupConversations(runs) {
 /** The run a new message continues: the latest run attached to the saved thread. */
 export function continuationTarget(conversation) {
   if(!conversation||conversation.runs.some(run=>active(run.state)))return null;
+  // Codex saves a thread only once a turn reaches it; the host enforces this too.
+  if(!conversation.runs.some(run=>run.turn_id))return null;
   const target=conversation.runs.filter(run=>run.thread_id).at(-1);
   return target&&!target.ephemeral&&target.state!=='recovery_required'?target:null;
 }
@@ -59,7 +61,8 @@ export function continuationBlocker(conversation) {
   const target=conversation.runs.filter(run=>run.thread_id).at(-1);
   if(target?.state==='recovery_required')return 'review';
   if(!target)return 'Codex did not create a conversation for this task. Start a new conversation.';
-  return 'This conversation was not saved, so it cannot be continued. Start a new conversation.';
+  if(target.ephemeral)return 'This conversation was not saved, so it cannot be continued. Start a new conversation.';
+  return 'Codex never confirmed a message in this conversation, so it may not have saved it. Start a new conversation.';
 }
 
 // Field names follow the Codex 0.159.3 app-server schema: ThreadItem

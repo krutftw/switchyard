@@ -238,9 +238,11 @@ separate work. Opening or refreshing a conversation never starts work.
 If Switchya stopped while a run was active, that run shows **Review the
 interrupted run**. Codex may already have applied an approved command or file
 change. Inspect the project, then choose **I reviewed the project** before
-continuing. Nothing is replayed. Continuing against a live, signed-in Codex
-installation has not been verified yet; it is covered by automated fixture
-tests.
+continuing. Nothing is replayed. A conversation can be continued only after Codex
+confirmed at least one message in it, because Codex saves a conversation only
+then. Resuming a saved conversation has been checked against the installed
+Codex CLI without a sign-in; a signed-in continuation that produces a reply
+has not been verified yet.
 
 Codex applies its own patch validation and
 permission rules. Switchya requests and checks Codex's read-only shell policy
