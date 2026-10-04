@@ -44,6 +44,15 @@ test('workspace, review and adapter render with the shipped HTM/Preact runtime',
   tags=flatten(root).map(node=>node.localName);
   assert.ok(tags.includes('main'));assert.ok(tags.includes('aside'));assert.ok(tags.includes('textarea'));
   render(null,root);
+  const { CodexItem, ApprovalSummary }=await import('../adapters.js');
+  const textOf=()=>flatten(root).filter(node=>node.nodeType===3).map(node=>node.data).join('');
+  const changes=[{path:'src/a.js',kind:{type:'update',move_path:null},diff:'@@ -1 +1 @@\n-a\n+b\n'},{path:'src/new.js',kind:{type:'add'},diff:'export const x=1;\n'}];
+  render(html`<div><${CodexItem} entry=${{item:{id:'c',type:'commandExecution',command:'npm test',cwd:'/p',status:'completed',exitCode:1,aggregatedOutput:'1 failing'}}}/><${CodexItem} entry=${{item:{id:'f',type:'fileChange',status:'completed',changes}}}/><${ApprovalSummary} approval=${{method:'item/commandExecution/requestApproval',preview:{params:{command:'curl https://example.com',cwd:'/p',reason:'fetch docs',networkApprovalContext:{host:'example.com',protocol:'https'}},item:null}}}/><${ApprovalSummary} approval=${{method:'item/fileChange/requestApproval',preview:{params:{grantRoot:'/'},item:{id:'f',type:'fileChange',changes}}}}/></div>`,root);
+  tags=flatten(root).map(node=>node.localName);
+  assert.ok(tags.includes('pre'));assert.ok(tags.includes('details'));
+  const shown=textOf();
+  for(const expected of ['npm test','1 failing','src/a.js','src/new.js','New file','Allow network access to example.com?','curl https://example.com','fetch docs','Broader write access requested'])assert.ok(shown.includes(expected),expected);
+  render(null,root);
   const { AccountsDialog }=await import('../accounts.js');
   render(html`<${AccountsDialog} api=${{}} open=${false} onRefresh=${()=>{}} profiles=${[
     {id:'c',name:'Codex profile',agent_id:'codex',managed:true,account:{auth_status:'signed_in',email:'fixture@example.test',plan:'Fixture',checked_at_ms:1234,usage:{status:'available',windows:[{id:'daily',name:'Daily',remaining_percent:0,used_percent:100,resets_at:2345}]}}},

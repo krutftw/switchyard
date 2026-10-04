@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { adapterTranscript, mergeAdapterEvents, groupConversations, continuationTarget, continuationBlocker } from '../adapters.js';
+import { adapterTranscript, mergeAdapterEvents, groupConversations, continuationTarget, continuationBlocker, codexItemSummary, approvalSummary } from '../adapters.js';
 import { readAdapterJournal, writeAdapterJournal } from '../adapter-journal.js';
 const event=(seq,kind,payload={},run_id='r')=>({seq,kind,payload,run_id,at_ms:seq});
 test('external run keeps the actual human task and final assistant text once',()=>{
@@ -69,4 +69,54 @@ test('pending continuation starts keep their continued run and reject an empty o
   const request={project_id:'p',adapter_id:'codex',prompt:'Next step',continue_run_id:'run-1',command_id:'4bd6cc30-30ef-4872-b8d7-6e5ef50cfd61'};
   assert.deepEqual(readAdapterJournal({getItem:()=>JSON.stringify({host_id:'continue-host',requests:{p:request}})},'continue-host').p,request);
   assert.deepEqual(readAdapterJournal({getItem:()=>JSON.stringify({host_id:'continue-empty',requests:{p:{...request,continue_run_id:''}}})},'continue-empty'),{});
+});
+
+// Fixtures follow the Codex 0.159.3 app-server schema shapes.
+const commandItem=(status,extra={})=>({id:'cmd1',type:'commandExecution',command:'npm test -- --grep "a b"',cwd:'C:\\work\\p',status,...extra});
+test('a Codex command item becomes one transcript entry updated in place by its completion',()=>{
+  const items=adapterTranscript([event(1,'item_started',{item:commandItem('inProgress')}),event(2,'notice',{message:'x'}),event(3,'item_completed',{item:commandItem('completed',{exitCode:0,aggregatedOutput:'ok\n'})})]);
+  assert.deepEqual(items.map(item=>item.type),['codex_item','activity']);
+  assert.equal(items[0].item.status,'completed');assert.equal(items[0].seq,1);
+  const summary=codexItemSummary(items[0].item);
+  assert.equal(summary.command,'npm test -- --grep "a b"');assert.equal(summary.cwd,'C:\\work\\p');
+  assert.equal(summary.statusLabel,'Completed');assert.equal(summary.tone,'neutral');assert.equal(summary.exitCode,0);assert.equal(summary.output,'ok\n');
+});
+test('command outcomes keep failure, declined and unreported fields distinct',()=>{
+  assert.equal(codexItemSummary(commandItem('completed',{exitCode:2})).tone,'stop');
+  assert.equal(codexItemSummary(commandItem('failed')).tone,'stop');
+  const declined=codexItemSummary(commandItem('declined'));assert.equal(declined.statusLabel,'Declined');assert.equal(declined.tone,'caution');
+  const bare=codexItemSummary({id:'c',type:'commandExecution',status:'completed'});
+  assert.equal(bare.exitCode,null);assert.equal(bare.output,null);assert.equal(bare.command,'');
+  assert.equal(codexItemSummary({type:'commandExecution',status:'somethingNew'}).statusLabel,'Something new');
+});
+test('file changes keep exact paths, kinds and change text',()=>{
+  const item={id:'f1',type:'fileChange',status:'completed',changes:[
+    {path:'src/a.js',kind:{type:'update',move_path:null},diff:'@@ -1 +1 @@\n-a\n+b\n'},
+    {path:'src/new.js',kind:{type:'add'},diff:'export const x=1;\n'},
+    {path:'old.txt',kind:{type:'delete'},diff:''},
+    {path:'b.js',kind:{type:'update',move_path:'c.js'},diff:'@@ -1 +1 @@\n-x\n+y\n'}]};
+  const summary=codexItemSummary(item);
+  assert.equal(summary.title,'Edit 4 files');
+  assert.deepEqual(summary.changes.map(change=>[change.path,change.label,change.unified]),[['src/a.js','Edit',true],['src/new.js','New file',false],['old.txt','Delete',false],['b.js','Move and edit',true]]);
+  assert.equal(summary.changes[1].diff,'export const x=1;\n');assert.equal(summary.changes[3].move,'c.js');
+  assert.equal(codexItemSummary({type:'fileChange',changes:[{path:'one'}]}).title,'Edit 1 file');
+});
+test('unfamiliar Codex items stay raw activity with a readable label',()=>{
+  const items=adapterTranscript([event(1,'item_completed',{item:{id:'r',type:'reasoning',status:'completed'}})]);
+  assert.equal(items[0].type,'activity');assert.equal(codexItemSummary({type:'webSearch'}).title,'Web search');
+});
+test('approval summaries show the exact proposed command, network host and stdin kind',()=>{
+  const approval=(params,method='item/commandExecution/requestApproval',item=null)=>({method,preview:{params:{threadId:'t',turnId:'u',itemId:'i',startedAtMs:1,...params},item}});
+  const plain=approvalSummary(approval({command:'rm -rf build',cwd:'/p',reason:'clean'}));
+  assert.equal(plain.title,'Run this command?');assert.equal(plain.command,'rm -rf build');assert.equal(plain.cwd,'/p');assert.equal(plain.reason,'clean');
+  const network=approvalSummary(approval({command:'curl x',cwd:'/p',networkApprovalContext:{host:'example.com',protocol:'https'}}));
+  assert.equal(network.title,'Allow network access to example.com?');assert.deepEqual(network.network,{host:'example.com',protocol:'https'});
+  assert.equal(approvalSummary(approval({kind:'writeStdin'})).title,'Send input to a running command?');
+  const files=approvalSummary(approval({grantRoot:'/'},'item/fileChange/requestApproval',{id:'i',type:'fileChange',changes:[{path:'a',kind:{type:'add'},diff:'x'}]}));
+  assert.equal(files.title,'Apply this file change?');assert.equal(files.grantRoot,'/');assert.equal(files.changes[0].label,'New file');
+  assert.equal(approvalSummary(approval({},'item/fileChange/requestApproval',null)).title,'Apply file changes?');
+});
+test('recorded decisions and turn outcomes become readable entries',()=>{
+  const items=adapterTranscript([event(1,'approval_resolved',{approval_id:'a',decision:'deny'}),event(2,'turn_completed',{status:'completed'})]);
+  assert.equal(items[0].type,'decision');assert.equal(items[0].decision,'deny');assert.equal(items[1].kind,'turn_completed');
 });

@@ -27,3 +27,5 @@ html[data-theme=dark]{color-scheme:dark;--sheet:#121b25;--paper:#17212d;--ink:#e
 @media(max-width:759px){.composer-boundary{font-size:11px}.composer-text textarea{min-height:48px;padding:10px 12px}.accounts-dialog{width:calc(100% - 24px)}.account-card{padding:16px}.account-actions .button{flex:1}.usage-heading{align-items:flex-start;flex-direction:column;gap:4px}.account-identity{align-items:flex-start;flex-direction:column}.account-select{max-width:100%}}
 .run-account{margin-top:6px;color:var(--muted);font-size:11px;line-height:1.5;overflow-wrap:anywhere}.run-account strong{color:var(--ink);font-weight:520}
 .continuing-account{margin:0;min-height:44px}.continuing-account strong{min-width:0;overflow:hidden;color:var(--ink);font-size:11px;font-weight:520;text-overflow:ellipsis;white-space:nowrap}.adapter-turn+.adapter-turn .run-divider{margin-top:6px;padding-top:14px;border-top:1px dashed var(--line)}
+.codex-item-headline{display:inline-block;max-width:min(48ch,100%);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:bottom}
+.codex-item>summary>span:first-of-type{flex:1;min-width:0}

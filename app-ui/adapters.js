@@ -1,6 +1,7 @@
 import { html, useEffect, useRef, useState } from './vendor/preact-htm.js';
 import { Icon } from './icons.js';
 import { Button, Notice, Dialog, RawValue, TextContent, CopyButton } from './components.js';
+import { DiffView } from './diff.js';
 import { stateLabel, stateTone, timeLabel, pretty } from './presentation.js';
 import { readAdapterJournal, writeAdapterJournal } from './adapter-journal.js';
 import { chosenProfile, canStartProfile, authLabel } from './account-presentation.js';
@@ -14,7 +15,7 @@ export function mergeAdapterEvents(previous,incoming,runId) {
   return [...bySeq.values()].sort((a,b)=>a.seq-b.seq).slice(-600);
 }
 export function adapterTranscript(events) {
-  const items=[],streams=new Map();
+  const items=[],streams=new Map(),codexItems=new Map();
   for(const event of events){
     const p=event.payload||{};
     if(event.kind==='user_task')items.push({...event,type:'user',text:typeof p.text==='string'?p.text:''});
@@ -27,7 +28,13 @@ export function adapterTranscript(events) {
       if(stream)stream.text=typeof p.item.text==='string'?p.item.text:stream.text;
       else items.push({...event,type:'assistant',text:p.item.text||''});
       streams.delete(key);
-    }else items.push({...event,type:'activity'});
+    }else if((event.kind==='item_started'||event.kind==='item_completed')&&['commandExecution','fileChange'].includes(p.item?.type)){
+      // One entry per Codex item: its completion replaces the started view in place.
+      const key=typeof p.item.id==='string'?p.item.id:'';const known=key&&codexItems.get(key);
+      if(known)Object.assign(known,{kind:event.kind,item:p.item,last_seq:event.seq});
+      else{const entry={...event,type:'codex_item',item:p.item};items.push(entry);if(key)codexItems.set(key,entry);}
+    }else if(event.kind==='approval_resolved')items.push({...event,type:'decision',decision:p.decision});
+    else items.push({...event,type:'activity'});
   }
   return items;
 }
@@ -55,17 +62,86 @@ export function continuationBlocker(conversation) {
   return 'This conversation was not saved, so it cannot be continued. Start a new conversation.';
 }
 
+// Field names follow the Codex 0.159.3 app-server schema: ThreadItem
+// commandExecution/fileChange, FileUpdateChange and the approval params.
+const ITEM_STATUS={inProgress:'Running',completed:'Completed',failed:'Failed',declined:'Declined'};
+const text=value=>typeof value==='string'?value:'';
+const humanize=value=>{const words=text(value).replace(/([a-z0-9])([A-Z])/g,'$1 $2').toLowerCase();return words?words[0].toUpperCase()+words.slice(1):'Activity';};
+/** One file change as Codex reported it: its path, kind and exact change text. */
+export function fileChangeSummary(change) {
+  const kind=change?.kind?.type,move=text(change?.kind?.move_path);
+  const label=kind==='add'?'New file':kind==='delete'?'Delete':kind==='update'?(move?'Move and edit':'Edit'):'Change';
+  const diff=text(change?.diff);
+  return {path:text(change?.path)||'Path not reported',label,move,diff,unified:/^@@ /m.test(diff)};
+}
+/** Concise, verbatim summary of a Codex command or file-change item. */
+export function codexItemSummary(item) {
+  const status=text(item?.status),statusLabel=ITEM_STATUS[status]||(status?humanize(status):'Status not reported');
+  if(item?.type==='commandExecution'){
+    const exitCode=Number.isInteger(item.exitCode)?item.exitCode:null;
+    const tone=status==='failed'||(exitCode!==null&&exitCode!==0)?'stop':status==='declined'?'caution':'neutral';
+    return {kind:'command',title:'Command',command:text(item.command),cwd:text(item.cwd),status,statusLabel,tone,exitCode,
+      output:typeof item.aggregatedOutput==='string'?item.aggregatedOutput:null};
+  }
+  if(item?.type==='fileChange'){
+    const changes=(Array.isArray(item.changes)?item.changes:[]).map(fileChangeSummary);
+    return {kind:'files',title:changes.length===1?'Edit 1 file':`Edit ${changes.length} files`,changes,status,statusLabel,
+      tone:status==='failed'?'stop':status==='declined'?'caution':'neutral'};
+  }
+  return {kind:'other',title:humanize(item?.type),status,statusLabel,tone:'neutral'};
+}
+/** What a pending Codex approval asks for, using only fields Codex supplied. */
+export function approvalSummary(approval) {
+  const params=approval?.preview?.params||{},reason=text(params.reason);
+  if(approval?.method==='item/commandExecution/requestApproval'){
+    const network=params.networkApprovalContext&&text(params.networkApprovalContext.host)?params.networkApprovalContext:null;
+    const stdin=params.kind==='writeStdin';
+    const title=network?`Allow network access to ${network.host}?`:stdin?'Send input to a running command?':'Run this command?';
+    return {kind:'command',title,command:text(params.command),cwd:text(params.cwd),reason,stdin,
+      network:network&&{host:network.host,protocol:text(network.protocol)}};
+  }
+  if(approval?.method==='item/fileChange/requestApproval'){
+    const item=approval.preview?.item;
+    const changes=(item?.type==='fileChange'&&Array.isArray(item.changes)?item.changes:[]).map(fileChangeSummary);
+    const grantRoot=text(params.grantRoot);
+    return {kind:'files',title:changes.length===1?'Apply this file change?':changes.length?`Apply these ${changes.length} file changes?`:'Apply file changes?',
+      changes,reason,grantRoot};
+  }
+  return {kind:'other',title:humanize(String(approval?.method||'').split('/').at(-2)),reason};
+}
+
+function CommandBlock({command,cwd,label='Exact command'}) {
+  return html`<pre class="command-preview" tabindex="0" aria-label=${label}><code>${command||'Command not reported'}</code></pre><dl class="command-location"><dt>Working directory</dt><dd><code>${cwd||'Not reported'}</code></dd></dl>`;
+}
+function FileChanges({changes,verb='Proposed'}) {
+  if(!changes.length)return html`<${Notice} title="File changes not reported" tone="caution">Review the exact Codex request details before deciding.<//>`;
+  return html`<div class="patch-review">${changes.map((change,index)=>html`<section class="file-review" key=${`${change.path}:${index}`}><h4><${Icon} name="edit"/><code>${change.path}</code><span class="field-hint">${change.label}${change.move?html` → <code>${change.move}</code>`:''}</span></h4>${change.unified?html`<${DiffView} text=${change.diff} label=${`${verb} changes to ${change.path}`}/>`:change.diff?html`<${RawValue} value=${change.diff} label=${`Exact change text for ${change.path}`}/>`:html`<p class="field-hint">Codex did not include change text for this file.</p>`}</section>`)}</div>`;
+}
+export function ApprovalSummary({approval}) {
+  const summary=approvalSummary(approval);
+  return html`<h3>${summary.title}</h3>${summary.reason&&html`<p class="field-hint">Codex's stated reason: ${summary.reason}</p>`}${summary.kind==='command'&&html`<div class="command-review">${summary.network&&html`<${Notice} title="Network access request" tone="caution">Codex asks to reach <code>${summary.network.host}</code>${summary.network.protocol?` over ${summary.network.protocol}`:''}.<//>`}<${CommandBlock} command=${summary.command} cwd=${summary.cwd} label=${summary.stdin?'Command receiving input':'Exact proposed command'}/>${summary.command&&html`<${CopyButton} text=${summary.command} label="Copy command"/>`}</div>`}${summary.kind==='files'&&html`${summary.grantRoot&&html`<${Notice} title="Broader write access requested" tone="stop">Codex also asks to write under <code>${summary.grantRoot}</code> for the rest of the session. Switchya only allows single operations, so this request can only be denied.<//>`}<${FileChanges} changes=${summary.changes}/>`}`;
+}
+export function CodexItem({entry}) {
+  const s=codexItemSummary(entry.item);
+  const headline=s.kind==='command'?s.command:s.changes.map(change=>change.path).join(', ');
+  return html`<details class="operation-history codex-item"><summary><${Icon} name=${s.kind==='files'?'edit':'command'}/><span><strong>${s.title}</strong> <code class="codex-item-headline">${headline||'Not reported'}</code></span><span class="status-label" data-tone=${s.tone}>${s.statusLabel}</span></summary>${s.kind==='command'?html`<${CommandBlock} command=${s.command} cwd=${s.cwd}/>${s.exitCode!==null?html`<p class="exit-status">Exit code <code>${s.exitCode}</code></p>`:s.status&&s.status!=='inProgress'&&html`<p class="exit-status field-hint">Exit code not reported.</p>`}${s.output?html`<${RawValue} value=${s.output} label="Command output reported by Codex"/>`:html`<p class="field-hint">${s.output===null?'Codex did not report output.':'No output was reported.'}</p>`}`:html`<${FileChanges} changes=${s.changes} verb="Recorded"/>`}<details class="operation-details result-details"><summary>Details (exact Codex item)</summary><${RawValue} value=${entry.item} label="Exact Codex item"/></details></details>`;
+}
+
 function AdapterReview({run,onDecision,busy,error,connected}) {
   const approvals=run?.pending_approvals||[];
-  return html`<header class="review-header"><h2>Agent review</h2><span class="field-hint">${approvals.length?`${approvals.length} pending`:'No pending decisions'}</span></header><div class="review-content">${error&&html`<${Notice} title="Decision could not be confirmed" tone="stop">${error}<//>`}${approvals.map(approval=>html`<section class="approval" key=${approval.id}><p class="eyebrow">CODEX REQUEST</p><h3>${approval.method}</h3><${Notice} title="Agent permission boundary" tone="caution">${approval.permission_boundary}<//><${RawValue} value=${approval.preview} label="Exact Codex approval request"/><details class="operation-details"><summary>Approval identity</summary><dl><dt>Request</dt><dd><code>${approval.id}</code></dd><dt>Expected hash</dt><dd><code>${approval.expected_hash}</code></dd></dl><${CopyButton} text=${pretty(approval.preview)} label="Copy full request"/></details>${!approval.can_allow_once&&html`<p class="field-hint">This request cannot be approved once by the adapter. Deny it to let the agent respond.</p>`}<div class="approval-actions"><${Button} onClick=${()=>onDecision(approval,'deny')} disabled=${busy||!connected}>Deny<//><${Button} variant="primary" onClick=${()=>onDecision(approval,'allow_once')} disabled=${busy||!connected||!approval.can_allow_once}>Allow once<//></div></section>`)}${!approvals.length&&html`<div class="empty-review"><${Icon} name="lock"/><h3>Requests appear here.</h3><p>Codex approval requests include the exact command or change supplied by the CLI.</p></div>`}${run&&html`<details class="operation-details"><summary>Run details and permissions</summary><dl><dt>Run</dt><dd><code>${run.id}</code></dd><dt>Model</dt><dd><code>${run.model||'Reported after the agent starts'}</code></dd><dt>Account</dt><dd>${run.profile_name||'Not reported'}</dd>${run.profile_id&&html`<dt>Account profile ID</dt><dd><code>${run.profile_id}</code></dd>`}<dt>Working folder</dt><dd><code>${run.project_path}</code></dd>${run.thread_id&&html`<dt>Codex conversation</dt><dd><code>${run.thread_id}</code></dd>`}</dl><p>${run.permission_boundary}</p><p class="field-hint">${run.ephemeral?'This run exists only while the local host is running. It is separate from saved native sessions.':'Saved on this computer together with its Codex conversation. It is separate from native sessions.'}</p></details>`}</div>`;
+  return html`<header class="review-header"><h2>Agent review</h2><span class="field-hint">${approvals.length?`${approvals.length} pending`:'No pending decisions'}</span></header><div class="review-content">${error&&html`<${Notice} title="Decision could not be confirmed" tone="stop">${error}<//>`}${approvals.map(approval=>html`<section class="approval" key=${approval.id}><p class="eyebrow">CODEX REQUEST</p><${ApprovalSummary} approval=${approval}/><${Notice} title="Agent permission boundary" tone="caution">${approval.permission_boundary}<//><details class="operation-details"><summary>Exact Codex request details</summary><${RawValue} value=${approval.preview} label="Exact Codex approval request"/><dl><dt>Method</dt><dd><code>${approval.method}</code></dd><dt>Request</dt><dd><code>${approval.id}</code></dd><dt>Expected hash</dt><dd><code>${approval.expected_hash}</code></dd></dl><${CopyButton} text=${pretty(approval.preview)} label="Copy full request"/></details>${!approval.can_allow_once&&html`<p class="field-hint">This request cannot be approved once by the adapter. Deny it to let the agent respond.</p>`}<div class="approval-actions"><${Button} onClick=${()=>onDecision(approval,'deny')} disabled=${busy||!connected}>Deny<//><${Button} variant="primary" onClick=${()=>onDecision(approval,'allow_once')} disabled=${busy||!connected||!approval.can_allow_once}>Allow once<//></div></section>`)}${!approvals.length&&html`<div class="empty-review"><${Icon} name="lock"/><h3>Requests appear here.</h3><p>Codex approval requests include the exact command or change supplied by the CLI.</p></div>`}${run&&html`<details class="operation-details"><summary>Run details and permissions</summary><dl><dt>Run</dt><dd><code>${run.id}</code></dd><dt>Model</dt><dd><code>${run.model||'Reported after the agent starts'}</code></dd><dt>Account</dt><dd>${run.profile_name||'Not reported'}</dd>${run.profile_id&&html`<dt>Account profile ID</dt><dd><code>${run.profile_id}</code></dd>`}<dt>Working folder</dt><dd><code>${run.project_path}</code></dd>${run.thread_id&&html`<dt>Codex conversation</dt><dd><code>${run.thread_id}</code></dd>`}</dl><p>${run.permission_boundary}</p><p class="field-hint">${run.ephemeral?'This run exists only while the local host is running. It is separate from saved native sessions.':'Saved on this computer together with its Codex conversation. It is separate from native sessions.'}</p></details>`}</div>`;
 }
 
 function TranscriptItem({item,onReview}) {
   if(item.type==='assistant'||item.type==='user')return html`<article class="message" data-role=${item.type}><div class="message-header"><span class="message-avatar" aria-hidden="true">${item.type==='user'?'Y':html`<${Icon} name="command"/>`}</span><strong>${item.type==='user'?'You':'Codex'}</strong><time>${timeLabel(item.at_ms)}</time></div><${TextContent} text=${item.text}/></article>`;
   if(item.kind==='notice'||item.kind==='adapter_error'||item.kind==='recovery_acknowledged')return html`<${Notice} title=${item.kind==='adapter_error'?'Agent error':item.kind==='recovery_acknowledged'?'Recovery reviewed':'Agent notice'} tone=${item.kind==='adapter_error'?'stop':'neutral'}>${item.payload?.message}<//>`;
   if(item.kind==='state_changed')return html`<div class="state-event"><${Icon} name="info"/><span>${stateLabel(item.payload?.state)}</span></div>`;
-  if(item.kind==='approval_requested')return html`<div class="tool-event"><${Button} icon="lock" onClick=${onReview}>Review agent request<//></div>`;
-  return html`<details class="activity-details"><summary>${item.kind.replaceAll('_',' ')}</summary><${RawValue} value=${item.payload}/></details>`;
+  if(item.kind==='approval_requested')return html`<div class="tool-event"><span class="field-hint">${approvalSummary(item.payload?.approval).title}</span><${Button} icon="lock" onClick=${onReview}>Review agent request<//></div>`;
+  if(item.type==='codex_item')return html`<${CodexItem} entry=${item}/>`;
+  if(item.type==='decision')return html`<div class="state-event"><${Icon} name="lock"/><span>${item.decision==='allow_once'?'You allowed this once.':item.decision==='deny'?'You denied this request.':'Decision recorded.'}</span></div>`;
+  if(item.kind==='turn_completed')return html`<div class="state-event"><${Icon} name="info"/><span>Codex reported the turn ${item.payload?.status==='completed'?'completed':item.payload?.status==='interrupted'?'interrupted':item.payload?.status==='failed'?'failed':'ended with an unknown status'}.</span></div>`;
+  const label=(item.kind==='item_started'||item.kind==='item_completed')&&item.payload?.item?.type?`${codexItemSummary(item.payload.item).title}${item.payload.item.status?` · ${codexItemSummary(item.payload.item).statusLabel}`:''}`:item.kind.replaceAll('_',' ');
+  return html`<details class="activity-details"><summary>${label}</summary><${RawValue} value=${item.payload}/></details>`;
 }
 
 async function allEvents(api,runId,signal) {
